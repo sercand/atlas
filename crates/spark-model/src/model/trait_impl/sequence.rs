@@ -55,13 +55,34 @@ impl TransformerModel {
                 && !self.tokens_have_vision_pad(&seq.tokens)
                 && seq.hss_window_start() == 0
             {
-                let acquired = self.prefix_cache.insert(
-                    &seq.tokens,
-                    &seq.block_table,
-                    &seq.disk_block_ids,
-                    bs,
-                    seq.prompt_len,
-                );
+                // #155: leaf snapshot at FULL length (prompt + generated) so
+                // the next warm hit restores at this turn's END and replays
+                // ~nothing. Save logic + the secondary-stream ordering guard
+                // live in decode_checkpoint.rs (finish_leaf_snapshot).
+                let finish_snap = self.finish_leaf_snapshot(seq);
+                let acquired = if let Some(snap_id) = finish_snap {
+                    let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
+                        &seq.tokens,
+                        &seq.block_table,
+                        &seq.disk_block_ids,
+                        bs,
+                        snap_id,
+                        seq.session_hash,
+                        seq.prompt_len,
+                    );
+                    if let Some(old) = displaced {
+                        self.ssm_snapshots.free(old);
+                    }
+                    acquired
+                } else {
+                    self.prefix_cache.insert(
+                        &seq.tokens,
+                        &seq.block_table,
+                        &seq.disk_block_ids,
+                        bs,
+                        seq.prompt_len,
+                    )
+                };
                 super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
                 // Bump KV block ref_counts so the prefix cache "owns" a reference.
                 // This keeps blocks alive after free_sequence drops the sequence's ref.
