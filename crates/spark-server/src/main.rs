@@ -31,6 +31,7 @@ mod conversation_store;
 pub mod grammar;
 mod halluc_probe;
 mod hint_injector;
+mod ir;
 mod llmlingua;
 mod lookback_lens;
 mod loop_detector;
