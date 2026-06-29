@@ -3,7 +3,7 @@
 // Anthropic request-translation: images and reasoning are carried into
 // the lowered OpenAI request instead of being dropped (issue #165).
 
-use super::super::translate::anthropic_to_chat_request_json;
+use super::super::translate::{anthropic_to_chat_request_json, chat_to_anthropic_response};
 use super::super::types::MessagesRequest;
 use crate::openai::ChatCompletionRequest;
 
@@ -95,6 +95,58 @@ fn url_image_source_is_carried() {
         user.content.images,
         vec!["https://example.com/a.png".to_string()]
     );
+}
+
+// ── response direction (chat_to_anthropic_response) ──
+
+#[test]
+fn response_maps_reasoning_text_tools_and_usage() {
+    let v = serde_json::json!({
+        "id": "chatcmpl-abc",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        "choices": [{
+            "message": {
+                "reasoning_content": "thinking",
+                "content": "hello",
+                "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{\"x\":1}"}}]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let json = serde_json::to_value(chat_to_anthropic_response(&v, "m".into())).unwrap();
+    assert_eq!(json["id"], "msg_abc");
+    assert_eq!(json["model"], "m");
+    assert_eq!(json["stop_reason"], "tool_use");
+    assert_eq!(json["usage"]["input_tokens"], 10);
+    assert_eq!(json["usage"]["output_tokens"], 5);
+    assert_eq!(json["content"][0]["type"], "thinking");
+    assert_eq!(json["content"][0]["thinking"], "thinking");
+    assert_eq!(json["content"][1]["type"], "text");
+    assert_eq!(json["content"][1]["text"], "hello");
+    assert_eq!(json["content"][2]["type"], "tool_use");
+    assert_eq!(json["content"][2]["name"], "f");
+    assert_eq!(json["content"][2]["input"], serde_json::json!({"x": 1}));
+}
+
+#[test]
+fn response_missing_id_becomes_msg_unknown() {
+    let v = serde_json::json!({
+        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+    });
+    let json = serde_json::to_value(chat_to_anthropic_response(&v, "m".into())).unwrap();
+    assert_eq!(json["id"], "msg_unknown");
+    assert_eq!(json["stop_reason"], "end_turn");
+    assert_eq!(json["content"][0]["text"], "hi");
+}
+
+#[test]
+fn response_empty_content_omits_text_block() {
+    let v = serde_json::json!({
+        "id": "chatcmpl-x",
+        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}]
+    });
+    let json = serde_json::to_value(chat_to_anthropic_response(&v, "m".into())).unwrap();
+    assert_eq!(json["content"].as_array().unwrap().len(), 0);
 }
 
 #[test]

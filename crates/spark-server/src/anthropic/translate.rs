@@ -382,78 +382,34 @@ pub(super) fn chat_to_anthropic_response(
     chat_value: &serde_json::Value,
     model: String,
 ) -> MessagesResponse {
-    let id = chat_value
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| format!("msg_{}", s.trim_start_matches("chatcmpl-")))
-        .unwrap_or_else(|| "msg_unknown".to_string());
+    // Parse the OpenAI body into the canonical response IR (typed), then
+    // serialize the IR into Anthropic's shape — no untyped `Value` poking.
+    let ir = crate::ir::OpenAiResponseView::from_value(chat_value).into_ir(model.clone());
+    ir_to_anthropic_response(ir, model)
+}
 
-    let usage = chat_value.get("usage").cloned().unwrap_or_default();
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    let choice = chat_value
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .cloned()
-        .unwrap_or_default();
-    let msg = choice.get("message").cloned().unwrap_or_default();
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("stop");
+/// Serialize a canonical [`crate::ir::ChatResponse`] into Anthropic's
+/// `MessagesResponse` wire shape.
+fn ir_to_anthropic_response(ir: crate::ir::ChatResponse, model: String) -> MessagesResponse {
+    let id = if ir.id.is_empty() {
+        "msg_unknown".to_string()
+    } else {
+        format!("msg_{}", ir.id.trim_start_matches("chatcmpl-"))
+    };
 
     let mut content: Vec<ResponseBlock> = Vec::new();
-
-    // Reasoning → thinking block
-    let reasoning = msg
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .or_else(|| msg.get("reasoning").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty());
-    if let Some(r) = reasoning {
-        content.push(ResponseBlock::Thinking {
-            thinking: r.to_string(),
-        });
+    if let Some(r) = ir.reasoning {
+        content.push(ResponseBlock::Thinking { thinking: r });
     }
-
-    // Text content
-    if let Some(text) = msg.get("content").and_then(|v| v.as_str())
-        && !text.is_empty()
-    {
-        content.push(ResponseBlock::Text {
-            text: text.to_string(),
-        });
+    if !ir.content.is_empty() {
+        content.push(ResponseBlock::Text { text: ir.content });
     }
-
-    // Tool calls
-    if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-        for tc in tcs {
-            let id = tc
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let function = tc.get("function").cloned().unwrap_or_default();
-            let name = function
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let args_str = function
-                .get("arguments")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            let input: serde_json::Value = serde_json::from_str(args_str)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            content.push(ResponseBlock::ToolUse { id, name, input });
-        }
+    for tc in ir.tool_calls {
+        content.push(ResponseBlock::ToolUse {
+            id: tc.id,
+            name: tc.name,
+            input: tc.arguments,
+        });
     }
 
     MessagesResponse {
@@ -462,11 +418,11 @@ pub(super) fn chat_to_anthropic_response(
         role: "assistant".to_string(),
         content,
         model,
-        stop_reason: Some(convert_stop_reason(finish_reason).to_string()),
+        stop_reason: Some(convert_stop_reason(ir.finish_reason.as_openai()).to_string()),
         stop_sequence: None,
         usage: AnthropicUsage {
-            input_tokens,
-            output_tokens,
+            input_tokens: ir.usage.prompt_tokens,
+            output_tokens: ir.usage.completion_tokens,
         },
     }
 }

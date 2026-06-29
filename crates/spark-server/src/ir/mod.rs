@@ -8,9 +8,13 @@
 // OpenAI/Anthropic surfaces from drifting (AGENTS.md).
 
 pub mod from_openai;
+pub mod from_openai_response;
 pub mod message;
+pub mod response;
 
+pub use from_openai_response::OpenAiResponseView;
 pub use message::{ContentPart, ImageData, Message, Role};
+pub use response::ChatResponse;
 
 #[cfg(test)]
 mod tests;
