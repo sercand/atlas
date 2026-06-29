@@ -34,17 +34,17 @@ pub(super) async fn wrap_chat_sse_for_anthropic(
         let mut translator = AnthropicTranslator::new(req_model);
         let mut buf = String::new();
         let mut data_stream = body.into_data_stream();
-        let mut pending: Vec<Event> = Vec::new();
+        let mut pending: Vec<SseEvent> = Vec::new();
 
-        // Inner helper: drain `pending` into the channel. Returns
-        // `false` when the receiver has hung up — caller should
-        // abort.
+        // Inner helper: drain `pending` into the channel, converting each
+        // typed `SseEvent` to an axum wire event. Returns `false` when the
+        // receiver has hung up — caller should abort.
         async fn flush(
             tx: &tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
-            pending: &mut Vec<Event>,
+            pending: &mut Vec<SseEvent>,
         ) -> bool {
             for ev in pending.drain(..) {
-                if tx.send(Ok(ev)).await.is_err() {
+                if tx.send(Ok(to_axum_event(&ev))).await.is_err() {
                     return false;
                 }
             }

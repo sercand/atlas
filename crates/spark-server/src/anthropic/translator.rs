@@ -4,6 +4,22 @@ use axum::response::sse::Event;
 
 use super::helpers::*;
 
+/// A typed Anthropic SSE event (event name + JSON data). Testable, unlike
+/// axum's opaque `Event`; converted to an axum event at the handler edge
+/// by [`to_axum_event`].
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SseEvent {
+    pub(super) event: String,
+    pub(super) data: serde_json::Value,
+}
+
+/// Convert a typed [`SseEvent`] to an axum SSE event for the wire.
+pub(super) fn to_axum_event(e: &SseEvent) -> Event {
+    Event::default()
+        .event(&e.event)
+        .data(serde_json::to_string(&e.data).unwrap_or_default())
+}
+
 /// Open-block tracker for the streaming translator's state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OpenBlock {
@@ -75,9 +91,11 @@ impl AnthropicTranslator {
         }
     }
 
-    fn make_event(ev_type: &str, data: serde_json::Value) -> Event {
-        let json_str = serde_json::to_string(&data).unwrap_or_default();
-        Event::default().event(ev_type).data(json_str)
+    fn make_event(ev_type: &str, data: serde_json::Value) -> SseEvent {
+        SseEvent {
+            event: ev_type.to_string(),
+            data,
+        }
     }
 
     /// Close the currently open block (if any) and increment the
@@ -93,7 +111,7 @@ impl AnthropicTranslator {
     /// a new index — Claude Code interprets each duplicate as a
     /// separate tool execution. Root-caused 2026-04-26 (8-agent
     /// sweep, F3).
-    pub(super) fn close_open_block(&mut self) -> Option<Event> {
+    pub(super) fn close_open_block(&mut self) -> Option<SseEvent> {
         match self.open_block {
             OpenBlock::None => None,
             OpenBlock::Text | OpenBlock::Thinking => {
@@ -124,7 +142,7 @@ impl AnthropicTranslator {
         }
     }
 
-    pub(super) fn ensure_message_start(&mut self, out: &mut Vec<Event>) {
+    pub(super) fn ensure_message_start(&mut self, out: &mut Vec<SseEvent>) {
         if self.msg_started {
             return;
         }
@@ -157,7 +175,11 @@ impl AnthropicTranslator {
 
     /// Process one OpenAI chat-completion chunk JSON value, push
     /// resulting Anthropic events into `out`.
-    pub(super) fn process_openai_chunk(&mut self, val: &serde_json::Value, out: &mut Vec<Event>) {
+    pub(super) fn process_openai_chunk(
+        &mut self,
+        val: &serde_json::Value,
+        out: &mut Vec<SseEvent>,
+    ) {
         // Pick up the chat-completion id on the first chunk that
         // carries it (typically the role chunk).
         if self.msg_id.is_empty()
@@ -407,7 +429,7 @@ impl AnthropicTranslator {
 
     /// Stream ended without an explicit `finish_reason`. Best-effort
     /// flush so the client sees a coherent end of message.
-    pub(super) fn finalize(&mut self, out: &mut Vec<Event>) {
+    pub(super) fn finalize(&mut self, out: &mut Vec<SseEvent>) {
         if self.finished {
             return;
         }
