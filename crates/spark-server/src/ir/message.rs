@@ -72,8 +72,12 @@ pub struct Message {
     /// First-class historical reasoning trace (a prior assistant
     /// `<think>` body) instead of a `<think>\n\n</think>` string prefix.
     pub reasoning: Option<Reasoning>,
-    /// `Tool` role only: the tool result reported an error. Replaces the
-    /// `[tool error]\n` string-prefix smuggling on the Anthropic path.
+    /// `Tool` role only: the tool result reported an error. The intended
+    /// first-class home for Anthropic's `is_error` flag. NOT wired yet — the
+    /// Anthropic path still emits the `[tool error]\n` text prefix; dropping
+    /// that in favor of this field is gated on flipping
+    /// `ChatCompletionRequest.messages` to the IR (issue #165 follow-up), so
+    /// no adapter sets it to `true` today.
     pub tool_error: bool,
 }
 
