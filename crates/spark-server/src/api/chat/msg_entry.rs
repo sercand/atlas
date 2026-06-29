@@ -10,9 +10,9 @@
 
 use axum::http::StatusCode;
 use axum::response::Response;
-use std::sync::Arc;
 
-use crate::AppState;
+use atlas_core::config::VisionConfig;
+
 use crate::ir::{ContentPart, ImageData, Message, Role};
 
 use super::super::compact::openai_error_response;
@@ -51,9 +51,30 @@ pub(super) struct BuildOut {
     pub(super) image_pad_counts: Vec<usize>,
 }
 
+/// Append the encoder-input string for every image part on `m` to
+/// `all_images`, growing `image_pad_counts` in lockstep (each pad count is
+/// filled in later by the vision preprocessor). Shared by the tool-message
+/// branch and the normal branch so images ride every role uniformly —
+/// including tool results, the motivating case for issue #165.
+fn collect_message_images(
+    m: &Message,
+    all_images: &mut Vec<String>,
+    image_pad_counts: &mut Vec<usize>,
+) {
+    for part in &m.content {
+        if let ContentPart::Image(src) = part {
+            let uri = match &src.data {
+                ImageData::Base64(s) | ImageData::Url(s) => s.clone(),
+            };
+            all_images.push(uri);
+            image_pad_counts.push(0);
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 pub(super) fn build_msg_entries(
-    state: &Arc<AppState>,
+    vision_config: Option<&VisionConfig>,
     input: &[Message],
     tools_active: bool,
 ) -> Result<BuildOut, Response> {
@@ -126,9 +147,10 @@ pub(super) fn build_msg_entries(
                 role: "tool".into(),
                 content: text,
                 tool_calls: None,
-                image_count: 0,
+                image_count: m.image_count(),
                 reasoning_content: None,
             });
+            collect_message_images(m, &mut all_images, &mut image_pad_counts);
             continue;
         }
 
@@ -165,15 +187,7 @@ pub(super) fn build_msg_entries(
                 None
             },
         });
-        for part in &m.content {
-            if let ContentPart::Image(src) = part {
-                let uri = match &src.data {
-                    ImageData::Base64(s) | ImageData::Url(s) => s.clone(),
-                };
-                all_images.push(uri);
-                image_pad_counts.push(0);
-            }
-        }
+        collect_message_images(m, &mut all_images, &mut image_pad_counts);
     }
 
     // Extract working directory from the system message if present.
@@ -228,11 +242,18 @@ pub(super) fn build_msg_entries(
         );
     }
 
-    // Preprocess images if a vision config is available.
+    // Preprocess images. One shared fail-fast point: if images were
+    // supplied but the model has no vision encoder, reject the request
+    // (issue #165) instead of silently dropping the user's input with a
+    // 200 — the old text-only behavior lost images without any signal.
     let mut image_pixels: Vec<(Vec<f32>, usize, usize)> = Vec::new();
-    if !all_images.is_empty()
-        && let Some(vcfg) = &state.vision_config
-    {
+    if !all_images.is_empty() {
+        let Some(vcfg) = vision_config else {
+            return Err(openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "this model does not accept image input (no vision config)".to_string(),
+            ));
+        };
         for (idx, uri) in all_images.iter().enumerate() {
             match spark_model::vision_preprocess::preprocess_image(uri, vcfg) {
                 Ok((pixels, grid_h, grid_w)) => {
@@ -252,8 +273,6 @@ pub(super) fn build_msg_entries(
             }
         }
     }
-    // If no vision_config (text-only model), image_pad_counts stays
-    // 0 and images are silently dropped on the encoder side.
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with
     // no productive file output, append a steering nudge to the most recent
@@ -331,5 +350,70 @@ mod vacuous_system_tests {
         assert!(!is_vacuous_system_content(
             "Summarize the following transcript and then ask the user this:"
         ));
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::build_msg_entries;
+    use crate::ir::message::{ContentPart, ImageData, ImageSource, Message, Role};
+    use axum::http::StatusCode;
+
+    fn assert_bad_request(msgs: &[Message], tools_active: bool) {
+        match build_msg_entries(None, msgs, tools_active) {
+            Ok(_) => panic!("expected 400, got Ok"),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::BAD_REQUEST),
+        }
+    }
+
+    fn text(role: Role, t: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentPart::Text(t.into())],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+            tool_error: false,
+        }
+    }
+
+    fn image(role: Role) -> Message {
+        Message {
+            role,
+            content: vec![
+                ContentPart::Image(ImageSource {
+                    data: ImageData::Base64("data:image/png;base64,AAA".into()),
+                }),
+                ContentPart::Text("result".into()),
+            ],
+            tool_calls: Vec::new(),
+            tool_call_id: Some("c1".into()),
+            name: None,
+            reasoning: None,
+            tool_error: false,
+        }
+    }
+
+    #[test]
+    fn text_only_builds_without_vision_config() {
+        let msgs = vec![text(Role::User, "hello")];
+        let out = build_msg_entries(None, &msgs, false).expect("text-only ok");
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0].image_count, 0);
+    }
+
+    #[test]
+    fn user_image_without_vision_config_is_rejected() {
+        // Previously: silently dropped (200). Now: fail fast.
+        assert_bad_request(&[text(Role::User, "hi"), image(Role::User)], false);
+    }
+
+    #[test]
+    fn tool_result_image_is_collected_and_rejected_without_vision() {
+        // Proves the tool branch now COUNTS + COLLECTS images (it used to
+        // hardcode image_count: 0 and `continue` before collection): the
+        // fail-fast only fires when an image was actually collected.
+        assert_bad_request(&[text(Role::User, "look"), image(Role::Tool)], true);
     }
 }

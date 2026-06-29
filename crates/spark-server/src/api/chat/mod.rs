@@ -140,7 +140,8 @@ pub(crate) async fn chat_completions_inner(
         cwd_hint,
         image_pixels,
         image_pad_counts,
-    } = match msg_entry::build_msg_entries(&state, &ir_messages, tools_active) {
+    } = match msg_entry::build_msg_entries(state.vision_config.as_ref(), &ir_messages, tools_active)
+    {
         Ok(o) => o,
         Err(resp) => return resp,
     };
