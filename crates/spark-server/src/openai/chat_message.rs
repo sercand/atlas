@@ -87,6 +87,7 @@ impl IncomingMessage {
                     .to_string();
                 let content_val = obj.get("content")?;
                 let mut text = String::new();
+                let mut images: Vec<String> = Vec::new();
                 match content_val {
                     serde_json::Value::String(s) => text.push_str(s),
                     serde_json::Value::Array(parts) => {
@@ -98,6 +99,12 @@ impl IncomingMessage {
                                     && let Some(t) = po.get("text").and_then(|t| t.as_str())
                                 {
                                     text.push_str(t);
+                                } else if matches!(part_kind, "input_image" | "image_url" | "image")
+                                    && let Some(url) = responses_image_url(po)
+                                {
+                                    // Carry the image instead of dropping it — the
+                                    // pipeline collects these into the vision encoder.
+                                    images.push(url);
                                 }
                             }
                         }
@@ -106,10 +113,7 @@ impl IncomingMessage {
                 }
                 Some(Self {
                     role,
-                    content: ParsedContent {
-                        text,
-                        images: Vec::new(),
-                    },
+                    content: ParsedContent { text, images },
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -186,6 +190,20 @@ impl IncomingMessage {
             "reasoning" => None,
             _ => None,
         }
+    }
+}
+
+/// Extract the image URL / data-URI from a Responses `input_image`
+/// content part. Accepts both the flat string form
+/// (`"image_url": "..."`) and the nested object form
+/// (`"image_url": {"url": "..."}`).
+fn responses_image_url(po: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    match po.get("image_url") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Object(o)) => {
+            o.get("url").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        _ => None,
     }
 }
 

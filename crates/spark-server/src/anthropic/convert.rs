@@ -32,7 +32,9 @@ pub(super) fn flatten_content(
                             text_parts.push(c.to_text());
                         }
                     }
-                    ContentBlock::Thinking { .. } | ContentBlock::Unknown => {}
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Unknown => {}
                 }
             }
             (text_parts.join(""), tool_calls)

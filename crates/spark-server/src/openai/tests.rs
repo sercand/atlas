@@ -196,6 +196,44 @@ fn markdown_link_with_parens_in_url_preserved() {
 }
 
 #[test]
+fn responses_input_image_string_url_is_carried() {
+    // Regression: the Responses adapter used to drop images entirely
+    // (`images: Vec::new()`), silently losing multimodal input.
+    let item = serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "what is this?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+        ]
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("message");
+    assert_eq!(m.content.text, "what is this?");
+    assert_eq!(
+        m.content.images,
+        vec!["data:image/png;base64,AAA".to_string()]
+    );
+}
+
+#[test]
+fn responses_input_image_object_url_is_carried() {
+    // Some SDKs nest the url: `{image_url: {url: "..."}}`.
+    let item = serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_image", "image_url": {"url": "https://example.com/a.png"}}
+        ]
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("message");
+    assert_eq!(
+        m.content.images,
+        vec!["https://example.com/a.png".to_string()]
+    );
+    assert_eq!(m.content.text, "");
+}
+
+#[test]
 fn responses_in_progress_event_name() {
     let ev = ResponsesStreamEvent::InProgress {
         sequence_number: 1,

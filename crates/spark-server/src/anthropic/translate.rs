@@ -140,6 +140,25 @@ pub(super) fn audit_translation_drift(req: &MessagesRequest, chat_json: &serde_j
     }
 }
 
+/// Build an OpenAI message `content` value: a plain string when there are
+/// no images (byte-identical to the historical output), or a multimodal
+/// `[{image_url}*, {text}]` array when images are present. Images come
+/// first to match the IR content-part ordering and the template's
+/// `[image*N, text]` shape.
+fn content_value(text: &str, images: &[String]) -> serde_json::Value {
+    if images.is_empty() {
+        return serde_json::Value::String(text.to_string());
+    }
+    let mut parts: Vec<serde_json::Value> = images
+        .iter()
+        .map(|u| serde_json::json!({"type": "image_url", "image_url": {"url": u}}))
+        .collect();
+    if !text.is_empty() {
+        parts.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    serde_json::Value::Array(parts)
+}
+
 pub(super) fn anthropic_to_chat_request_json(req: &MessagesRequest) -> serde_json::Value {
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(req.messages.len() + 1);
 
@@ -177,11 +196,18 @@ pub(super) fn anthropic_to_chat_request_json(req: &MessagesRequest) -> serde_jso
             }
             AnthropicContent::Blocks(blocks) => {
                 let mut text_parts: Vec<String> = Vec::new();
+                let mut images: Vec<String> = Vec::new();
+                let mut reasoning_parts: Vec<String> = Vec::new();
                 let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-                let mut tool_results: Vec<(String, String)> = Vec::new();
+                let mut tool_results: Vec<(String, String, Vec<String>)> = Vec::new();
                 for b in blocks {
                     match b {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
+                        ContentBlock::Image { source } => {
+                            if let Some(uri) = source.to_image_uri() {
+                                images.push(uri);
+                            }
+                        }
                         ContentBlock::ToolUse { id, name, input } => {
                             tool_calls.push(serde_json::json!({
                                 "id": id,
@@ -211,33 +237,61 @@ pub(super) fn anthropic_to_chat_request_json(req: &MessagesRequest) -> serde_jso
                             } else {
                                 text
                             };
-                            tool_results.push((tool_use_id.clone(), prefixed));
+                            // Carry images embedded in a tool result (e.g. a
+                            // screenshot the tool returned) so they reach the
+                            // vision encoder (issue #165).
+                            let tr_images: Vec<String> = match content {
+                                Some(ToolResultContent::Blocks(inner)) => inner
+                                    .iter()
+                                    .filter_map(|ib| match ib {
+                                        ContentBlock::Image { source } => source.to_image_uri(),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            tool_results.push((tool_use_id.clone(), prefixed, tr_images));
                         }
-                        ContentBlock::Thinking { .. } | ContentBlock::Unknown => {}
+                        ContentBlock::Thinking { thinking } => {
+                            // Historical assistant reasoning — previously
+                            // dropped. Forward it as `reasoning_content` so the
+                            // template can rehydrate the `<think>` block instead
+                            // of emitting an empty one.
+                            if let Some(t) = thinking
+                                && !t.is_empty()
+                            {
+                                reasoning_parts.push(t.clone());
+                            }
+                        }
+                        ContentBlock::Unknown => {}
                     }
                 }
                 let text_content = text_parts.join("");
                 if role == "assistant" {
                     let mut msg = serde_json::json!({
                         "role": "assistant",
-                        "content": text_content,
+                        "content": content_value(&text_content, &images),
                     });
                     if !tool_calls.is_empty() {
                         msg["tool_calls"] = serde_json::Value::Array(tool_calls);
                     }
+                    if !reasoning_parts.is_empty() {
+                        msg["reasoning_content"] =
+                            serde_json::Value::String(reasoning_parts.join("\n"));
+                    }
                     messages.push(msg);
                 } else {
-                    if !text_content.is_empty() {
+                    if !text_content.is_empty() || !images.is_empty() {
                         messages.push(serde_json::json!({
                             "role": "user",
-                            "content": text_content,
+                            "content": content_value(&text_content, &images),
                         }));
                     }
-                    for (tool_use_id, text) in tool_results {
+                    for (tool_use_id, text, tr_images) in tool_results {
                         messages.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
-                            "content": text,
+                            "content": content_value(&text, &tr_images),
                         }));
                     }
                 }
