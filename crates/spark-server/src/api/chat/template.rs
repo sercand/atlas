@@ -40,38 +40,7 @@ pub(super) fn render_template(
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|m| {
-            let content_val = if m.image_count > 0 {
-                let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.image_count + 1);
-                for _ in 0..m.image_count {
-                    items.push(serde_json::json!({"type": "image"}));
-                }
-                if !m.content.is_empty() {
-                    items.push(serde_json::json!({"type": "text", "text": m.content}));
-                }
-                serde_json::Value::Array(items)
-            } else {
-                serde_json::Value::String(m.content.clone())
-            };
-            let mut msg = serde_json::json!({"role": m.role, "content": content_val});
-            if let Some(ref tcs) = m.tool_calls {
-                msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
-            }
-            // F1: forward historical reasoning trace to the Jinja
-            // template. The template at qwen3_5_moe.jinja:90-104
-            // reads `message.reasoning_content` and rehydrates the
-            // `<think>` block for the historical assistant turns.
-            // Without this, every historical assistant message
-            // rendered an empty `<think>\n\n</think>\n\n` wrapper
-            // (empty-think poisoning, → premature `<|im_end|>`).
-            if let Some(ref rc) = m.reasoning_content {
-                msg["reasoning_content"] = serde_json::Value::String(rc.clone());
-            }
-            msg
-        })
-        .collect();
+    let json_messages = build_json_messages(messages);
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
@@ -167,4 +136,113 @@ pub(super) fn render_template(
         enable_thinking,
         thinking_budget,
     })
+}
+
+/// Build the Jinja-facing JSON message array from the processed
+/// [`MsgEntry`] vec. Pure (no tokenizer/state) so it can be
+/// characterization-tested directly:
+///   * `image_count == 0` → `content` is a plain string,
+///   * `image_count > 0`  → `content` is `[{type:image} * N, {type:text}]`
+///     (text part omitted when empty),
+///   * `tool_calls` / `reasoning_content` attached when present.
+pub(super) fn build_json_messages(messages: &[MsgEntry]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let content_val = if m.image_count > 0 {
+                let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.image_count + 1);
+                for _ in 0..m.image_count {
+                    items.push(serde_json::json!({"type": "image"}));
+                }
+                if !m.content.is_empty() {
+                    items.push(serde_json::json!({"type": "text", "text": m.content}));
+                }
+                serde_json::Value::Array(items)
+            } else {
+                serde_json::Value::String(m.content.clone())
+            };
+            let mut msg = serde_json::json!({"role": m.role, "content": content_val});
+            if let Some(ref tcs) = m.tool_calls {
+                msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
+            }
+            // F1: forward historical reasoning trace to the Jinja
+            // template. The template at qwen3_5_moe.jinja:90-104
+            // reads `message.reasoning_content` and rehydrates the
+            // `<think>` block for the historical assistant turns.
+            // Without this, every historical assistant message
+            // rendered an empty `<think>\n\n</think>\n\n` wrapper
+            // (empty-think poisoning, → premature `<|im_end|>`).
+            if let Some(ref rc) = m.reasoning_content {
+                msg["reasoning_content"] = serde_json::Value::String(rc.clone());
+            }
+            msg
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod json_message_tests {
+    use super::MsgEntry;
+    use super::build_json_messages;
+
+    fn entry(role: &str, content: &str, image_count: usize) -> MsgEntry {
+        MsgEntry {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            image_count,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn plain_text_message_serializes_to_string_content() {
+        let out = build_json_messages(&[entry("user", "hi", 0)]);
+        assert_eq!(
+            out,
+            vec![serde_json::json!({"role": "user", "content": "hi"})]
+        );
+    }
+
+    #[test]
+    fn images_expand_to_structured_content_array_with_text_last() {
+        let out = build_json_messages(&[entry("user", "look", 2)]);
+        assert_eq!(
+            out,
+            vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "image"},
+                    {"type": "text", "text": "look"}
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn empty_text_with_images_omits_text_part() {
+        let out = build_json_messages(&[entry("user", "", 1)]);
+        assert_eq!(
+            out,
+            vec![serde_json::json!({"role": "user", "content": [{"type": "image"}]})]
+        );
+    }
+
+    #[test]
+    fn tool_calls_and_reasoning_are_attached() {
+        let mut e = entry("assistant", "", 0);
+        e.tool_calls = Some(vec![serde_json::json!({"id": "c1"})]);
+        e.reasoning_content = Some("because".to_string());
+        let out = build_json_messages(&[e]);
+        assert_eq!(
+            out,
+            vec![serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c1"}],
+                "reasoning_content": "because"
+            })]
+        );
+    }
 }

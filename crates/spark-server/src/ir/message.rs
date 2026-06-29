@@ -5,28 +5,38 @@
 // and the template renderer read only these types.
 
 /// Message author role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     System,
     User,
     Assistant,
     Tool,
+    /// Any other wire role string (e.g. `"developer"`, `"function"`),
+    /// preserved verbatim. The canonical roles above are matched by the
+    /// pipeline; unknown roles fall through to the template unchanged
+    /// (which is where today's "Unexpected message role" handling lives),
+    /// so introducing the IR does not change their behavior.
+    Other(String),
 }
 
 impl Role {
     /// Wire string used by the OpenAI/Anthropic envelopes and the Jinja
-    /// templates (`"system" | "user" | "assistant" | "tool"`).
-    pub fn as_wire(&self) -> &'static str {
+    /// templates (`"system" | "user" | "assistant" | "tool"`, or the
+    /// preserved string for [`Role::Other`]).
+    pub fn as_wire(&self) -> &str {
         match self {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
+            Role::Other(s) => s,
         }
     }
 
-    /// Parse a wire role string. Returns `None` for anything unknown —
+    /// Parse a known wire role. Returns `None` for anything unknown —
     /// callers decide the fallback explicitly (PCND: no silent default).
+    /// Use [`Role::from_wire_lossless`] when an unknown role must be
+    /// preserved rather than rejected.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "system" => Some(Role::System),
@@ -35,6 +45,13 @@ impl Role {
             "tool" => Some(Role::Tool),
             _ => None,
         }
+    }
+
+    /// Map any wire role string to a `Role`, preserving unknown roles as
+    /// [`Role::Other`] (lossless — the template still decides what to do
+    /// with them).
+    pub fn from_wire_lossless(s: &str) -> Self {
+        Self::from_wire(s).unwrap_or_else(|| Role::Other(s.to_string()))
     }
 }
 

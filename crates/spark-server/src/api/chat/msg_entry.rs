@@ -13,7 +13,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::openai::ChatCompletionRequest;
+use crate::ir::{ContentPart, ImageData, Message, Role};
 
 use super::super::compact::openai_error_response;
 
@@ -54,10 +54,10 @@ pub(super) struct BuildOut {
 #[allow(clippy::result_large_err)]
 pub(super) fn build_msg_entries(
     state: &Arc<AppState>,
-    req: &ChatCompletionRequest,
+    input: &[Message],
     tools_active: bool,
 ) -> Result<BuildOut, Response> {
-    let mut messages: Vec<MsgEntry> = Vec::with_capacity(req.messages.len());
+    let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut all_images: Vec<String> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
     let mut consecutive_tool_errors: u32 = 0;
@@ -72,49 +72,40 @@ pub(super) fn build_msg_entries(
     // assistant turns. The Jinja template already does this gating
     // itself (via its own `ns.last_query_index` computation) and the
     // injection here was the source of empty-think poisoning. Removed.
-    for (msg_idx, m) in req.messages.iter().enumerate() {
-        let _ = msg_idx;
-        let text = m.content.text.clone();
+    for m in input.iter() {
+        let text = m.text();
 
         // Preserve structured tool_calls for the Jinja template.
         // Always extract from assistant messages — past turns may
         // carry tool_calls that the template MUST render even when
-        // the current request didn't pass `tools`.
-        let tool_calls_json = if m.role == "assistant" {
-            m.tool_calls.as_ref().and_then(|tcs| {
-                if tcs.is_empty() {
-                    return None;
-                }
-                let parsed: Vec<serde_json::Value> = tcs
-                    .iter()
-                    .map(|tc| {
-                        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::Value::Object(Default::default()));
-                        serde_json::json!({
-                            "id": tc.id.as_deref().unwrap_or(""),
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": args
-                            }
-                        })
+        // the current request didn't pass `tools`. `tc.arguments` is
+        // already structured JSON in the IR (parsed at the adapter
+        // boundary), so we forward it directly.
+        let tool_calls_json = if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+            let parsed: Vec<serde_json::Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
                     })
-                    .collect();
-                Some(parsed)
-            })
+                })
+                .collect();
+            Some(parsed)
         } else {
             None
         };
 
         // BW1: tally tool-call productivity (write/edit/build-run vs explore).
-        if m.role == "assistant"
-            && let Some(ref tcs) = m.tool_calls
-        {
-            for tc in tcs {
+        if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+            for tc in &m.tool_calls {
                 total_tool_calls += 1;
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                if crate::hint_injector::tool_call_is_productive(&tc.function.name, &args) {
+                if crate::hint_injector::tool_call_is_productive(&tc.name, &tc.arguments) {
                     productive_tool_calls += 1;
                 }
             }
@@ -123,7 +114,7 @@ pub(super) fn build_msg_entries(
         // Tool-response messages: pass raw content; Jinja template
         // handles `<tool_response>` wrapping and consecutive
         // grouping.
-        if tools_active && m.role == "tool" {
+        if tools_active && m.role == Role::Tool {
             let mut text = text;
             if crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
@@ -141,7 +132,7 @@ pub(super) fn build_msg_entries(
             continue;
         }
 
-        let image_count = m.content.images.len();
+        let image_count = m.image_count();
         // Wave 3 (2026-05-26): `ATLAS_STRIP_REASONING_HISTORY=1` drops
         // historical reasoning_content entirely. Matches MLC commit
         // d75d64e (Apr 2026) `strip_reasoning_in_history` for qwen3,
@@ -154,7 +145,7 @@ pub(super) fn build_msg_entries(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         messages.push(MsgEntry {
-            role: m.role.clone(),
+            role: m.role.as_wire().to_string(),
             content: text,
             tool_calls: tool_calls_json,
             image_count,
@@ -165,18 +156,21 @@ pub(super) fn build_msg_entries(
             // empty-`<think>\n\n</think>\n\n` poisoning, because F6's
             // template change skips the wrapper when reasoning_content
             // is empty.
-            reasoning_content: if m.role == "assistant" && !strip_reasoning {
-                m.reasoning_content
+            reasoning_content: if m.role == Role::Assistant && !strip_reasoning {
+                m.reasoning
                     .as_ref()
-                    .map(|s| s.trim().to_string())
+                    .map(|r| r.text.trim().to_string())
                     .filter(|s| !s.is_empty())
             } else {
                 None
             },
         });
-        if !m.content.images.is_empty() {
-            for img_uri in &m.content.images {
-                all_images.push(img_uri.clone());
+        for part in &m.content {
+            if let ContentPart::Image(src) = part {
+                let uri = match &src.data {
+                    ImageData::Base64(s) | ImageData::Url(s) => s.clone(),
+                };
+                all_images.push(uri);
                 image_pad_counts.push(0);
             }
         }

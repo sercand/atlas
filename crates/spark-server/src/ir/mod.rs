@@ -7,7 +7,10 @@
 // request/response type. This is the narrow waist that keeps the
 // OpenAI/Anthropic surfaces from drifting (AGENTS.md).
 
+pub mod from_openai;
 pub mod message;
+
+pub use message::{ContentPart, ImageData, Message, Role};
 
 #[cfg(test)]
 mod tests;

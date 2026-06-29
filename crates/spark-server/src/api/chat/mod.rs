@@ -132,12 +132,15 @@ pub(crate) async fn chat_completions_inner(
     );
 
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
+    // Convert the OpenAI wire messages into the canonical chat IR at the
+    // edge; everything downstream reads only the IR.
+    let ir_messages: Vec<crate::ir::Message> = req.messages.iter().map(Into::into).collect();
     let msg_entry::BuildOut {
         messages,
         cwd_hint,
         image_pixels,
         image_pad_counts,
-    } = match msg_entry::build_msg_entries(&state, &req, tools_active) {
+    } = match msg_entry::build_msg_entries(&state, &ir_messages, tools_active) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
