@@ -452,7 +452,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRe
         data: vec![ModelInfo {
             id: state.model_name.clone(),
             object: "model".to_string(),
-            created: crate::openai::unix_timestamp(),
+            created: crate::ids::unix_timestamp(),
             owned_by: "atlas-spark".to_string(),
         }],
     })
@@ -467,7 +467,7 @@ pub async fn get_model(
         Json(serde_json::json!({
             "id": state.model_name,
             "object": "model",
-            "created": crate::openai::unix_timestamp(),
+            "created": crate::ids::unix_timestamp(),
             "owned_by": "atlas-spark",
         }))
         .into_response()

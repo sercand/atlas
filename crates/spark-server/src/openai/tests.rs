@@ -196,6 +196,95 @@ fn markdown_link_with_parens_in_url_preserved() {
 }
 
 #[test]
+fn responses_input_image_string_url_is_carried() {
+    // Regression: the Responses adapter used to drop images entirely
+    // (`images: Vec::new()`), silently losing multimodal input.
+    let item = serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "what is this?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+        ]
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("message");
+    assert_eq!(m.content.text, "what is this?");
+    assert_eq!(
+        m.content.images,
+        vec!["data:image/png;base64,AAA".to_string()]
+    );
+}
+
+#[test]
+fn responses_input_image_object_url_is_carried() {
+    // Some SDKs nest the url: `{image_url: {url: "..."}}`.
+    let item = serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_image", "image_url": {"url": "https://example.com/a.png"}}
+        ]
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("message");
+    assert_eq!(
+        m.content.images,
+        vec!["https://example.com/a.png".to_string()]
+    );
+    assert_eq!(m.content.text, "");
+}
+
+#[test]
+fn responses_function_call_output_image_is_carried() {
+    // #165 parity for the Responses surface: a screenshot returned by a
+    // tool (`function_call_output` with structured output parts) must
+    // reach the vision encoder, exactly like Anthropic tool_result
+    // images and chat-completions role:"tool" array content.
+    let item = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": [
+            {"type": "output_text", "text": "screenshot follows"},
+            {"type": "input_image", "image_url": "data:image/png;base64,BBB"}
+        ]
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
+    assert_eq!(m.role, "tool");
+    assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(m.content.text, "screenshot follows");
+    assert_eq!(
+        m.content.images,
+        vec!["data:image/png;base64,BBB".to_string()]
+    );
+}
+
+#[test]
+fn responses_function_call_output_string_unchanged() {
+    let item = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "call_2",
+        "output": "plain result"
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
+    assert_eq!(m.content.text, "plain result");
+    assert!(m.content.images.is_empty());
+}
+
+#[test]
+fn responses_function_call_output_opaque_array_stringified() {
+    // Out-of-spec array (no recognizable parts) keeps the historical
+    // stringified-JSON behavior instead of silently emptying the result.
+    let opaque = serde_json::json!([{"weather": "sunny", "temp_c": 21}]);
+    let item = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "call_3",
+        "output": opaque.clone()
+    });
+    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
+    assert_eq!(m.content.text, opaque.to_string());
+    assert!(m.content.images.is_empty());
+}
+
+#[test]
 fn responses_in_progress_event_name() {
     let ev = ResponsesStreamEvent::InProgress {
         sequence_number: 1,
@@ -287,68 +376,167 @@ fn blocking_message_emits_only_reasoning_content() {
     );
 }
 
-// ── ChatTemplateKwargs ────────────────────────────────────────────
+// ── Thinking directive (client channels → ir::ThinkingDirective) ──
+
+use crate::ir::ThinkingDirective;
+
+fn chat_req(body: serde_json::Value) -> ChatCompletionRequest {
+    serde_json::from_value(body).expect("valid chat request")
+}
+
+fn base_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+}
 
 #[test]
-fn chat_template_kwargs_parse() {
-    let kw = ChatTemplateKwargs::from_json(r#"{"enable_thinking":true,"thinking_budget":1024}"#)
-        .expect("should parse");
+fn silent_request_is_unspecified() {
+    let req = chat_req(base_body());
+    assert_eq!(
+        req.client_thinking_directive(),
+        ThinkingDirective::Unspecified
+    );
+    assert!(!req.client_thinking_directive().is_explicit());
+}
+
+#[test]
+fn anthropic_thinking_channel() {
+    // type=disabled wins even with a budget present.
+    let mut b = base_body();
+    b["thinking"] = serde_json::json!({"type": "disabled", "budget_tokens": 100});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::Off
+    );
+
+    let mut b = base_body();
+    b["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": 512});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: Some(512) }
+    );
+
+    // Adaptive / budget-less thinking object → think as long as needed
+    // (budget defers to the per-model max_thinking_budget).
+    let mut b = base_body();
+    b["thinking"] = serde_json::json!({"type": "adaptive"});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: None }
+    );
+}
+
+#[test]
+fn thinking_token_budget_channel() {
+    let mut b = base_body();
+    b["thinking_token_budget"] = serde_json::json!(512);
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: Some(512) }
+    );
+
+    let mut b = base_body();
+    b["thinking_token_budget"] = serde_json::json!(0);
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::Off
+    );
+}
+
+#[test]
+fn reasoning_effort_channel() {
+    for (effort, expect) in [
+        ("none", ThinkingDirective::Off),
+        ("minimal", ThinkingDirective::On { budget: Some(64) }),
+        ("low", ThinkingDirective::On { budget: Some(128) }),
+        ("medium", ThinkingDirective::On { budget: Some(256) }),
+        ("high", ThinkingDirective::On { budget: Some(512) }),
+        ("xhigh", ThinkingDirective::On { budget: Some(1024) }),
+        ("max", ThinkingDirective::On { budget: Some(1024) }),
+        // Unknown efforts fall back to the conservative default budget.
+        ("bogus", ThinkingDirective::On { budget: Some(256) }),
+    ] {
+        let mut b = base_body();
+        b["reasoning"] = serde_json::json!({"effort": effort});
+        assert_eq!(
+            chat_req(b).client_thinking_directive(),
+            expect,
+            "effort={effort}"
+        );
+    }
+}
+
+#[test]
+fn chat_template_kwargs_channel() {
+    // Struct still parses as a request-body wire field.
+    let kw: ChatTemplateKwargs =
+        serde_json::from_str(r#"{"enable_thinking":true,"thinking_budget":1024}"#)
+            .expect("should parse");
     assert_eq!(kw.enable_thinking, Some(true));
     assert_eq!(kw.thinking_budget, Some(1024));
 
-    assert!(ChatTemplateKwargs::from_json("").is_none());
-}
+    // Budget rung wins over the enable flag.
+    let mut b = base_body();
+    b["chat_template_kwargs"] =
+        serde_json::json!({"enable_thinking": false, "thinking_budget": 1024});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: Some(1024) }
+    );
 
-fn empty_chat_request() -> ChatCompletionRequest {
-    serde_json::from_value(serde_json::json!({
-        "model": "test",
-        "messages": [{"role": "user", "content": "hi"}],
-    }))
-    .expect("valid chat request")
-}
+    let mut b = base_body();
+    b["chat_template_kwargs"] = serde_json::json!({"thinking_budget": 0});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::Off
+    );
 
-#[test]
-fn server_default_merged_when_request_silent() {
-    let mut req = empty_chat_request();
-    assert!(req.chat_template_kwargs.is_none());
-
-    let server_kw = ChatTemplateKwargs {
-        enable_thinking: Some(true),
-        thinking_budget: None,
-    };
-    if !req.thinking_explicitly_requested() {
-        req.chat_template_kwargs = Some(server_kw);
-    }
-    assert!(req.chat_template_kwargs.is_some());
-
-    let (enabled, budget) = req.resolve_thinking(false);
-    assert!(enabled);
     // enable_thinking with no explicit budget defers to the per-model
-    // max_thinking_budget (None), not the conservative 256-token default —
-    // a hard cut force-injects </think> mid-reasoning and wrecks agentic
-    // tool selection (see resolve_thinking step 5).
-    assert!(budget.is_none());
+    // max_thinking_budget (budget: None), not the conservative 256-token
+    // default — a hard cut force-injects </think> mid-reasoning and
+    // wrecks agentic tool selection.
+    let mut b = base_body();
+    b["chat_template_kwargs"] = serde_json::json!({"enable_thinking": true});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: None }
+    );
+
+    let mut b = base_body();
+    b["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::Off
+    );
+
+    // Empty kwargs object carries no intent.
+    let mut b = base_body();
+    b["chat_template_kwargs"] = serde_json::json!({});
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::Unspecified
+    );
 }
 
 #[test]
-fn server_default_not_merged_when_request_explicit() {
-    let mut req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-        "model": "test",
-        "messages": [{"role": "user", "content": "hi"}],
-        "enable_thinking": true,
-    }))
-    .expect("valid chat request");
-    assert!(req.thinking_explicitly_requested());
+fn legacy_enable_thinking_channel() {
+    let mut b = base_body();
+    b["enable_thinking"] = serde_json::json!(true);
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: None }
+    );
 
-    let server_kw = ChatTemplateKwargs {
-        enable_thinking: Some(false),
-        thinking_budget: None,
-    };
-    if !req.thinking_explicitly_requested() {
-        req.chat_template_kwargs = Some(server_kw);
-    }
-    assert!(req.chat_template_kwargs.is_none());
-    assert!(req.resolve_thinking(false).0);
+    // false is the serde default — indistinguishable from absent, so it
+    // must NOT count as an explicit opt-out.
+    let mut b = base_body();
+    b["enable_thinking"] = serde_json::json!(false);
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::Unspecified
+    );
 }
 
 // ── Legacy /v1/completions echo + logprobs wire types ──

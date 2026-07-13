@@ -91,30 +91,9 @@ impl IncomingMessage {
                 }
                 .to_string();
                 let content_val = obj.get("content")?;
-                let mut text = String::new();
-                match content_val {
-                    serde_json::Value::String(s) => text.push_str(s),
-                    serde_json::Value::Array(parts) => {
-                        for part in parts {
-                            if let Some(po) = part.as_object() {
-                                let part_kind =
-                                    po.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                if matches!(part_kind, "input_text" | "output_text" | "text")
-                                    && let Some(t) = po.get("text").and_then(|t| t.as_str())
-                                {
-                                    text.push_str(t);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
                 Some(Self {
                     role,
-                    content: ParsedContent {
-                        text,
-                        images: Vec::new(),
-                    },
+                    content: responses_content_to_parsed(content_val),
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -161,10 +140,34 @@ impl IncomingMessage {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let output_text = match obj.get("output") {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(other) => other.to_string(),
-                    None => String::new(),
+                let output = match obj.get("output") {
+                    Some(serde_json::Value::String(s)) => ParsedContent {
+                        text: s.clone(),
+                        images: Vec::new(),
+                    },
+                    // Structured output parts (`output_text` / `input_image` /
+                    // …): carry text AND images so a screenshot returned by a
+                    // tool reaches the vision encoder — parity with the
+                    // Anthropic tool_result path and chat-completions
+                    // `role:"tool"` array content (#165). Arrays that contain
+                    // no recognizable parts keep the old stringified-JSON
+                    // behavior so out-of-spec payloads still reach the model.
+                    Some(arr @ serde_json::Value::Array(_)) => {
+                        let parsed = responses_content_to_parsed(arr);
+                        if parsed.text.is_empty() && parsed.images.is_empty() {
+                            ParsedContent {
+                                text: arr.to_string(),
+                                images: Vec::new(),
+                            }
+                        } else {
+                            parsed
+                        }
+                    }
+                    Some(other) => ParsedContent {
+                        text: other.to_string(),
+                        images: Vec::new(),
+                    },
+                    None => ParsedContent::default(),
                 };
                 let name = obj
                     .get("name")
@@ -173,10 +176,7 @@ impl IncomingMessage {
                     .to_string();
                 Some(Self {
                     role: "tool".to_string(),
-                    content: ParsedContent {
-                        text: output_text,
-                        images: Vec::new(),
-                    },
+                    content: output,
                     tool_calls: None,
                     tool_call_id: Some(call_id),
                     name: if name.is_empty() { None } else { Some(name) },
@@ -191,6 +191,51 @@ impl IncomingMessage {
             "reasoning" => None,
             _ => None,
         }
+    }
+}
+
+/// Flatten a Responses-API content value (string, or array of
+/// `input_text`/`output_text`/`input_image`/… parts) into text + image
+/// lists. Shared by `message` items and `function_call_output` items so
+/// images are carried on both — the pipeline collects them into the
+/// vision encoder.
+fn responses_content_to_parsed(v: &serde_json::Value) -> ParsedContent {
+    let mut text = String::new();
+    let mut images: Vec<String> = Vec::new();
+    match v {
+        serde_json::Value::String(s) => text.push_str(s),
+        serde_json::Value::Array(parts) => {
+            for part in parts {
+                if let Some(po) = part.as_object() {
+                    let part_kind = po.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if matches!(part_kind, "input_text" | "output_text" | "text")
+                        && let Some(t) = po.get("text").and_then(|t| t.as_str())
+                    {
+                        text.push_str(t);
+                    } else if matches!(part_kind, "input_image" | "image_url" | "image")
+                        && let Some(url) = responses_image_url(po)
+                    {
+                        images.push(url);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    ParsedContent { text, images }
+}
+
+/// Extract the image URL / data-URI from a Responses `input_image`
+/// content part. Accepts both the flat string form
+/// (`"image_url": "..."`) and the nested object form
+/// (`"image_url": {"url": "..."}`).
+fn responses_image_url(po: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    match po.get("image_url") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Object(o)) => {
+            o.get("url").and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        _ => None,
     }
 }
 

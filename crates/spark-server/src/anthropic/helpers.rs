@@ -54,12 +54,16 @@ pub(super) fn convert_tool_choice(tc: &AnthropicToolChoice) -> tool_parser::Tool
     }
 }
 
-/// Convert Anthropic finish reason to stop_reason string.
+/// Convert an OpenAI finish reason to Anthropic's stop_reason string.
 pub(super) fn convert_stop_reason(finish_reason: &str) -> &'static str {
     match finish_reason {
         "stop" => "end_turn",
         "tool_calls" => "tool_use",
         "length" => "max_tokens",
+        // Safety-filtered output maps to Anthropic's dedicated refusal
+        // stop reason (2025-05 API), not a normal end_turn — clients
+        // branch on this to avoid retrying verbatim.
+        "content_filter" => "refusal",
         _ => "end_turn",
     }
 }
