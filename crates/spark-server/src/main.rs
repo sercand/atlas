@@ -26,6 +26,7 @@ mod anthropic;
 mod api;
 mod auth;
 mod citation;
+mod citation_structured;
 mod cli;
 mod conversation_store;
 pub mod grammar;
