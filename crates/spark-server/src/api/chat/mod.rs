@@ -104,8 +104,8 @@ pub async fn chat_completions(
 
     // Wire → IR at the edge: echo-only fields peel off beside the
     // envelope; everything downstream reads only the IR.
-    let echo = ResponseEcho::from_wire(&req);
-    match chat_completions_inner(state.clone(), req_ctx, req.into_ir(), dump_seq).await {
+    let echo = ResponseEcho::from(&req);
+    match chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await {
         ChatOutcome::Blocking(ir) => {
             crate::openai::encode_chat_response(&state, *ir, &echo, dump_seq)
         }

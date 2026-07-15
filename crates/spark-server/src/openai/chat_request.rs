@@ -277,12 +277,6 @@ pub struct ChatTemplateKwargs {
 const DEFAULT_THINKING_BUDGET: u32 = 256;
 
 impl ChatCompletionRequest {
-    /// Per-request override for the vLLM-anchored token-loop detector.
-    /// `None` = use the boot-global watchdog parameters.
-    pub fn repetition_detection(&self) -> Option<RepetitionDetectionParams> {
-        self.repetition_detection
-    }
-
     /// Resolve the client's thinking intent from all supported
     /// request-body formats into the neutral [`ThinkingDirective`].
     /// This is the OpenAI-edge half of thinking resolution; the model

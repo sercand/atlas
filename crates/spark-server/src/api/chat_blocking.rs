@@ -413,7 +413,7 @@ async fn build_choice_message(
         reasoning: reasoning_content,
         tool_calls,
         refusal: msg_refusal,
-        finish_reason: ir::FinishReason::from_wire(&finish_reason_i),
+        finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
     }

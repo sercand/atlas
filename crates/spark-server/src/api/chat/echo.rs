@@ -20,9 +20,9 @@ pub(crate) struct ResponseEcho {
     pub(crate) include_usage: bool,
 }
 
-impl ResponseEcho {
+impl<'a> From<&'a crate::openai::ChatCompletionRequest> for ResponseEcho {
     /// Capture the echo fields from a parsed OpenAI wire request.
-    pub(crate) fn from_wire(req: &crate::openai::ChatCompletionRequest) -> Self {
+    fn from(req: &'a crate::openai::ChatCompletionRequest) -> Self {
         ResponseEcho {
             service_tier: req.service_tier.clone(),
             metadata: req.metadata.clone(),

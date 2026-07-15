@@ -35,7 +35,7 @@ impl Role {
 
     /// Parse a known wire role. Returns `None` for anything unknown —
     /// callers decide the fallback explicitly (PCND: no silent default).
-    /// Use [`Role::from_wire_lossless`] when an unknown role must be
+    /// Use the [`From<&str>`] impl when an unknown role must be
     /// preserved rather than rejected.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
@@ -46,11 +46,13 @@ impl Role {
             _ => None,
         }
     }
+}
 
+impl From<&str> for Role {
     /// Map any wire role string to a `Role`, preserving unknown roles as
     /// [`Role::Other`] (lossless — the template still decides what to do
     /// with them).
-    pub fn from_wire_lossless(s: &str) -> Self {
+    fn from(s: &str) -> Self {
         Self::from_wire(s).unwrap_or_else(|| Role::Other(s.to_string()))
     }
 }

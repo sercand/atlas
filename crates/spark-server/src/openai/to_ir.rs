@@ -50,7 +50,7 @@ impl From<&IncomingMessage> for Message {
             .unwrap_or_default();
 
         Message {
-            role: Role::from_wire_lossless(&m.role),
+            role: Role::from(m.role.as_str()),
             content,
             tool_calls,
             tool_call_id: m.tool_call_id.clone(),
@@ -61,7 +61,7 @@ impl From<&IncomingMessage> for Message {
     }
 }
 
-impl ChatCompletionRequest {
+impl From<ChatCompletionRequest> for ir::ChatRequest {
     /// Lower the parsed OpenAI wire request into the provider-agnostic
     /// [`ir::ChatRequest`] envelope. Infallible: range validation
     /// happens on the envelope (`chat_phases::validate_input`), and the
@@ -71,17 +71,17 @@ impl ChatCompletionRequest {
     /// Echo-only fields (service_tier, store, metadata,
     /// stream_options) are NOT lowered — the handler keeps the wire
     /// request for encode-time echoes.
-    pub fn into_ir(self) -> ir::ChatRequest {
-        let thinking = self.client_thinking_directive();
-        let top_logprobs = resolve_top_logprobs(self.logprobs, self.top_logprobs);
+    fn from(req: ChatCompletionRequest) -> Self {
+        let thinking = req.client_thinking_directive();
+        let top_logprobs = resolve_top_logprobs(req.logprobs, req.top_logprobs);
         // Logit bias: OpenAI's string-keyed map → typed pairs. Keys that
         // don't parse as token ids are dropped (historical behavior).
-        let logit_bias: Vec<(u32, f32)> = self.logit_bias.as_ref().map_or(Vec::new(), |map| {
+        let logit_bias: Vec<(u32, f32)> = req.logit_bias.as_ref().map_or(Vec::new(), |map| {
             map.iter()
                 .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v)))
                 .collect()
         });
-        let response_format = match self.response_format {
+        let response_format = match req.response_format {
             // "text" is the wire spelling of "no constraint".
             None | Some(ResponseFormat::Text) => None,
             Some(ResponseFormat::JsonObject) => Some(ir::ResponseFormat::JsonObject),
@@ -94,33 +94,33 @@ impl ChatCompletionRequest {
             }
         };
         ir::ChatRequest {
-            model: self.model,
-            messages: self.messages.iter().map(Into::into).collect(),
-            tools: self.tools.unwrap_or_default(),
-            tool_choice: self.tool_choice,
+            model: req.model,
+            messages: req.messages.iter().map(Into::into).collect(),
+            tools: req.tools.unwrap_or_default(),
+            tool_choice: req.tool_choice,
             sampling: ir::SamplingParams {
-                temperature: self.temperature,
-                top_k: self.top_k,
-                top_p: self.top_p,
-                top_n_sigma: self.top_n_sigma,
-                min_p: self.min_p,
-                repetition_penalty: self.repetition_penalty,
-                presence_penalty: self.presence_penalty,
-                frequency_penalty: self.frequency_penalty,
+                temperature: req.temperature,
+                top_k: req.top_k,
+                top_p: req.top_p,
+                top_n_sigma: req.top_n_sigma,
+                min_p: req.min_p,
+                repetition_penalty: req.repetition_penalty,
+                presence_penalty: req.presence_penalty,
+                frequency_penalty: req.frequency_penalty,
             },
-            max_tokens: self.max_tokens,
-            min_tokens: self.min_tokens,
-            stop: self.stop,
-            stream: self.stream,
-            n: self.n,
+            max_tokens: req.max_tokens,
+            min_tokens: req.min_tokens,
+            stop: req.stop,
+            stream: req.stream,
+            n: req.n,
             response_format,
             thinking,
-            repetition_detection: self.repetition_detection,
+            repetition_detection: req.repetition_detection,
             logit_bias,
             top_logprobs,
-            seed: self.seed,
-            timeout_secs: self.timeout,
-            return_token_ids: self.return_token_ids,
+            seed: req.seed,
+            timeout_secs: req.timeout,
+            return_token_ids: req.return_token_ids,
         }
     }
 }
@@ -313,7 +313,7 @@ mod tests {
             "seed": 7,
             "n": 2
         }));
-        let ir = req.into_ir();
+        let ir = ir::ChatRequest::from(req);
         assert_eq!(ir.model, "m");
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.max_tokens, 64);
@@ -336,14 +336,14 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {"type": "text"}
         }));
-        assert!(req.into_ir().response_format.is_none());
+        assert!(ir::ChatRequest::from(req).response_format.is_none());
 
         let req = wire(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {"type": "json_schema", "json_schema": {"name": "s", "schema": {"type": "object"}}}
         }));
-        match req.into_ir().response_format {
+        match ir::ChatRequest::from(req).response_format {
             Some(ir::ResponseFormat::JsonSchema {
                 name,
                 schema,

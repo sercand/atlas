@@ -90,10 +90,10 @@ pub enum FinishReason {
     Other(String),
 }
 
-impl FinishReason {
+impl From<&str> for FinishReason {
     /// Map the engine's finish-reason string (the scheduler's internal
     /// vocabulary, which happens to match OpenAI's wire strings).
-    pub fn from_wire(s: &str) -> Self {
+    fn from(s: &str) -> Self {
         match s {
             "stop" => FinishReason::Stop,
             "length" => FinishReason::Length,
@@ -102,7 +102,9 @@ impl FinishReason {
             other => FinishReason::Other(other.to_string()),
         }
     }
+}
 
+impl FinishReason {
     /// The canonical wire string (OpenAI-compatible surfaces emit it
     /// verbatim; other surfaces map per their own vocabulary).
     pub fn as_wire(&self) -> &str {

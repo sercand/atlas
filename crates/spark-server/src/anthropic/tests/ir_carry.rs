@@ -5,8 +5,7 @@
 // calls, and the tool_result error flag as typed structure (issue
 // #165 + IR migration).
 
-use super::super::translate::ir_to_anthropic_response;
-use super::super::types::MessagesRequest;
+use super::super::types::{MessagesRequest, MessagesResponse};
 use crate::ir::message::ImageSource;
 use crate::ir::{ChatRequest, ContentPart, ImageData, Role, ThinkingDirective};
 
@@ -14,7 +13,7 @@ use crate::ir::{ChatRequest, ContentPart, ImageData, Role, ThinkingDirective};
 /// `handlers::messages` takes).
 fn lower(req_json: serde_json::Value) -> ChatRequest {
     let req: MessagesRequest = serde_json::from_value(req_json).expect("MessagesRequest");
-    req.into_ir()
+    req.into()
 }
 
 fn text_of(parts: &[ContentPart]) -> String {
@@ -305,7 +304,7 @@ fn wire_surfaces_lower_to_identical_ir_core() {
         ]
     }))
     .expect("chat wire parses");
-    let chat_ir = chat.into_ir();
+    let chat_ir = ChatRequest::from(chat);
 
     assert_eq!(anth.messages, chat_ir.messages);
     assert_eq!(anth.thinking, chat_ir.thinking);
@@ -322,7 +321,7 @@ fn wire_surfaces_lower_to_identical_ir_core() {
     );
 }
 
-// ── response direction (ir_to_anthropic_response) ──
+// ── response direction (IR → MessagesResponse) ──
 
 fn ir_response(choice: crate::ir::Choice) -> crate::ir::ChatResponse {
     crate::ir::ChatResponse {
@@ -364,7 +363,7 @@ fn response_maps_reasoning_text_tools_and_usage() {
         arguments: serde_json::json!({"x": 1}),
     }];
     c.finish_reason = crate::ir::FinishReason::ToolCalls;
-    let json = serde_json::to_value(ir_to_anthropic_response(ir_response(c))).unwrap();
+    let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
     assert_eq!(json["id"], "msg_abc");
     assert_eq!(json["model"], "m");
     assert_eq!(json["stop_reason"], "tool_use");
@@ -386,19 +385,19 @@ fn response_stop_reason_mapping() {
     // content_filter → refusal (Anthropic's dedicated stop reason).
     let mut c = choice();
     c.finish_reason = crate::ir::FinishReason::ContentFilter;
-    let json = serde_json::to_value(ir_to_anthropic_response(ir_response(c))).unwrap();
+    let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
     assert_eq!(json["stop_reason"], "refusal");
 
     // length → max_tokens.
     let mut c = choice();
     c.finish_reason = crate::ir::FinishReason::Length;
-    let json = serde_json::to_value(ir_to_anthropic_response(ir_response(c))).unwrap();
+    let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
     assert_eq!(json["stop_reason"], "max_tokens");
 
     // A client stop sequence gets stop_sequence + the matched echo.
     let mut c = choice();
     c.matched_stop = Some("END".into());
-    let json = serde_json::to_value(ir_to_anthropic_response(ir_response(c))).unwrap();
+    let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
     assert_eq!(json["stop_reason"], "stop_sequence");
     assert_eq!(json["stop_sequence"], "END");
 }
@@ -407,7 +406,7 @@ fn response_stop_reason_mapping() {
 fn response_empty_content_omits_text_block() {
     let mut c = choice();
     c.content = Some(String::new());
-    let json = serde_json::to_value(ir_to_anthropic_response(ir_response(c))).unwrap();
+    let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
     assert_eq!(json["content"].as_array().unwrap().len(), 0);
     assert_eq!(json["stop_reason"], "end_turn");
 }

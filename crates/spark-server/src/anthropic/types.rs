@@ -138,7 +138,7 @@ impl ImageSourceBlock {
     /// Build the string the vision encoder consumes: a `data:` URI for
     /// base64 sources, or the raw URL for url sources. `None` when the
     /// required fields are missing.
-    pub(super) fn to_image_uri(&self) -> Option<String> {
+    pub(super) fn maybe_get_image_uri(&self) -> Option<String> {
         match self.source_type.as_str() {
             "base64" => {
                 let data = self.data.as_ref()?;

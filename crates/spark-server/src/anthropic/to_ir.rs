@@ -12,12 +12,11 @@ use crate::ir;
 use crate::ir::message::{ImageSource, Reasoning, ToolCall};
 use crate::ir::{ContentPart, ImageData, Message, Role, ThinkingDirective};
 
-use super::helpers::{convert_tool_choice, convert_tools};
 use super::types::{
     AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ToolResultContent,
 };
 
-impl MessagesRequest {
+impl From<MessagesRequest> for ir::ChatRequest {
     /// Lower the parsed Anthropic wire request into the
     /// provider-agnostic [`ir::ChatRequest`] envelope.
     ///
@@ -37,11 +36,11 @@ impl MessagesRequest {
     ///   the text here.
     /// * unknown roles collapse to user (Anthropic wire only defines
     ///   user/assistant).
-    pub fn into_ir(self) -> ir::ChatRequest {
-        let mut messages: Vec<Message> = Vec::with_capacity(self.messages.len() + 1);
+    fn from(req: MessagesRequest) -> Self {
+        let mut messages: Vec<Message> = Vec::with_capacity(req.messages.len() + 1);
 
         // System message (filter x-anthropic- billing/config blocks).
-        if let Some(sys) = &self.system {
+        if let Some(sys) = &req.system {
             let sys_text = match sys {
                 SystemContent::Text(s) => s.clone(),
                 SystemContent::Blocks(blocks) => blocks
@@ -60,7 +59,7 @@ impl MessagesRequest {
         }
 
         // Conversation history.
-        for m in self.messages {
+        for m in req.messages {
             let role = match m.role.as_str() {
                 "assistant" => Role::Assistant,
                 _ => Role::User,
@@ -93,7 +92,7 @@ impl MessagesRequest {
                         match b {
                             ContentBlock::Text { text } => text_parts.push(text),
                             ContentBlock::Image { source } => {
-                                if let Some(uri) = source.to_image_uri() {
+                                if let Some(uri) = source.maybe_get_image_uri() {
                                     images.push(uri);
                                 }
                             }
@@ -120,7 +119,9 @@ impl MessagesRequest {
                                     Some(ToolResultContent::Blocks(inner)) => inner
                                         .iter()
                                         .filter_map(|ib| match ib {
-                                            ContentBlock::Image { source } => source.to_image_uri(),
+                                            ContentBlock::Image { source } => {
+                                                source.maybe_get_image_uri()
+                                            }
                                             _ => None,
                                         })
                                         .collect(),
@@ -192,7 +193,7 @@ impl MessagesRequest {
         // OpenAI ladder applies to its `thinking` channel: disabled wins,
         // then an explicit budget, then budget-less enabled/adaptive
         // (think as long as needed — defer to the per-model cap).
-        let thinking = match &self.thinking {
+        let thinking = match &req.thinking {
             None => ThinkingDirective::Unspecified,
             Some(tc) if tc.thinking_type == "disabled" => ThinkingDirective::Off,
             Some(tc) => match tc.budget_tokens {
@@ -204,20 +205,24 @@ impl MessagesRequest {
         };
 
         ir::ChatRequest {
-            model: self.model,
+            model: req.model,
             messages,
-            tools: self.tools.as_deref().map(convert_tools).unwrap_or_default(),
-            tool_choice: self.tool_choice.as_ref().map(convert_tool_choice),
+            tools: req
+                .tools
+                .as_deref()
+                .map(|ts| ts.iter().map(Into::into).collect())
+                .unwrap_or_default(),
+            tool_choice: req.tool_choice.as_ref().map(Into::into),
             sampling: ir::SamplingParams {
-                temperature: self.temperature,
-                top_k: self.top_k,
-                top_p: self.top_p,
+                temperature: req.temperature,
+                top_k: req.top_k,
+                top_p: req.top_p,
                 ..Default::default()
             },
-            max_tokens: self.max_tokens,
+            max_tokens: req.max_tokens,
             min_tokens: 0,
-            stop: self.stop_sequences,
-            stream: self.stream,
+            stop: req.stop_sequences,
+            stream: req.stream,
             n: 1,
             response_format: None,
             thinking,

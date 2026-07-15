@@ -6,18 +6,20 @@ use super::helpers::*;
 
 /// A typed Anthropic SSE event (event name + JSON data). Testable, unlike
 /// axum's opaque `Event`; converted to an axum event at the handler edge
-/// by [`to_axum_event`].
+/// by [`Self::to_axum_event`].
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SseEvent {
     pub(super) event: String,
     pub(super) data: serde_json::Value,
 }
 
-/// Convert a typed [`SseEvent`] to an axum SSE event for the wire.
-pub(super) fn to_axum_event(e: &SseEvent) -> Event {
-    Event::default()
-        .event(&e.event)
-        .data(serde_json::to_string(&e.data).unwrap_or_default())
+impl SseEvent {
+    /// Convert a reference to self to an axum SSE event for the wire.
+    pub(super) fn to_axum_event(&self) -> Event {
+        Event::default()
+            .event(&self.event)
+            .data(serde_json::to_string(&self.data).unwrap_or_default())
+    }
 }
 
 /// Open-block tracker for the streaming translator's state machine.

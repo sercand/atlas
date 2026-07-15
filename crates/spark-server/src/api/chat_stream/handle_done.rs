@@ -223,7 +223,7 @@ pub(super) fn handle_done(
     // and never rode a content delta — ride the Finish delta so
     // Σ token_ids == completion_tokens exactly.
     deltas.push(StreamDelta::Finish {
-        reason: crate::ir::FinishReason::from_wire(fr),
+        reason: crate::ir::FinishReason::from(fr),
         usage,
         token_ids: state.take_ids_if(ctx.req_return_token_ids),
     });

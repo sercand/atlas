@@ -11,7 +11,6 @@ use crate::AppState;
 
 use super::handlers_stream::*;
 use super::helpers::*;
-use super::translate::*;
 use super::types::*;
 
 // ── Handler ──
@@ -19,7 +18,7 @@ use super::types::*;
 /// POST /v1/messages — Anthropic Messages API.
 ///
 /// Lowers the request directly into the canonical chat IR
-/// (`MessagesRequest::into_ir`), dispatches through
+/// (`From<MessagesRequest> for ir::ChatRequest`), dispatches through
 /// `api::chat_completions_inner` (which runs every fix12-23
 /// sanitization, salvage, watchdog, and dump path), and translates the
 /// response back into Anthropic format. The Anthropic-specific surface
@@ -77,26 +76,25 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
     //    sampling preset, and prompt mutation logic lives there.
     //    Anthropic has no echo-only wire fields (service_tier / store /
     //    stream_options), so the echo context stays default.
-    let outcome =
-        crate::api::chat_completions_inner(state.clone(), None, req.into_ir(), None).await;
+    let outcome = crate::api::chat_completions_inner(state.clone(), None, req.into(), None).await;
 
     // 5. Encode back to Anthropic shape. Non-streaming success arrives
     //    as the response IR — no body re-parse; a malformed inner body
     //    is now structurally impossible.
     let chat_resp = match outcome {
         crate::api::ChatOutcome::Blocking(ir) => {
-            let messages_resp = ir_to_anthropic_response(*ir);
+            let messages_resp = MessagesResponse::from(*ir);
             if let (Some(seq), Some(dump)) = (dump_seq, state.dump_writer.as_ref()) {
                 dump.dump_response("/v1/messages", seq, &messages_resp, false);
             }
             return Json(messages_resp).into_response();
         }
         crate::api::ChatOutcome::Streaming(deltas) => {
-            // Note: streaming dump from the Anthropic side is
-            // best-effort; Anthropic-shape response capture is a
-            // follow-up.
-            let _ = dump_seq;
-            return anthropic_sse_from_deltas(deltas, model_echo);
+            // --dump: the encoder aggregates the typed Anthropic events
+            // and writes them under the same seq as the request entry.
+            let dump =
+                dump_seq.and_then(|seq| state.dump_writer.as_ref().map(|d| (seq, d.clone())));
+            return anthropic_sse_from_deltas(deltas, model_echo, dump);
         }
         crate::api::ChatOutcome::Http(r) => r,
     };
@@ -156,13 +154,13 @@ pub async fn count_tokens(
     };
 
     // Count against the EXACT prompt the serving path renders: same
-    // adapter (into_ir), same tool-prompt injection / hint / cwd /
-    // thinking resolution / Jinja variant (prepare_chat_prompt). The
+    // adapter (the IR `From` impl), same tool-prompt injection / hint /
+    // cwd / thinking resolution / Jinja variant (prepare_chat_prompt). The
     // old path was a third, divergent lowering — it dropped images and
     // thinking blocks, force-prepended an empty `<think>` wrapper, and
     // rendered through the non-openai Jinja variant, so counts drifted
     // from real usage.
-    let mut ir_req = req.into_ir();
+    let mut ir_req = crate::ir::ChatRequest::from(req);
     // Counting must not require the vision encoder: strip image parts
     // (they contributed 0 tokens in the old count too — pad expansion
     // needs real pixel grids, which a count endpoint can't produce).

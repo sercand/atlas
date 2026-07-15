@@ -69,6 +69,39 @@ impl IncomingMessage {
         }
     }
 
+    /// Convert a stored conversation item into a message for pipeline
+    /// replay. Items we don't recognize (tool outputs in exotic shapes)
+    /// are silently dropped — they wouldn't contribute to the text
+    /// context anyway.
+    pub fn from_conversation_item(item: &serde_json::Value) -> Option<Self> {
+        let role = item.get("role").and_then(|v| v.as_str())?;
+        let content = item.get("content");
+        let text = match content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| {
+                    p.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        Some(Self {
+            role: role.to_string(),
+            content: ParsedContent {
+                text,
+                images: Vec::new(),
+            },
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        })
+    }
+
     /// Translate a Responses-API `input` array item into a chat-completions
     /// message. Returns `None` for items the adapter doesn't understand (they
     /// are silently skipped so the request still runs).
@@ -93,7 +126,7 @@ impl IncomingMessage {
                 let content_val = obj.get("content")?;
                 Some(Self {
                     role,
-                    content: responses_content_to_parsed(content_val),
+                    content: ParsedContent::from_responses_content(content_val),
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -153,7 +186,7 @@ impl IncomingMessage {
                     // no recognizable parts keep the old stringified-JSON
                     // behavior so out-of-spec payloads still reach the model.
                     Some(arr @ serde_json::Value::Array(_)) => {
-                        let parsed = responses_content_to_parsed(arr);
+                        let parsed = ParsedContent::from_responses_content(arr);
                         if parsed.text.is_empty() && parsed.images.is_empty() {
                             ParsedContent {
                                 text: arr.to_string(),
@@ -194,35 +227,37 @@ impl IncomingMessage {
     }
 }
 
-/// Flatten a Responses-API content value (string, or array of
-/// `input_text`/`output_text`/`input_image`/… parts) into text + image
-/// lists. Shared by `message` items and `function_call_output` items so
-/// images are carried on both — the pipeline collects them into the
-/// vision encoder.
-fn responses_content_to_parsed(v: &serde_json::Value) -> ParsedContent {
-    let mut text = String::new();
-    let mut images: Vec<String> = Vec::new();
-    match v {
-        serde_json::Value::String(s) => text.push_str(s),
-        serde_json::Value::Array(parts) => {
-            for part in parts {
-                if let Some(po) = part.as_object() {
-                    let part_kind = po.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if matches!(part_kind, "input_text" | "output_text" | "text")
-                        && let Some(t) = po.get("text").and_then(|t| t.as_str())
-                    {
-                        text.push_str(t);
-                    } else if matches!(part_kind, "input_image" | "image_url" | "image")
-                        && let Some(url) = responses_image_url(po)
-                    {
-                        images.push(url);
+impl ParsedContent {
+    /// Flatten a Responses-API content value (string, or array of
+    /// `input_text`/`output_text`/`input_image`/… parts) into text +
+    /// image lists. Shared by `message` items and `function_call_output`
+    /// items so images are carried on both — the pipeline collects them
+    /// into the vision encoder.
+    fn from_responses_content(v: &serde_json::Value) -> Self {
+        let mut text = String::new();
+        let mut images: Vec<String> = Vec::new();
+        match v {
+            serde_json::Value::String(s) => text.push_str(s),
+            serde_json::Value::Array(parts) => {
+                for part in parts {
+                    if let Some(po) = part.as_object() {
+                        let part_kind = po.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if matches!(part_kind, "input_text" | "output_text" | "text")
+                            && let Some(t) = po.get("text").and_then(|t| t.as_str())
+                        {
+                            text.push_str(t);
+                        } else if matches!(part_kind, "input_image" | "image_url" | "image")
+                            && let Some(url) = responses_image_url(po)
+                        {
+                            images.push(url);
+                        }
                     }
                 }
             }
+            _ => {}
         }
-        _ => {}
+        ParsedContent { text, images }
     }
-    ParsedContent { text, images }
 }
 
 /// Extract the image URL / data-URI from a Responses `input_image`

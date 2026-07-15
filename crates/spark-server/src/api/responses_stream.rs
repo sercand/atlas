@@ -87,7 +87,7 @@ pub(super) async fn responses_endpoint_stream(
 
     // Run the chat-completions streaming handler (re-using the full
     // pipeline: scheduler, tool detection, thinking, logprobs, ...).
-    let deltas = match chat_completions_inner(state.0, None, chat_req.into_ir(), None).await {
+    let deltas = match chat_completions_inner(state.0, None, chat_req.into(), None).await {
         super::chat::ChatOutcome::Streaming(d) => d,
         // Error envelope — forward unchanged.
         super::chat::ChatOutcome::Http(r) => return r,
