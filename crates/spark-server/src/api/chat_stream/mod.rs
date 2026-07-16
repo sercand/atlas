@@ -48,6 +48,17 @@ pub(crate) async fn run_chat_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     session_hash: u64,
+    // M2 per-request LoRA routing: resolved adapter slot (-1 = defer to active).
+    adapter_slot: i32,
+    // Resolved source-language token id (0 = deployment default).
+    src_lang_id: u32,
+    // Resolved target-language token id (0 = deployment default).
+    tgt_lang_id: u32,
+    // NLLB beam search params (1/1.0/false = greedy). Streaming + beam is
+    // rejected in the handler; threaded here only to set the Streaming defaults.
+    num_beams: u32,
+    length_penalty: f32,
+    early_stopping: bool,
     image_pixels: Vec<(Vec<f32>, usize, usize)>,
     max_tokens: usize,
     min_tokens: usize,
@@ -111,6 +122,12 @@ pub(crate) async fn run_chat_stream(
     let request = InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
+        adapter_slot,
+        src_lang_id,
+        tgt_lang_id,
+        num_beams,
+        length_penalty,
+        early_stopping,
         image_pixels,
         max_tokens,
         min_tokens,
@@ -243,16 +260,20 @@ pub(crate) async fn run_chat_stream(
                 decode_time_ms,
                 reasoning_tokens,
                 cached_prompt_tokens,
-            } => handle_done::handle_done(
-                &mut stream_state,
-                &ctx,
-                finish_reason,
-                completion_tokens,
-                time_to_first_token_ms,
-                decode_time_ms,
-                reasoning_tokens,
-                cached_prompt_tokens,
-            ),
+                guard_stop,
+            } => {
+                stream_state.guard_stop = guard_stop;
+                handle_done::handle_done(
+                    &mut stream_state,
+                    &ctx,
+                    finish_reason,
+                    completion_tokens,
+                    time_to_first_token_ms,
+                    decode_time_ms,
+                    reasoning_tokens,
+                    cached_prompt_tokens,
+                )
+            }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
         };
 

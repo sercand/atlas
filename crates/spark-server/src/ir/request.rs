@@ -41,6 +41,22 @@ pub struct ChatRequest {
     pub thinking: ThinkingDirective,
     /// Per-request token-loop detector override.
     pub repetition_detection: Option<crate::api::inference_types::RepetitionDetectionParams>,
+    /// M2 per-request LoRA routing: optional resident adapter NAME for
+    /// this request (independent of `model`). `None` = installed active
+    /// adapter; resolved to a pool slot at the handler edge.
+    pub adapter: Option<String>,
+    /// NLLB (encoder-decoder): per-request source language token NAME
+    /// (e.g. `eng_Latn`); resolved to a token id via the server
+    /// tokenizer at dispatch. `None` = deployment default.
+    pub src_lang: Option<String>,
+    /// NLLB: per-request target language token NAME. See [`Self::src_lang`].
+    pub tgt_lang: Option<String>,
+    /// NLLB beam search width. `None` = single-hypothesis decode.
+    pub num_beams: Option<u32>,
+    /// NLLB beam search length penalty (only read when `num_beams > 1`).
+    pub length_penalty: Option<f32>,
+    /// NLLB beam search early stopping (only read when `num_beams > 1`).
+    pub early_stopping: Option<bool>,
     /// Per-token logit bias, already parsed from the wire's string-key
     /// map at the edge (non-numeric keys dropped, matching history).
     pub logit_bias: Vec<(u32, f32)>,

@@ -11,6 +11,25 @@ use crate::ir::ThinkingDirective;
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: String,
+    /// M2 per-request LoRA routing: optional resident adapter NAME for THIS
+    /// request (independent of `model`). Unset = installed active adapter;
+    /// unknown = 400. Resolved to a pool slot at request time.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// NLLB per-request source/target language names (tokenizer-resolved).
+    #[serde(default)]
+    pub src_lang: Option<String>,
+    #[serde(default)]
+    pub tgt_lang: Option<String>,
+    /// NLLB beam search: beams per request (None/1 = greedy).
+    #[serde(default)]
+    pub num_beams: Option<u32>,
+    /// NLLB beam search: length penalty (None = 1.0).
+    #[serde(default)]
+    pub length_penalty: Option<f32>,
+    /// NLLB beam search: early-stop when enough hypotheses finish (None = false).
+    #[serde(default)]
+    pub early_stopping: Option<bool>,
     pub messages: Vec<IncomingMessage>,
     #[serde(default = "default_max_tokens", alias = "max_completion_tokens")]
     pub max_tokens: usize,
@@ -21,24 +40,19 @@ pub struct ChatCompletionRequest {
     /// Top-p (nucleus): keep smallest set of tokens whose cumulative probability >= p.
     /// None = use server default from generation_config.json.
     pub top_p: Option<f32>,
-    /// Top-n-sigma: filter tokens in logit space before temperature scaling.
-    /// Keep only tokens with logit >= mean - n*sigma. Temperature-invariant.
-    /// None = use server default. 0.0 = disabled.
+    /// Top-n-sigma: keep tokens with logit >= mean - n*sigma (temperature-
+    /// invariant). None = server default. 0.0 = disabled.
     pub top_n_sigma: Option<f32>,
-    /// Min-p: keep tokens with prob >= min_p * max_prob (post-softmax).
-    /// None = use server default. 0.0 = disabled.
+    /// Min-p: keep tokens with prob >= min_p * max_prob. None = server default.
     pub min_p: Option<f32>,
-    /// Repetition penalty: penalize tokens that have already been generated.
-    /// None = use server default. 1.0 = disabled.
+    /// Repetition penalty. None = server default. 1.0 = disabled.
     pub repetition_penalty: Option<f32>,
-    /// Presence penalty (OpenAI-style): flat additive penalty for each token that
-    /// appeared at least once. Range [-2.0, 2.0], default 0.0 (disabled).
-    /// Positive values encourage topic diversity.
+    /// Presence penalty (OpenAI-style): flat additive penalty per token seen at
+    /// least once. Range [-2.0, 2.0], default 0.0 (disabled).
     #[serde(default)]
     pub presence_penalty: Option<f32>,
-    /// Frequency penalty (OpenAI-style): additive penalty proportional to occurrence
-    /// count. Range [-2.0, 2.0], default 0.0 (disabled).
-    /// Positive values discourage token repetition.
+    /// Frequency penalty (OpenAI-style): additive penalty proportional to
+    /// occurrence count. Range [-2.0, 2.0], default 0.0 (disabled).
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     /// Per-token logit bias: {"token_id": bias_value}. Positive boosts, negative suppresses.
@@ -47,13 +61,9 @@ pub struct ChatCompletionRequest {
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     #[serde(default)]
     pub stream: bool,
-    /// Emit the exact sampled token IDs on each streamed chunk's
-    /// `choices[0].token_ids` (vLLM-compatible extension). Lets a
-    /// benchmark harness count `usage.completion_tokens` precisely
-    /// instead of re-tokenizing detokenized text (which over-counts,
-    /// since BPE is not homomorphic over fragment concatenation).
-    /// PCND: defaults false — opt-in only, so the default wire format
-    /// for every existing client stays byte-identical.
+    /// Emit exact sampled token IDs on each streamed chunk's
+    /// `choices[0].token_ids` (vLLM-compatible extension) for precise
+    /// `usage.completion_tokens` counting. Defaults false (opt-in).
     #[serde(default)]
     pub return_token_ids: bool,
     /// Enable chain-of-thought reasoning (Qwen3.5 thinking models).
