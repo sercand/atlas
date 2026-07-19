@@ -2,6 +2,10 @@
 
 //! `build_model` — entry point that wires up the configured loader,
 //! buffers, KV cache, and (optional) DFlash drafter into a `TransformerModel`.
+//! Metal-only builds dispatch to `model::metal_gguf` instead; the CUDA
+//! construction body (`build_model_cuda`) is compiled out there, so its
+//! imports would count as unused.
+#![cfg_attr(all(feature = "metal", not(feature = "cuda")), allow(unused_imports))]
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
@@ -19,8 +23,15 @@ use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+#[cfg_attr(all(feature = "metal", not(feature = "cuda")), allow(dead_code))]
 mod kv_summary;
 
+// Metal-only builds return from the dispatch block up top, so the CUDA-path
+// arguments (and `config`'s mutability) go unused there by design.
+#[cfg_attr(
+    all(feature = "metal", not(feature = "cuda")),
+    allow(unused_variables, unused_mut)
+)]
 pub fn build_model(
     mut config: ModelConfig,
     store: &WeightStore,
@@ -57,6 +68,81 @@ pub fn build_model(
     nllb_lang: Option<(u32, u32)>,
     // NLLB / M2M-100 PEFT LoRA adapter directory (`--lora-adapter` for an
     // encoder-decoder checkpoint). `None` = base model.
+    nllb_lora_dir: Option<std::path::PathBuf>,
+) -> Result<Box<dyn Model>> {
+    // Apple-Silicon serving: the CUDA TransformerModel stack below cannot run
+    // on the metal backend (its layer impls dispatch cuBLASLt/CUTLASS/graph
+    // paths that are `unreachable!` stubs there). Route the supported family
+    // to the MetalGgufModel and fail fast for everything else. The remainder
+    // of this function is the CUDA construction path.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return crate::model::metal_gguf::build_metal_model(
+            &config,
+            store,
+            gpu,
+            max_seq_len,
+            max_batch_size,
+            kv_dtype,
+        );
+    }
+    #[cfg(any(feature = "cuda", not(feature = "metal")))]
+    build_model_cuda(
+        config,
+        store,
+        gpu,
+        max_batch_tokens,
+        kv_block_size,
+        max_seq_len,
+        max_batch_size,
+        mtp_quant,
+        use_speculative,
+        prefix_cache,
+        mtp_vocab_size,
+        comm,
+        self_speculative,
+        num_drafts,
+        kv_dtype,
+        inference_reserve,
+        gpu_memory_utilization,
+        ssm_cache_slots,
+        layer_dtypes,
+        ssm_checkpoint_interval,
+        hss_cache_blocks_per_seq,
+        dflash_args,
+        lora_args,
+        nllb_lang,
+        nllb_lora_dir,
+    )
+}
+
+#[cfg(any(feature = "cuda", not(feature = "metal")))]
+#[allow(clippy::too_many_arguments)]
+fn build_model_cuda(
+    mut config: ModelConfig,
+    store: &WeightStore,
+    gpu: Box<dyn GpuBackend>,
+    max_batch_tokens: usize,
+    kv_block_size: usize,
+    max_seq_len: usize,
+    max_batch_size: usize,
+    mtp_quant: MtpQuantization,
+    use_speculative: bool,
+    prefix_cache: Box<dyn PrefixCache>,
+    mtp_vocab_size: u32,
+    comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
+    self_speculative: bool,
+    num_drafts: usize,
+    kv_dtype: KvCacheDtype,
+    inference_reserve: usize,
+    gpu_memory_utilization: f64,
+    ssm_cache_slots: usize,
+    layer_dtypes: Vec<KvCacheDtype>,
+    ssm_checkpoint_interval: usize,
+    hss_cache_blocks_per_seq: Option<u32>,
+    dflash_args: Option<DflashBuildArgs<'_>>,
+    lora_args: Option<LoraBuildArgs<'_>>,
+    nllb_lang: Option<(u32, u32)>,
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by

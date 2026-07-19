@@ -246,6 +246,65 @@ pub fn reorder_packed_rows(
     Ok(out)
 }
 
+/// For the native keep-packed path: true when this tensor's transform is the
+/// `out_proj` within-row COLUMN reorder ([`Op::ReorderOutCols`]), which moves
+/// `value_head_dim`-sized column groups. When `value_head_dim` is a whole
+/// number of quant blocks (`value_head_dim % group == 0` — always true for
+/// Q1_0 g128 on Bonsai, where value_head_dim = 128 = one block) the
+/// permutation moves whole blocks within each packed row and
+/// [`reorder_packed_out_cols`] applies it byte-exactly. Callers must verify
+/// the divisibility before taking the packed path.
+pub fn packed_reorder_out_cols(hf_name: &str) -> bool {
+    hf_name.ends_with(".linear_attn.out_proj.weight")
+}
+
+/// Byte-exact analog of [`reorder_out_cols`] on packed blocks: permute the
+/// `value_head_dim/group`-block column groups of every packed row from GGUF
+/// tiled order to HF grouped order. `raw` is `[n, k]` row-major packed.
+pub fn reorder_packed_out_cols(
+    raw: &[u8],
+    hf_shape: &[usize],
+    dims: &GdnDims,
+    group: usize,
+    block_bytes: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        hf_shape.len() == 2,
+        "packed out_proj reorder expects 2-D [n,k], got {hf_shape:?}"
+    );
+    let (n, k) = (hf_shape[0], hf_shape[1]);
+    ensure!(
+        k == dims.num_v_heads * dims.value_head_dim,
+        "packed out_proj reorder: k={k} != num_v_heads*value_head_dim {}",
+        dims.num_v_heads * dims.value_head_dim
+    );
+    ensure!(
+        dims.value_head_dim.is_multiple_of(group),
+        "packed out_proj reorder: value_head_dim {} not a multiple of group {group}",
+        dims.value_head_dim
+    );
+    let blocks_per_row = k / group;
+    let blocks_per_head = dims.value_head_dim / group;
+    let head_bytes = blocks_per_head * block_bytes;
+    let row_bytes = blocks_per_row * block_bytes;
+    ensure!(
+        raw.len() == n * row_bytes,
+        "packed out_proj reorder: raw len {} != n*row_bytes {}",
+        raw.len(),
+        n * row_bytes
+    );
+    let mut out = raw.to_vec();
+    for row in 0..n {
+        let ro = row * row_bytes;
+        for hf in 0..dims.num_v_heads {
+            let g = dims.gguf_head(hf);
+            out[ro + hf * head_bytes..ro + (hf + 1) * head_bytes]
+                .copy_from_slice(&raw[ro + g * head_bytes..ro + (g + 1) * head_bytes]);
+        }
+    }
+    Ok(out)
+}
+
 /// Apply the qwen35 value transform (if any) to the dequantized F32 values
 /// `buf` in place. `hf_shape` is the tensor's HF (row-major) shape. No-op for
 /// names [`classify`] does not recognize.

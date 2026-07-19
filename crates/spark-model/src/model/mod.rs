@@ -45,4 +45,8 @@ pub(crate) mod types;
 #[cfg(feature = "cuda")]
 pub mod nllb;
 
+// Served Qwen3.5/3.6-family GGUF model on Apple Silicon (metal serving path).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub mod metal_gguf;
+
 pub use types::TransformerModel;

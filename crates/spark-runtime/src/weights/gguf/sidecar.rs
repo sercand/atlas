@@ -131,7 +131,9 @@ fn keep_packed_layout(
     let direct = (names::is_keep_packed_proj(hf) || (id == 41 && names::is_keep_packed_embed(hf)))
         && !value_transform::needs(hf);
     let row_permuted = value_transform::packed_reorder_rows(hf).is_some();
-    (direct || row_permuted).then_some((group, block_bytes))
+    // Q1-only: out_proj stays packed via the column-block permute.
+    let col_permuted = id == 41 && value_transform::packed_reorder_out_cols(hf);
+    (direct || row_permuted || col_permuted).then_some((group, block_bytes))
 }
 
 /// Load every recognized tensor from one already-parsed GGUF into `weights`,
@@ -257,7 +259,12 @@ pub fn load_pass(
                 (q2_group, 2 + q2_group / 4) // fp16 scale + group/4 code bytes
             };
             let permuted = value_transform::reorder_packed_rows(
-                raw, &hf_shape, &dims, after_qk, group, block_bytes,
+                raw,
+                &hf_shape,
+                &dims,
+                after_qk,
+                group,
+                block_bytes,
             )
             .with_context(|| format!("packed GDN row-permute {hf_name}"))?;
             let ptr = gpu.alloc(permuted.len())?;
@@ -268,6 +275,35 @@ pub fn load_pass(
                     ptr,
                     shape: hf_shape,
                     dtype: packed_dtype(id, q2_group),
+                },
+            );
+            continue;
+        }
+
+        // ── Native keep-packed GDN out_proj column-permute (Q1 only) ──
+        // out_proj's transform permutes `value_head_dim`-sized COLUMN groups.
+        // For Q1_0 (group 128) Bonsai's value_head_dim = 128 = exactly one
+        // block, so the permutation moves whole blocks within each packed row
+        // and stays 1-bit (saves ~3 GB across 48 GDN layers vs BF16). Guarded
+        // by the divisibility check; non-conforming shapes fall through to the
+        // BF16 path below.
+        if native_q1
+            && id == 41
+            && let names::GgufName::Direct(ref hf_name) = target
+            && value_transform::packed_reorder_out_cols(hf_name)
+            && let Some(dims) = gdn
+            && dims.value_head_dim.is_multiple_of(128)
+        {
+            let permuted = value_transform::reorder_packed_out_cols(raw, &hf_shape, &dims, 128, 18)
+                .with_context(|| format!("packed GDN out_proj col-permute {hf_name}"))?;
+            let ptr = gpu.alloc(permuted.len())?;
+            gpu.copy_h2d(&permuted, ptr)?;
+            weights.insert(
+                hf_name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: hf_shape,
+                    dtype: WeightDtype::PackedQ1_0,
                 },
             );
             continue;

@@ -272,7 +272,12 @@ impl super::WeightLoader for GgufLoader {
             .with_context(|| format!("No .gguf file found in {}", model_dir.display()))?;
         tracing::info!("Loading GGUF weights from {}", path.display());
 
-        let force_cpu = std::env::var("ATLAS_GGUF_FORCE_CPU").ok().as_deref() == Some("1");
+        // Metal-only builds always take the CPU dequant path: the GPU dequant
+        // kernels (`dequant_gguf_bf16`) are CUDA modules that aren't in the
+        // metal kernel registry, and on UMA the host-side dequant + single
+        // copy_h2d is equivalent anyway.
+        let force_cpu = std::env::var("ATLAS_GGUF_FORCE_CPU").ok().as_deref() == Some("1")
+            || cfg!(all(feature = "metal", not(feature = "cuda")));
         let native_q2 = native_q2_enabled();
         let native_q1 = native_q1_enabled();
         let q2_group = q2_group_usize();

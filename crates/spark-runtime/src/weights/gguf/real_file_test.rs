@@ -75,3 +75,80 @@ fn gguf_real_file_ternary_bonsai() {
         }
     }
 }
+
+const REAL_Q1_GGUF: &str = "/Users/sercand/Developer/src/github.com/PrisimML-Eng/Bonsai-demo/\
+models/gguf/27B/Bonsai-27B-Q1_0.gguf";
+
+/// Parse the real 1-bit Bonsai-27B GGUF (PrismML Q1_0, id 41), confirm the
+/// qwen35 container facts + GDN geometry the loader reads, and prove the CPU
+/// Q1 dequant of `token_embd.weight` produces only ±d for each block's scale.
+/// Override the path with `ATLAS_BONSAI_GGUF`.
+#[test]
+#[ignore = "requires the on-disk Bonsai-27B-Q1_0 GGUF (see path)"]
+fn gguf_real_file_bonsai_q1_0() {
+    let path = std::env::var("ATLAS_BONSAI_GGUF").unwrap_or_else(|_| REAL_Q1_GGUF.to_string());
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => panic!("cannot open real GGUF {path}: {e}"),
+    };
+    // SAFETY: read-only mmap of an existing file for the duration of the test.
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+
+    let gguf = GgufFile::parse(&mmap).expect("parse container");
+
+    assert_eq!(
+        gguf.get_str("general.architecture"),
+        Some("qwen35"),
+        "architecture"
+    );
+    // GDN geometry consumed by value_transform::gdn_dims.
+    assert_eq!(gguf.get_u64("qwen35.ssm.group_count"), Some(16));
+    assert_eq!(gguf.get_u64("qwen35.ssm.time_step_rank"), Some(48));
+    assert_eq!(gguf.get_u64("qwen35.ssm.inner_size"), Some(6144));
+    assert_eq!(gguf.get_u64("qwen35.ssm.state_size"), Some(128));
+    assert_eq!(gguf.get_u64("qwen35.block_count"), Some(64));
+    assert_eq!(gguf.get_u64("qwen35.embedding_length"), Some(5120));
+
+    let t = gguf
+        .tensor("token_embd.weight")
+        .expect("token_embd.weight present");
+    assert_eq!(t.ggml_type, GgmlType::Q1_0, "token_embd is ggml id 41");
+    assert_eq!(t.ggml_type.id(), 41);
+    assert_eq!(t.dims, vec![5120, 248320], "token_embd dims (ggml order)");
+
+    // Dequant the first ~20000 blocks and assert pure binary ±d values.
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    const N_BLOCKS: usize = 20_000;
+    let n_elems = N_BLOCKS * GROUP;
+
+    let start = gguf.tensor_abs_offset(t);
+    let raw = &mmap[start..start + N_BLOCKS * BLOCK_BYTES];
+
+    let mut out = vec![0f32; n_elems];
+    dequant_cpu::dequant_to_f32(super::dequant_cpu::GgmlType::Q1_0, raw, n_elems, &mut out)
+        .expect("cpu dequant");
+
+    let mut nonzero_scale_blocks = 0usize;
+    for b in 0..N_BLOCKS {
+        let d = f16_to_f32(u16::from_le_bytes([
+            raw[b * BLOCK_BYTES],
+            raw[b * BLOCK_BYTES + 1],
+        ]));
+        if d != 0.0 {
+            nonzero_scale_blocks += 1;
+        }
+        for j in 0..GROUP {
+            let v = out[b * GROUP + j];
+            assert!(
+                v == -d || v == d,
+                "block {b} elem {j}: value {v} not in {{-d,+d}} for d={d}"
+            );
+        }
+    }
+    // A real checkpoint's embedding is not all-zero.
+    assert!(
+        nonzero_scale_blocks > N_BLOCKS / 2,
+        "suspicious: only {nonzero_scale_blocks}/{N_BLOCKS} blocks have nonzero scale"
+    );
+}

@@ -116,7 +116,10 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+// Consumed only by the CUDA `build_model` body — compiled out on metal.
+#[cfg_attr(all(feature = "metal", not(feature = "cuda")), allow(dead_code))]
 mod lm_head_setup;
+#[cfg_attr(all(feature = "metal", not(feature = "cuda")), allow(dead_code))]
 mod m2_setup;
 
 pub use build::build_model;

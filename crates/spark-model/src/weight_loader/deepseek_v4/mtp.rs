@@ -62,6 +62,7 @@ pub struct DeepseekV4MtpModule {
 /// Returns `Ok(None)` (no-op) when MTP is disabled (`num_mtp_modules == 0`) or the
 /// checkpoint ships no MTP tensors (e.g. the RedHat NVFP4-FP8 re-quant) — so it is
 /// safe to call unconditionally on the V4 load path.
+#[cfg_attr(all(feature = "metal", not(feature = "cuda")), allow(dead_code))]
 pub fn load_v4_mtp_module(
     store: &WeightStore,
     config: &ModelConfig,

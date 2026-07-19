@@ -10,6 +10,9 @@ mod compute;
 mod load_layers;
 // MTP draft-module loader for nvidia/DeepSeek-V4-Flash-NVFP4.
 mod mtp;
+// `load_v4_mtp_module` is consumed by the CUDA `build_model` body, which is
+// compiled out on metal-only builds.
+#[cfg_attr(all(feature = "metal", not(feature = "cuda")), allow(unused_imports))]
 pub(crate) use mtp::{DeepseekV4MtpModule, load_v4_mtp_module};
 
 use anyhow::{Context, Result};
