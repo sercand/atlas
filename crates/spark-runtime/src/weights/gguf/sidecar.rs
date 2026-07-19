@@ -66,19 +66,72 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
 /// Sum the BF16 footprint of every tensor a pass will actually keep (i.e. that
 /// `names::translate` maps to a stored tensor, plus the clip patch-embed frames
 /// that are fused rather than name-mapped), for the pre-flight OOM estimate.
-pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
+pub fn est_bf16(
+    gguf: &container::GgufFile,
+    arch: &str,
+    native_q1: bool,
+    native_q2: bool,
+    q2_group: usize,
+) -> usize {
     let is_clip = value_transform::is_clip(arch);
     gguf.tensors
         .iter()
-        .filter(|t| {
-            (is_clip && value_transform::vision_patch_frame(&t.name).is_some())
-                || !matches!(
-                    names::translate(&t.name, arch),
-                    None | Some(names::GgufName::Drop)
-                )
+        .filter_map(|t| {
+            let target = names::translate(&t.name, arch);
+            let keep = (is_clip && value_transform::vision_patch_frame(&t.name).is_some())
+                || !matches!(target, None | Some(names::GgufName::Drop));
+            if !keep {
+                return None;
+            }
+            // Tensors the load pass will keep packed cost their on-disk block
+            // size, not the BF16 expansion.
+            if let Some(names::GgufName::Direct(ref hf)) = target
+                && let Some((group, block_bytes)) =
+                    keep_packed_layout(t.ggml_type.id(), hf, native_q1, native_q2, q2_group)
+            {
+                return Some((t.num_elements() / group) * block_bytes);
+            }
+            Some(t.num_elements() * WeightDtype::BF16.byte_size())
         })
-        .map(|t| t.num_elements() * WeightDtype::BF16.byte_size())
         .sum()
+}
+
+/// `(group, block_bytes)` when this tensor stays packed under the native
+/// keep-packed gates, `None` when it dequantizes to BF16. Single source of
+/// truth shared by [`est_bf16`] and [`load_pass`] so the preflight estimate
+/// can never diverge from what the loader actually allocates. Covers both the
+/// transform-free direct short-circuit and the GDN packed row-permute (the
+/// permute changes byte ORDER, not size).
+/// The `WeightDtype` tag for a keep-packed tensor of ggml type `id`.
+fn packed_dtype(id: u32, q2_group: usize) -> WeightDtype {
+    if id == 41 {
+        WeightDtype::PackedQ1_0
+    } else {
+        WeightDtype::PackedQ2_0 {
+            group: q2_group as u16,
+        }
+    }
+}
+
+fn keep_packed_layout(
+    id: u32,
+    hf: &str,
+    native_q1: bool,
+    native_q2: bool,
+    q2_group: usize,
+) -> Option<(usize, usize)> {
+    let (enabled, group, block_bytes) = match id {
+        41 => (native_q1, 128, 18),
+        42 => (native_q2, q2_group, 2 + q2_group / 4),
+        _ => return None,
+    };
+    if !enabled {
+        return None;
+    }
+    let direct = (names::is_keep_packed_proj(hf) || (id == 41 && names::is_keep_packed_embed(hf)))
+        && !value_transform::needs(hf);
+    let row_permuted = value_transform::packed_reorder_rows(hf).is_some();
+    (direct || row_permuted).then_some((group, block_bytes))
 }
 
 /// Load every recognized tensor from one already-parsed GGUF into `weights`,
@@ -101,6 +154,7 @@ pub fn load_pass(
     arch: &str,
     gdn: Option<value_transform::GdnDims>,
     force_cpu: bool,
+    native_q1: bool,
     native_q2: bool,
     q2_group: usize,
     q2_variant: container::Q2Group,
@@ -152,18 +206,21 @@ pub fn load_pass(
         // GGUF dims are ggml-order; Atlas/HF shape is the reverse.
         let hf_shape: Vec<usize> = tensor.dims.iter().rev().copied().collect();
 
-        // ── Native keep-packed Q2_0 short-circuit ──
-        // When `ATLAS_GGUF_NATIVE_Q2=1`, upload the raw `block_q2_0` bytes for
-        // the big transform-free FFN projections UNCHANGED and tag them
-        // `PackedQ2_0` so the model's `q2_0_gemv` decode path dequants in-kernel
-        // (no BF16 expansion, no downstream NVFP4 requant). This is the whole
-        // memory win. Excludes GDN reorder tensors via `!value_transform::needs`
-        // (a column reorder would split blocks). Non-id-42 and non-FFN tensors,
-        // and the flag-off default, are untouched below.
-        if native_q2
-            && id == 42
-            && let names::GgufName::Direct(ref hf_name) = target
-            && names::is_keep_packed_proj(hf_name)
+        // ── Native keep-packed short-circuit (Q2_0 id 42 / Q1_0 id 41) ──
+        // Under the matching native gate, upload the raw block bytes for the
+        // big transform-free projections UNCHANGED and tag them packed so the
+        // model's native gemv path dequants in-kernel (no BF16 expansion, no
+        // downstream NVFP4 requant). This is the whole memory win. Excludes
+        // GDN reorder tensors via `!value_transform::needs` (a column reorder
+        // would split blocks). Q1 additionally keep-packs the embedding + LM
+        // head (see `is_keep_packed_embed`). Non-matching ids/names, and the
+        // gates-off default, are untouched below.
+        if let names::GgufName::Direct(ref hf_name) = target
+            && ((native_q2 && id == 42 && names::is_keep_packed_proj(hf_name))
+                || (native_q1
+                    && id == 41
+                    && (names::is_keep_packed_proj(hf_name)
+                        || names::is_keep_packed_embed(hf_name))))
             && !value_transform::needs(hf_name)
         {
             let ptr = gpu.alloc(raw.len())?;
@@ -173,37 +230,34 @@ pub fn load_pass(
                 WeightTensor {
                     ptr,
                     shape: hf_shape,
-                    dtype: WeightDtype::PackedQ2_0 {
-                        group: q2_group as u16,
-                    },
+                    dtype: packed_dtype(id, q2_group),
                 },
             );
             continue;
         }
 
-        // ── Native keep-packed Q2_0 GDN row-permute short-circuit (Tier-1c) ──
+        // ── Native keep-packed GDN row-permute short-circuit (Tier-1c) ──
         // The big GDN input projections (`in_proj_qkv` V-region, `in_proj_z`)
         // carry a value-head ROW reorder. Because that permutation moves whole
         // `value_head_dim`-row block-runs and one row is an integer number of
-        // `block_q2_0` blocks, we can apply it directly to the PACKED bytes and
-        // keep the weight 2-bit (byte-exact vs dequant→reorder→requant). The
+        // blocks, we can apply it directly to the PACKED bytes and keep the
+        // weight quantized (byte-exact vs dequant→reorder→requant). The
         // within-row column reorder of `out_proj` is NOT handled here (stays on
         // its NVFP4/BF16 path). Runs BEFORE the CPU-dequant `needs()` branch so
-        // these tensors never expand to BF16.
-        if native_q2
-            && id == 42
+        // these tensors never expand to BF16. Applies to id 42 (native-Q2) and
+        // id 41 (native-Q1, fixed group 128 / 18-byte block) identically.
+        if ((native_q2 && id == 42) || (native_q1 && id == 41))
             && let names::GgufName::Direct(ref hf_name) = target
             && let Some(after_qk) = value_transform::packed_reorder_rows(hf_name)
             && let Some(dims) = gdn
         {
-            let block_bytes = 2 + q2_group / 4; // fp16 scale + group/4 code bytes
+            let (group, block_bytes) = if id == 41 {
+                (128, 18)
+            } else {
+                (q2_group, 2 + q2_group / 4) // fp16 scale + group/4 code bytes
+            };
             let permuted = value_transform::reorder_packed_rows(
-                raw,
-                &hf_shape,
-                &dims,
-                after_qk,
-                q2_group,
-                block_bytes,
+                raw, &hf_shape, &dims, after_qk, group, block_bytes,
             )
             .with_context(|| format!("packed GDN row-permute {hf_name}"))?;
             let ptr = gpu.alloc(permuted.len())?;
@@ -213,9 +267,7 @@ pub fn load_pass(
                 WeightTensor {
                     ptr,
                     shape: hf_shape,
-                    dtype: WeightDtype::PackedQ2_0 {
-                        group: q2_group as u16,
-                    },
+                    dtype: packed_dtype(id, q2_group),
                 },
             );
             continue;

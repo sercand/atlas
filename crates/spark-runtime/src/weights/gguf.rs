@@ -70,6 +70,19 @@ fn native_q2_enabled() -> bool {
     std::env::var("ATLAS_GGUF_NATIVE_Q2").ok().as_deref() == Some("1")
 }
 
+/// True when the native keep-packed Q1_0 (1-bit, id 41) decode path is enabled.
+/// Controlled by `ATLAS_GGUF_NATIVE_Q1`; defaults ON for metal-only builds
+/// (Apple Silicon serving is memory-bound — a BF16 expansion of a 27B 1-bit
+/// checkpoint needs ~55 GB and cannot fit) and OFF elsewhere (the CUDA layer
+/// stack has no q1_0 kernels; it dequants id-41 tensors to BF16 as before).
+fn native_q1_enabled() -> bool {
+    match std::env::var("ATLAS_GGUF_NATIVE_Q1").ok().as_deref() {
+        Some("1") => true,
+        Some(_) => false,
+        None => cfg!(all(feature = "metal", not(feature = "cuda"))),
+    }
+}
+
 /// The id-42 PrismML group size, from `ATLAS_GGUF_Q2_GROUP` (default 128).
 fn q2_group_usize() -> usize {
     match std::env::var("ATLAS_GGUF_Q2_GROUP").ok().as_deref() {
@@ -261,11 +274,17 @@ impl super::WeightLoader for GgufLoader {
 
         let force_cpu = std::env::var("ATLAS_GGUF_FORCE_CPU").ok().as_deref() == Some("1");
         let native_q2 = native_q2_enabled();
+        let native_q1 = native_q1_enabled();
         let q2_group = q2_group_usize();
         let q2_variant = q2_group_variant(q2_group);
         if native_q2 {
             tracing::info!(
                 "ATLAS_GGUF_NATIVE_Q2=1: keeping id-42 FFN projections packed (group {q2_group})"
+            );
+        }
+        if native_q1 {
+            tracing::info!(
+                "native-Q1: keeping id-41 projections + embeddings packed (group 128, 1-bit)"
             );
         }
 
@@ -311,10 +330,13 @@ impl super::WeightLoader for GgufLoader {
                 .to_lowercase()
         });
 
-        // Pre-flight: combined BF16 footprint of both files.
-        let mut est = sidecar::est_bf16(&bb_gguf, &arch);
+        // Pre-flight: combined footprint of both files (packed tensors under a
+        // native keep-packed gate count at their on-disk size, not the BF16
+        // expansion — otherwise a 27B 1-bit checkpoint fails preflight on a
+        // machine it comfortably fits).
+        let mut est = sidecar::est_bf16(&bb_gguf, &arch, native_q1, native_q2, q2_group);
         if let (Some((_, _, mm_gguf)), Some(mm_arch)) = (mmproj.as_ref(), mmproj_arch.as_ref()) {
-            est += sidecar::est_bf16(mm_gguf, mm_arch);
+            est += sidecar::est_bf16(mm_gguf, mm_arch, false, false, q2_group);
         }
         preflight_oom(gpu, est, oom_reserve_bytes, self.peak_memory_multiplier)?;
 
@@ -330,6 +352,7 @@ impl super::WeightLoader for GgufLoader {
             &arch,
             gdn,
             force_cpu,
+            native_q1,
             native_q2,
             q2_group,
             q2_variant,
@@ -345,8 +368,9 @@ impl super::WeightLoader for GgufLoader {
         // No GDN transforms (gdn = None) and no expert fan-out for clip.
         if let (Some((mm_file, mm_mmap, mm_gguf)), Some(mm_arch)) = (mmproj, mmproj_arch) {
             let before = weights.len();
-            // mmproj is a `clip` tower — no qwen35 FFN names, so native_q2 is
-            // irrelevant there; pass false to keep it on the plain BF16 path.
+            // mmproj is a `clip` tower — no qwen35 FFN names, so the native
+            // keep-packed gates are irrelevant there; pass false to keep it on
+            // the plain BF16 path.
             sidecar::load_pass(
                 self,
                 gpu,
@@ -355,6 +379,7 @@ impl super::WeightLoader for GgufLoader {
                 &mm_arch,
                 None,
                 force_cpu,
+                false,
                 false,
                 q2_group,
                 q2_variant,

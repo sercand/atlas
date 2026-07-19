@@ -361,3 +361,13 @@ pub(super) fn dequant_q2_0_gn(blk: &[u8], out: &mut [f32], g: usize) {
         out[j] = (code - 1) as f32 * d;
     }
 }
+
+/// PrismML Q1_0 (id 41), fixed group 128 (`QK1_0`).
+/// Block = `[f16 d (FRONT)][u8 qs[16]]`, one sign bit per weight,
+/// LSB-first within each byte; `value = bit ? +d : −d`. Delegates to the
+/// canonical implementation in [`crate::weights::gguf_q1`] (shared with the
+/// Metal embed-row lookup and the kernel parity tests) so the bit layout has
+/// exactly one definition in the crate.
+pub(super) fn dequant_q1_0(blk: &[u8], out: &mut [f32]) {
+    crate::weights::gguf_q1::dequant_block_f32(blk, out);
+}

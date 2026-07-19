@@ -42,6 +42,9 @@ pub enum GgmlType {
     Q8K,
     Tq1_0,
     Tq2_0,
+    /// PrismML id 41: 1-bit binary, scale-at-front, one sign bit per weight
+    /// (LSB-first), `value = bit ? +d : −d`. Fixed group 128; block = 18 bytes.
+    Q1_0,
     /// PrismML id 42: 2-bit, symmetric, scale-at-front, contiguous codes.
     /// `group` ∈ {64, 128}; block = 2 + group/4 bytes.
     Q2_0 {
@@ -72,6 +75,7 @@ impl GgmlType {
             15 => Self::Q8K,
             34 => Self::Tq1_0,
             35 => Self::Tq2_0,
+            41 => Self::Q1_0,
             42 => Self::Q2_0 { group: q2_0_group },
             other => bail!("unsupported / unknown ggml type id {other}"),
         })
@@ -90,6 +94,7 @@ impl GgmlType {
             | Self::Q8K
             | Self::Tq1_0
             | Self::Tq2_0 => 256,
+            Self::Q1_0 => 128,
             Self::Q2_0 { group } => group,
         }
     }
@@ -113,6 +118,7 @@ impl GgmlType {
             Self::Q8K => 292,
             Self::Tq1_0 => 54,
             Self::Tq2_0 => 66,
+            Self::Q1_0 => 18,
             Self::Q2_0 { group } => {
                 if group == 0 || !group.is_multiple_of(4) {
                     bail!("Q2_0 group size must be a positive multiple of 4, got {group}");
@@ -256,6 +262,7 @@ fn dequant_block(t: GgmlType, blk: &[u8], out: &mut [f32]) {
         GgmlType::Q8K => blocks::dequant_q8_k(blk, out),
         GgmlType::Tq1_0 => blocks::dequant_tq1_0(blk, out),
         GgmlType::Tq2_0 => blocks::dequant_tq2_0(blk, out),
+        GgmlType::Q1_0 => blocks::dequant_q1_0(blk, out),
         GgmlType::Q2_0 { group } => blocks::dequant_q2_0_gn(blk, out, group),
     }
 }

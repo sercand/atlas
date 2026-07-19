@@ -131,6 +131,36 @@ fn q2_0_g64_block_bytes() {
 }
 
 #[test]
+fn q1_0_single_block() {
+    // PrismML id 41, fixed group 128, scale at FRONT. d = 2.0.
+    // qs[0] = 0b0000_0101 -> bits (LSB-first) 1,0,1,0,... -> +d,-d,+d,-d.
+    let mut blk = Vec::new();
+    push_f16(&mut blk, F16_2_0);
+    let mut qs = [0u8; 16]; // 128 / 8
+    qs[0] = 0x05;
+    qs[15] = 0x80; // element 127 (MSB of last byte) -> +d
+    blk.extend_from_slice(&qs);
+
+    let mut out = [0f32; 128];
+    dequant_to_f32(GgmlType::Q1_0, &blk, 128, &mut out).unwrap();
+    assert_eq!(out[0], 2.0); // bit 1 -> +d
+    assert_eq!(out[1], -2.0); // bit 0 -> -d
+    assert_eq!(out[2], 2.0); // bit 1 -> +d
+    assert_eq!(out[3], -2.0); // bit 0 -> -d
+    assert_eq!(out[8], -2.0); // qs[1] = 0 -> -d
+    assert_eq!(out[126], -2.0);
+    assert_eq!(out[127], 2.0); // MSB of qs[15]
+}
+
+#[test]
+fn q1_0_block_geometry_and_id() {
+    // id 41 → Q1_0; group fixed at 128; block = 2 (f16 d) + 16 (bits) = 18 B.
+    assert_eq!(GgmlType::from_id(41, 128).unwrap(), GgmlType::Q1_0);
+    assert_eq!(GgmlType::Q1_0.block_bytes().unwrap(), 18);
+    assert_eq!(GgmlType::Q1_0.block_size(), 128);
+}
+
+#[test]
 fn rejects_short_input_and_bad_length() {
     let mut out = [0f32; 32];
     // Too few bytes for one Q8_0 block.

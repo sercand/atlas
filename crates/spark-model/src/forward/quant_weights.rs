@@ -18,6 +18,7 @@
 
 use anyhow::{Result, bail};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::weights::gguf_q1::{self, GgufQ1Weight};
 use spark_runtime::weights::mlx_int8::{self, MlxInt8Weight};
 
 /// A quantised weight tensor that can drive matvec / matmul ops on a
@@ -115,6 +116,52 @@ pub trait QuantWeights: Send + Sync {
 // foreign to spark-runtime, but native here). Each impl is a thin
 // forwarding shim onto the concrete weight type's inherent methods,
 // keeping the optimised fused-kernel paths intact.
+
+impl QuantWeights for GgufQ1Weight {
+    fn out_features(&self) -> u32 {
+        self.out_features
+    }
+    fn in_features(&self) -> u32 {
+        self.in_features
+    }
+    fn gemv(&self, gpu: &dyn GpuBackend, x: DevicePtr, y: DevicePtr, stream: u64) -> Result<()> {
+        GgufQ1Weight::gemv(self, gpu, x, y, stream)
+    }
+    fn gemv_gate_up_with(
+        &self,
+        other: &Self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        gate_y: DevicePtr,
+        up_y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        // Fused dual-output kernel (`q1_0_gemv_gate_up`): one x[] read
+        // drives both projections instead of two serial gemvs.
+        gguf_q1::gemv_gate_up(gpu, self, other, x, gate_y, up_y, stream)
+    }
+    fn gemv_silu_gate(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        GgufQ1Weight::gemv_silu_gate(self, gpu, gate, up, y, stream)
+    }
+    fn gemv_silu_gate_resid(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        x_resid: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        GgufQ1Weight::gemv_silu_gate_resid(self, gpu, gate, up, x_resid, y, stream)
+    }
+}
 
 impl QuantWeights for MlxInt8Weight {
     fn out_features(&self) -> u32 {

@@ -390,6 +390,16 @@ pub fn is_keep_packed_proj(hf: &str) -> bool {
         || hf.ends_with(".self_attn.o_proj.weight")
 }
 
+/// Embedding / LM-head tensors that ALSO keep-pack under the native-Q1 path
+/// (Apple-Silicon serving, where a BF16 expansion of a 248k-vocab embedding
+/// table costs ~2.5 GB each and blows the unified-memory budget). The Metal
+/// model does its embed lookup by CPU row-dequant and its LM head through the
+/// packed `q1_0_gemv`, so neither ever needs the BF16 form. Not applied on the
+/// native-Q2 CUDA path (its loaders expect BF16 embeddings).
+pub fn is_keep_packed_embed(hf: &str) -> bool {
+    hf == "model.embed_tokens.weight" || hf == "lm_head.weight"
+}
+
 /// Expand an [`GgufName::ExpertStack`] into the concrete per-expert HF name for
 /// expert `e`. The loader calls this while slicing the stacked tensor so the
 /// naming convention lives next to the translation table it mirrors.

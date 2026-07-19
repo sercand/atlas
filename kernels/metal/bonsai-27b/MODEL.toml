@@ -1,0 +1,55 @@
+[model]
+name = "bonsai-27b"
+# PrismML Bonsai-27B: 1-bit (Q1_0 g128) binary-quantized Qwen3.6-27B
+# GDN-hybrid + SigLIP vision tower, served from GGUF
+# (Bonsai-27B-Q1_0.gguf + Bonsai-27B-mmproj-Q8_0.gguf sidecar).
+hf_id = "prism-ml/Bonsai-27B-gguf"
+params = "27B"
+active_params = "27B"
+# 64 decoder layers: 3x linear_attention (GDN) then 1x full_attention,
+# repeated (full_attention_interval = 4) -> 16 full + 48 GDN.
+layers_attention = 16
+layers_ssm = 48
+moe_experts = 0
+moe_topk = 0
+hidden_dim = 5120
+head_dim = 256
+q_heads = 24
+kv_heads = 4
+
+# Match arm consumed by spark-model::factory::loader_for_config. The
+# upstream config declares `model_type = "qwen3_5"` (dense — no MoE
+# router), which routes to Qwen35DenseWeightLoader on CUDA and the
+# Metal GGUF model under the metal feature.
+[[model_types]]
+model_type = "qwen3_5"
+hidden_size = 5120
+
+# Sampling presets — Bonsai model-card recommendations.
+[sampling.thinking_text]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[behavior]
+default_kv_dtype = "bf16"
+thinking_default = true

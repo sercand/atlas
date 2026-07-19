@@ -49,6 +49,12 @@ pub enum WeightDtype {
     PackedQ2_0 {
         group: u16,
     },
+    /// Keep-packed PrismML 1-bit binary Q1_0 (ggml id 41): raw on-disk blocks
+    /// stay 1-bit in device memory (fp16 scale + 1 sign bit/weight per group
+    /// of 128, 18-byte block), dequantized in-kernel by the native
+    /// `q1_0_gemv` decode path. Only produced by the GGUF loader under the
+    /// native-Q1 gate. Footprint is block-based like `PackedQ2_0`.
+    PackedQ1_0,
 }
 
 impl WeightDtype {
@@ -66,6 +72,7 @@ impl WeightDtype {
             Self::UInt8 => 1,
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
+            Self::PackedQ1_0 => 0,
         }
     }
 
@@ -127,6 +134,8 @@ impl WeightTensor {
                 let n_blocks = self.num_elements() / g.max(1);
                 n_blocks * (2 + g / 4)
             }
+            // Packed Q1_0: fixed group 128, 18-byte block (fp16 d + 16 B bits).
+            WeightDtype::PackedQ1_0 => (self.num_elements() / 128) * 18,
             d => self.num_elements() * d.byte_size(),
         }
     }
@@ -142,6 +151,11 @@ impl WeightTensor {
     /// True if this tensor holds keep-packed ternary Q2_0 blocks (id 42).
     pub fn is_packed_q2(&self) -> bool {
         matches!(self.dtype, WeightDtype::PackedQ2_0 { .. })
+    }
+
+    /// True if this tensor holds keep-packed 1-bit Q1_0 blocks (id 41).
+    pub fn is_packed_q1(&self) -> bool {
+        matches!(self.dtype, WeightDtype::PackedQ1_0)
     }
 }
 
@@ -297,6 +311,7 @@ pub fn parse_expert_index(name: &str) -> Option<usize> {
 pub mod adapter;
 mod gguf;
 mod loader;
+pub mod gguf_q1;
 pub mod mlx_int8;
 pub use gguf::{GgufLoader, config_from_gguf_dir, find_gguf};
 pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};

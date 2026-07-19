@@ -68,7 +68,8 @@ pub enum GgmlType {
     Bf16,
     Tq1_0,
     Tq2_0,
-    /// PrismML-private ternary (id 41).
+    /// PrismML-private 1-bit binary (id 41): fp16 scale + 1 sign bit/weight,
+    /// fixed group 128 (`QK1_0`), 18-byte block.
     Q1_0,
     /// PrismML-private ternary (id 42). Group size (128 vs 64) is NOT encoded
     /// in the type id — see [`Q2Group`].
@@ -196,6 +197,8 @@ impl GgmlType {
             Q8_K => (256, 292),
             Tq1_0 => (256, 54),
             Tq2_0 => (256, 66),
+            // PrismML 1-bit binary: fp16 scale + 128 sign bits = 18 bytes.
+            Q1_0 => (128, 18),
             Q2_0 => match q2 {
                 Q2Group::G128 => (128, 34),
                 Q2Group::G64 => (64, 18),
