@@ -113,9 +113,39 @@ pub(crate) fn preflight_reserve(
             0
         }
     };
-    let inference_reserve: usize =
-        ssm_pool_bytes + ssm_snapshot_bytes + gdn_two_phase_bytes + cuda_headroom;
-    let total_reserve = inference_reserve + buffer_arena_bytes;
+    // Metal-only builds serve through MetalGgufModel, which allocates
+    // per-slot contiguous KV + GDN recurrent state at alloc_sequence and a
+    // few MB of shared scratch — none of the CUDA arena / SSM pool /
+    // snapshot-ring structures exist, so reserving for them (~7.5 GB at
+    // 27B dims) would spuriously reject configs that fit comfortably.
+    let metal_only = cfg!(all(feature = "metal", not(feature = "cuda")));
+    let metal_reserve: usize = {
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        // bf16 worst case: K+V, 2 bytes each, per full-attention layer.
+        let kv_per_slot = config.num_attention_layers() * args.max_seq_len * kv_dim * 2 * 2;
+        let qkv_lin = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let gdn_per_slot = config.num_ssm_layers()
+            * (qkv_lin * config.linear_conv_kernel_dim * 4
+                + config.linear_num_value_heads
+                    * config.linear_key_head_dim
+                    * config.linear_value_head_dim
+                    * 4);
+        // + fixed headroom: logits rows, scratch, host-side packed-embed
+        // copy (UMA), mmap page-cache pressure during load.
+        args.max_batch_size * (kv_per_slot + gdn_per_slot) + 768 * 1024 * 1024
+    };
+    let inference_reserve: usize = if metal_only {
+        metal_reserve
+    } else {
+        ssm_pool_bytes + ssm_snapshot_bytes + gdn_two_phase_bytes + cuda_headroom
+    };
+    // The BufferArena is a CUDA-path construct; metal builds never create it.
+    let total_reserve = if metal_only {
+        inference_reserve
+    } else {
+        inference_reserve + buffer_arena_bytes
+    };
     if total_reserve > free_mem {
         let need_gb = total_reserve as f64 / (1024.0 * 1024.0 * 1024.0);
         let free_gb = free_mem as f64 / (1024.0 * 1024.0 * 1024.0);

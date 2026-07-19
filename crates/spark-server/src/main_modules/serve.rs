@@ -179,7 +179,13 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         ssm_prefill_chunk,
         max_batch_tokens_pre,
     } = serve_phases::preflight_reserve(&args, &config, free_mem)?;
-    let total_reserve = inference_reserve + buffer_arena_bytes;
+    // Metal-only builds never construct the BufferArena — mirror
+    // preflight_reserve's total (see the metal_only branch there).
+    let total_reserve = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+        inference_reserve
+    } else {
+        inference_reserve + buffer_arena_bytes
+    };
 
     // 2a-2. OOM watchdog: background async task that polls GPU memory every 2s.
     // On GB10 unified memory, GPU OOM = system freeze, so we exit(1) early.
