@@ -98,7 +98,7 @@ impl MetalGgufModel {
                 .get(chunk_start + i)
                 .copied()
                 .unwrap_or([cache_pos; 3]);
-            self.run_token(&mut bufs, st, tok, cache_pos, pos3, stream)?;
+            self.run_token(&mut bufs, st, tok, cache_pos, pos3, stream, true)?;
         }
         let row = self.prefill_logits_row(seq.slot_idx);
         if emit_logits {
@@ -140,7 +140,7 @@ impl MetalGgufModel {
         // image run it is offset from the physical KV position).
         let rope_pos = if st.next_pos > 0 { st.next_pos } else { pos };
         st.next_pos = rope_pos + 1;
-        self.run_token(&mut bufs, st, token, pos, [rope_pos; 3], stream)?;
+        self.run_token(&mut bufs, st, token, pos, [rope_pos; 3], stream, false)?;
         self.write_logits(&bufs, row, stream)?;
         drop(states);
         drop(bufs);
@@ -274,6 +274,13 @@ impl Model for MetalGgufModel {
             );
         }
         for (i, seq) in seqs.iter_mut().enumerate() {
+            // decode_one only ENCODES (no sync — the sampler's read
+            // syncs). The next sequence's embed/position host uploads
+            // would race the still-queued reads of the shared forward
+            // buffers, so drain between sequences.
+            if i > 0 {
+                self.gpu.synchronize(stream)?;
+            }
             self.decode_one(tokens[i], seq, self.decode_logits_row(i), stream)?;
         }
         Ok(self.decode_logits_row(0))
@@ -432,7 +439,10 @@ impl Model for MetalGgufModel {
     }
 
     fn copy_logits_to_host(&self, logits_ptr: DevicePtr, dst: &mut [u8]) -> Result<()> {
-        self.gpu.copy_d2h(logits_ptr, dst)
+        // The logits gemv no longer syncs after encoding (decode is one
+        // command buffer end-to-end); flush + wait before the CPU read.
+        self.gpu
+            .copy_d2h_on_stream(logits_ptr, dst, self.gpu.default_stream())
     }
 
     fn logits_buffer_ptr(&self) -> DevicePtr {

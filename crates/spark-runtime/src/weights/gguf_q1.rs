@@ -14,11 +14,12 @@
 //! Bonsai linear and the embedding/LM-head rows are multiples of 128).
 //!
 //! [`GgufQ1Weight`] wraps a packed device buffer produced by the GGUF
-//! loader (`WeightDtype::PackedQ1_0`) and drives the fused Metal
-//! kernels: `q1_0_gemv` (+`_batchm`), `q1_0_gemv_gate_up`, and
-//! `q1_0_gemv_silu_gate(_resid)`. On Apple-Silicon UMA the same packed
-//! bytes are also readable host-side, which [`dequant_row_f32`] uses for
-//! CPU embedding-row lookups.
+//! loader (`WeightDtype::PackedQ1_0`, or `PackedQ1Planar` under
+//! `ATLAS_Q1_PLANAR=1`) and drives the Metal kernels: `q1_0_gemv`
+//! (+`_resid`, `_batchm`), `q1_0_gemv_gate_up` (+`_act`), and the
+//! elementwise `silu_gate` for the composed FFN tail. On Apple-Silicon
+//! UMA the same packed bytes are also readable host-side, which
+//! [`dequant_row_f32`] uses for CPU embedding-row lookups.
 
 use anyhow::{Result, bail};
 
@@ -72,10 +73,14 @@ pub fn dequant_row_f32(row_bytes: &[u8], k: usize, out: &mut [f32]) -> Result<()
 /// here), mirroring how the CUDA `PackedQ2Weight` wraps store buffers.
 #[derive(Clone, Copy)]
 pub struct GgufQ1Weight {
-    /// `[out_features, in_features/128]` packed 18-byte blocks.
+    /// `[out_features, in_features/128]` packed 18-byte blocks — in
+    /// on-disk block order, or the loader's row-planar reorder when
+    /// `planar` (see `WeightDtype::PackedQ1Planar`).
     pub packed: DevicePtr,
     pub out_features: u32,
     pub in_features: u32,
+    /// Row-planar byte order → dispatch the `_planar` kernel variants.
+    pub planar: bool,
 }
 
 impl GgufQ1Weight {
@@ -100,12 +105,30 @@ impl GgufQ1Weight {
             packed: t.ptr,
             out_features: n as u32,
             in_features: k as u32,
+            planar: t.dtype == crate::weights::WeightDtype::PackedQ1Planar,
         })
     }
 
-    /// Row-group launch geometry shared by every q1 gemv kernel:
-    /// 4 rows per threadgroup, one 32-lane simdgroup per row.
+    /// Kernel function name honoring the tensor's byte order.
+    fn fn_name(&self, base: &'static str, planar_variant: &'static str) -> &'static str {
+        if self.planar { planar_variant } else { base }
+    }
+
+    /// Row-group launch geometry shared by the q1 gemv kernels: 16
+    /// rows per 128-thread threadgroup (4 simdgroups × 4 rows each).
+    /// 4 rows/simdgroup measured fastest — 8 amortizes x further but
+    /// the doubled accumulator/stream state costs more than it saves.
     fn grid(&self) -> ([u32; 3], [u32; 3]) {
+        ([self.out_features.div_ceil(16), 1, 1], [128, 1, 1])
+    }
+
+    /// Launch geometry for the dual-stream gate_up kernels.
+    fn grid_gate_up(&self) -> ([u32; 3], [u32; 3]) {
+        ([self.out_features.div_ceil(16), 1, 1], [128, 1, 1])
+    }
+
+    /// Legacy geometry for `q1_0_gemv_batchm` (one simdgroup per row).
+    fn grid_batchm(&self) -> ([u32; 3], [u32; 3]) {
         ([self.out_features.div_ceil(4), 1, 1], [128, 1, 1])
     }
 
@@ -117,7 +140,7 @@ impl GgufQ1Weight {
         y: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        let kernel = gpu.kernel("q1_0_gemv", "q1_0_gemv")?;
+        let kernel = gpu.kernel("q1_0_gemv", self.fn_name("q1_0_gemv", "q1_0_gemv_planar"))?;
         let (grid, block) = self.grid();
         gpu.launch_typed(
             kernel,
@@ -149,8 +172,11 @@ impl GgufQ1Weight {
         if m > 8 {
             bail!("q1_0_gemv_batchm supports M <= 8, got {m}");
         }
+        if self.planar {
+            bail!("q1_0_gemv_batchm has no planar variant (decode path is single-token)");
+        }
         let kernel = gpu.kernel("q1_0_gemv", "q1_0_gemv_batchm")?;
-        let (grid, block) = self.grid();
+        let (grid, block) = self.grid_batchm();
         gpu.launch_typed(
             kernel,
             grid,
@@ -168,7 +194,37 @@ impl GgufQ1Weight {
         )
     }
 
-    /// Fused FFN tail: `y = W @ (silu(gate) ⊙ up)`.
+    /// Elementwise `up[k] = silu(gate[k]) ⊙ up[k]` over `in_features`
+    /// elements. The in-place clobber of `up` is deliberate: the
+    /// silu-gate entry points receive per-layer scratch that this call
+    /// consumes, and writing the activation once here is what removes
+    /// the N-fold silu recompute the old fused gemv kernels paid
+    /// (activation cost scaled with OUTPUT rows, not input length).
+    fn activate_silu(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate: DevicePtr,
+        up: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = gpu.kernel("silu_gate", "silu_gate")?;
+        gpu.launch_typed(
+            kernel,
+            [self.in_features.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&self.in_features.to_le_bytes()),
+                KernelArg::Buffer(gate),
+                KernelArg::Buffer(up),
+                KernelArg::Buffer(up),
+            ],
+        )
+    }
+
+    /// FFN tail: `y = W @ (silu(gate) ⊙ up)`. Clobbers `up` with the
+    /// activated vector (see [`Self::activate_silu`]).
     pub fn gemv_silu_gate(
         &self,
         gpu: &dyn GpuBackend,
@@ -177,7 +233,24 @@ impl GgufQ1Weight {
         y: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        let kernel = gpu.kernel("q1_0_gemv_silu_gate", "q1_0_gemv_silu_gate")?;
+        self.activate_silu(gpu, gate, up, stream)?;
+        self.gemv(gpu, up, y, stream)
+    }
+
+    /// Matvec with the residual-stream add folded into the epilogue:
+    /// `y[n] = x_resid[n] + Σ_k W[n,k]·x[k]`.
+    pub fn gemv_resid(
+        &self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        x_resid: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = gpu.kernel(
+            "q1_0_gemv",
+            self.fn_name("q1_0_gemv_resid", "q1_0_gemv_resid_planar"),
+        )?;
         let (grid, block) = self.grid();
         gpu.launch_typed(
             kernel,
@@ -189,15 +262,16 @@ impl GgufQ1Weight {
                 KernelArg::Bytes(&self.out_features.to_le_bytes()),
                 KernelArg::Bytes(&self.in_features.to_le_bytes()),
                 KernelArg::Buffer(self.packed),
-                KernelArg::Buffer(gate),
-                KernelArg::Buffer(up),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(x_resid),
                 KernelArg::Buffer(y),
             ],
         )
     }
 
-    /// Like [`Self::gemv_silu_gate`] with the residual add folded in:
-    /// `y[n] = x_resid[n] + Σ_k W[n,k]·(silu(gate)⊙up)[k]`.
+    /// Like [`Self::gemv_silu_gate`] with the residual add folded into
+    /// the gemv: `y[n] = x_resid[n] + Σ_k W[n,k]·(silu(gate)⊙up)[k]`.
+    /// Clobbers `up`.
     pub fn gemv_silu_gate_resid(
         &self,
         gpu: &dyn GpuBackend,
@@ -207,25 +281,58 @@ impl GgufQ1Weight {
         y: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        let kernel = gpu.kernel("q1_0_gemv_silu_gate", "q1_0_gemv_silu_gate_resid")?;
-        let (grid, block) = self.grid();
-        gpu.launch_typed(
-            kernel,
-            grid,
-            block,
-            0,
-            stream,
-            &[
-                KernelArg::Bytes(&self.out_features.to_le_bytes()),
-                KernelArg::Bytes(&self.in_features.to_le_bytes()),
-                KernelArg::Buffer(self.packed),
-                KernelArg::Buffer(gate),
-                KernelArg::Buffer(up),
-                KernelArg::Buffer(x_resid),
-                KernelArg::Buffer(y),
-            ],
-        )
+        self.activate_silu(gpu, gate, up, stream)?;
+        self.gemv_resid(gpu, up, x_resid, y, stream)
     }
+}
+
+/// Whole SwiGLU FFN tail in two dispatches:
+/// `y = x_resid + down_w @ (silu(gate_w @ x) ⊙ (up_w @ x))`.
+/// The `q1_0_gemv_gate_up_act` kernel folds the activation into the
+/// dual-gemv epilogue (writing `act_scratch`), so no elementwise silu
+/// dispatch runs between the two gemvs. Blocked layout only — callers
+/// fall back to the composed path for planar tensors.
+pub fn gemv_ffn_swiglu(
+    gpu: &dyn GpuBackend,
+    gate_w: &GgufQ1Weight,
+    up_w: &GgufQ1Weight,
+    down_w: &GgufQ1Weight,
+    x: DevicePtr,
+    act_scratch: DevicePtr,
+    x_resid: DevicePtr,
+    y: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    if gate_w.out_features != up_w.out_features || gate_w.in_features != up_w.in_features {
+        bail!(
+            "ffn gate/up shape mismatch: [{}, {}] vs [{}, {}]",
+            gate_w.out_features,
+            gate_w.in_features,
+            up_w.out_features,
+            up_w.in_features
+        );
+    }
+    if gate_w.planar || up_w.planar || down_w.planar {
+        bail!("gemv_ffn_swiglu: planar tensors take the composed path");
+    }
+    let kernel = gpu.kernel("q1_0_gemv_gate_up", "q1_0_gemv_gate_up_act")?;
+    let (grid, block) = gate_w.grid_gate_up();
+    gpu.launch_typed(
+        kernel,
+        grid,
+        block,
+        0,
+        stream,
+        &[
+            KernelArg::Bytes(&gate_w.out_features.to_le_bytes()),
+            KernelArg::Bytes(&gate_w.in_features.to_le_bytes()),
+            KernelArg::Buffer(gate_w.packed),
+            KernelArg::Buffer(up_w.packed),
+            KernelArg::Buffer(x),
+            KernelArg::Buffer(act_scratch),
+        ],
+    )?;
+    down_w.gemv_resid(gpu, act_scratch, x_resid, y, stream)
 }
 
 /// Fused dual-output GEMV: `gate_y = gate_w @ x`, `up_y = up_w @ x`,
@@ -249,8 +356,14 @@ pub fn gemv_gate_up(
             up_w.in_features
         );
     }
-    let kernel = gpu.kernel("q1_0_gemv_gate_up", "q1_0_gemv_gate_up")?;
-    let (grid, block) = gate_w.grid();
+    if gate_w.planar != up_w.planar {
+        bail!("gate/up byte-order mismatch (one planar, one blocked)");
+    }
+    let kernel = gpu.kernel(
+        "q1_0_gemv_gate_up",
+        gate_w.fn_name("q1_0_gemv_gate_up", "q1_0_gemv_gate_up_planar"),
+    )?;
+    let (grid, block) = gate_w.grid_gate_up();
     gpu.launch_typed(
         kernel,
         grid,

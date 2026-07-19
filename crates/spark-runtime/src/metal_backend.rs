@@ -21,10 +21,25 @@
 //!
 //! # Streams
 //!
-//! A stream handle indexes a slab of `MetalStream { queue, in_flight }`.
-//! Handle 0 is the default stream and is lazily created on first use.
-//! `synchronize(stream)` commits the in-flight `MTLCommandBuffer` and
-//! `waitUntilCompleted()`s; the next encoder opens on a fresh buffer.
+//! A stream handle indexes a slab of `MetalStream { queue, in_flight,
+//! encoder }`. Handle 0 is the default stream and is lazily created on
+//! first use. `synchronize(stream)` commits the in-flight
+//! `MTLCommandBuffer` and `waitUntilCompleted()`s; the next encoder
+//! opens on a fresh buffer.
+//!
+//! Dispatches accumulate on ONE serial `MTLComputeCommandEncoder` per
+//! stream (`MetalStream::encoder`), reused across `launch_typed` calls
+//! — encoder churn, not kernel time, dominated per-token latency when
+//! every launch opened its own encoder. The serial dispatch type
+//! guarantees dispatch N+1 sees dispatch N's writes, so this is
+//! semantically identical to the old encoder-per-launch shape. The
+//! encoder is ended before anything that can't live inside a compute
+//! pass: blits, event signal/wait, and commit.
+//!
+//! Buffers are bound with `setBuffer:offset:atIndex:`, which makes them
+//! resident for the pass automatically — kernels take every input as a
+//! typed argument (no argument-buffer pointer chasing), so no
+//! `useResource:` calls are needed.
 //!
 //! # Kernel handles
 //!
@@ -46,7 +61,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLEvent, MTLLibrary, MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize,
+    MTLEvent, MTLLibrary, MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 use parking_lot::Mutex;
 
@@ -61,6 +76,7 @@ type ObjCmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 type ObjLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
 type ObjPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 type ObjSharedEvent = Retained<ProtocolObject<dyn MTLSharedEvent>>;
+type ObjComputeEnc = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 
 // ── Stream + slab types ──────────────────────────────────────────────────
 
@@ -70,6 +86,54 @@ struct MetalStream {
     /// waited on by `synchronize()`; replaced by a fresh buffer on
     /// next encoder open.
     in_flight: Option<ObjCmdBuf>,
+    /// Open compute encoder on `in_flight`, reused across dispatches.
+    /// Must be ended before blit encoding, event signal/wait, or commit.
+    encoder: Option<ObjComputeEnc>,
+}
+
+impl MetalStream {
+    /// Borrow (or open) the in-flight command buffer.
+    fn cmd_buf(&mut self) -> Result<ObjCmdBuf> {
+        if let Some(ref cb) = self.in_flight {
+            return Ok(cb.clone());
+        }
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow!("commandBuffer returned null"))?;
+        self.in_flight = Some(cb.clone());
+        Ok(cb)
+    }
+
+    /// Borrow (or open) the stream's serial compute encoder.
+    fn compute_encoder(&mut self) -> Result<ObjComputeEnc> {
+        if let Some(ref enc) = self.encoder {
+            return Ok(enc.clone());
+        }
+        let cb = self.cmd_buf()?;
+        let enc = cb
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow!("computeCommandEncoder returned null"))?;
+        self.encoder = Some(enc.clone());
+        Ok(enc)
+    }
+
+    /// End the open compute encoder, if any. Required before blits,
+    /// event encoding, and commit.
+    fn end_encoder(&mut self) {
+        if let Some(enc) = self.encoder.take() {
+            enc.endEncoding();
+        }
+    }
+
+    /// End encoding and commit the in-flight buffer (no wait). Returns
+    /// the committed buffer so callers can `waitUntilCompleted()`.
+    fn commit(&mut self) -> Option<ObjCmdBuf> {
+        self.end_encoder();
+        let cb = self.in_flight.take()?;
+        cb.commit();
+        Some(cb)
+    }
 }
 
 /// Tracks one outstanding shared event so `record_event` can write the
@@ -105,6 +169,8 @@ pub struct MetalGpuBackend {
     /// Both are mutexed so `kernel()` can be called from any thread.
     pipeline_cache: Arc<Mutex<HashMap<PipelineKey, KernelHandle>>>,
     pipeline_slab: Arc<Mutex<Vec<ObjPipeline>>>,
+    /// Function name per slab entry (same index) — profile-mode labels.
+    pipeline_names: Arc<Mutex<Vec<String>>>,
     /// Shared-event slab for cross-stream synchronization.
     events: Arc<Mutex<Vec<EventSlot>>>,
 }
@@ -156,6 +222,7 @@ impl MetalGpuBackend {
         let streams = vec![MetalStream {
             queue: default_queue,
             in_flight: None,
+            encoder: None,
         }];
 
         tracing::info!(
@@ -171,6 +238,7 @@ impl MetalGpuBackend {
             libraries,
             pipeline_cache: Arc::new(Mutex::new(HashMap::new())),
             pipeline_slab: Arc::new(Mutex::new(Vec::new())),
+            pipeline_names: Arc::new(Mutex::new(Vec::new())),
             events: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -211,37 +279,18 @@ impl MetalGpuBackend {
         Ok(idx)
     }
 
-    /// Borrow (or open) the in-flight command buffer on the given
-    /// stream. Returns a clone of the `Retained` so the caller can
-    /// encode without holding the streams mutex across encoder calls.
-    fn current_cmd_buf(&self, stream_handle: u64) -> Result<ObjCmdBuf> {
+    /// Run `f` with exclusive access to the stream's state. Encoding
+    /// happens under the streams mutex — cheap now that a launch is a
+    /// handful of `set*` calls, and it keeps the encoder cache
+    /// consistent without per-stream locks.
+    fn with_stream<R>(
+        &self,
+        stream_handle: u64,
+        f: impl FnOnce(&mut MetalStream) -> Result<R>,
+    ) -> Result<R> {
         let mut slab = self.streams.lock();
         let idx = Self::stream_index(stream_handle, &slab)?;
-        let s = &mut slab[idx];
-        if let Some(ref cb) = s.in_flight {
-            return Ok(cb.clone());
-        }
-        let cb = s
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow!("commandBuffer returned null on stream {stream_handle}"))?;
-        s.in_flight = Some(cb.clone());
-        Ok(cb)
-    }
-
-    /// Commit the in-flight buffer on `stream_handle` (no wait). Used
-    /// internally by `synchronize` and `record_event`. Returns the
-    /// committed buffer so callers that need to `waitUntilCompleted()`
-    /// can.
-    fn commit_in_flight(&self, stream_handle: u64) -> Result<Option<ObjCmdBuf>> {
-        let mut slab = self.streams.lock();
-        let idx = Self::stream_index(stream_handle, &slab)?;
-        let s = &mut slab[idx];
-        let Some(cb) = s.in_flight.take() else {
-            return Ok(None);
-        };
-        cb.commit();
-        Ok(Some(cb))
+        f(&mut slab[idx])
     }
 }
 
@@ -345,18 +394,22 @@ impl GpuBackend for MetalGpuBackend {
             .ok_or_else(|| anyhow!("copy_d2d: dst ptr {dst} not allocated"))?;
         drop(allocs);
 
-        let cmd_buf = self.current_cmd_buf(0)?;
-        let enc = cmd_buf
-            .blitCommandEncoder()
-            .ok_or_else(|| anyhow!("blitCommandEncoder returned null"))?;
-        unsafe {
-            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &src_buf, src_off, &dst_buf, dst_off, bytes,
-            );
-        }
-        enc.endEncoding();
-        // Synchronize so the d2d behaves like CUDA's synchronous variant.
-        if let Some(cb) = self.commit_in_flight(0)? {
+        let committed = self.with_stream(0, |s| {
+            s.end_encoder();
+            let cmd_buf = s.cmd_buf()?;
+            let enc = cmd_buf
+                .blitCommandEncoder()
+                .ok_or_else(|| anyhow!("blitCommandEncoder returned null"))?;
+            unsafe {
+                enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &src_buf, src_off, &dst_buf, dst_off, bytes,
+                );
+            }
+            enc.endEncoding();
+            // Synchronize so the d2d behaves like CUDA's synchronous variant.
+            Ok(s.commit())
+        })?;
+        if let Some(cb) = committed {
             cb.waitUntilCompleted();
         }
         Ok(())
@@ -378,17 +431,20 @@ impl GpuBackend for MetalGpuBackend {
         let (dst_buf, dst_off) = Self::find_buffer(&allocs, dst)
             .ok_or_else(|| anyhow!("copy_d2d_async: dst {dst} not allocated"))?;
         drop(allocs);
-        let cmd_buf = self.current_cmd_buf(stream)?;
-        let enc = cmd_buf
-            .blitCommandEncoder()
-            .ok_or_else(|| anyhow!("blitCommandEncoder returned null"))?;
-        unsafe {
-            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &src_buf, src_off, &dst_buf, dst_off, bytes,
-            );
-        }
-        enc.endEncoding();
-        Ok(())
+        self.with_stream(stream, |s| {
+            s.end_encoder();
+            let cmd_buf = s.cmd_buf()?;
+            let enc = cmd_buf
+                .blitCommandEncoder()
+                .ok_or_else(|| anyhow!("blitCommandEncoder returned null"))?;
+            unsafe {
+                enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &src_buf, src_off, &dst_buf, dst_off, bytes,
+                );
+            }
+            enc.endEncoding();
+            Ok(())
+        })
     }
 
     fn launch(
@@ -428,69 +484,96 @@ impl GpuBackend for MetalGpuBackend {
                 .ok_or_else(|| anyhow!("launch_typed: unknown kernel handle {}", func.0))?
         };
 
-        // Snapshot the alloc registry so we can resolve Buffer args
-        // (and so the encoder can `useResource:` every live buffer
-        // without holding the alloc lock during encoding).
-        let live_buffers: Vec<ObjBuffer> = self.allocations.lock().values().cloned().collect();
-        let allocs_snapshot: BTreeMap<u64, ObjBuffer> = self.allocations.lock().clone();
-
-        let cmd_buf = self.current_cmd_buf(stream)?;
-        let enc = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow!("computeCommandEncoder returned null"))?;
-        enc.setComputePipelineState(&pipeline);
-
-        // Mark every live allocation as in-use so Metal's automatic
-        // hazard tracking keeps them resident. Cheap on Apple Silicon
-        // because `useResource:` is a hint, not a copy.
-        for buf in &live_buffers {
-            let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
-            enc.useResource_usage(
-                resource,
-                objc2_metal::MTLResourceUsage::Read | objc2_metal::MTLResourceUsage::Write,
-            );
+        // Resolve only the buffers this launch actually binds. Bound
+        // buffers are made resident by `setBuffer:`; nothing else needs
+        // `useResource:` (kernels take every input as a typed arg).
+        const MAX_ARGS: usize = 16;
+        if args.len() > MAX_ARGS {
+            bail!("launch_typed: {} args exceeds MAX_ARGS {MAX_ARGS}", args.len());
         }
-
-        // Bind each typed arg to its index.
-        for (idx, arg) in args.iter().enumerate() {
-            match arg {
-                KernelArg::Buffer(p) => {
-                    let (buf, offset) = Self::find_buffer(&allocs_snapshot, *p)
+        let mut resolved: [Option<(ObjBuffer, usize)>; MAX_ARGS] = std::array::from_fn(|_| None);
+        {
+            let allocs = self.allocations.lock();
+            for (idx, arg) in args.iter().enumerate() {
+                if let KernelArg::Buffer(p) = arg {
+                    let (buf, offset) = Self::find_buffer(&allocs, *p)
                         .ok_or_else(|| anyhow!("launch_typed: arg #{idx} ptr {p} not allocated"))?;
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(Some(&buf), offset, idx);
-                    }
-                }
-                KernelArg::Bytes(b) => {
-                    let ptr = NonNull::new(b.as_ptr() as *mut c_void)
-                        .ok_or_else(|| anyhow!("launch_typed: arg #{idx} bytes is null"))?;
-                    unsafe {
-                        enc.setBytes_length_atIndex(ptr, b.len(), idx);
-                    }
+                    resolved[idx] = Some((buf, offset));
                 }
             }
         }
 
-        let threadgroups = MTLSize {
-            width: grid[0] as usize,
-            height: grid[1] as usize,
-            depth: grid[2] as usize,
-        };
-        let threads_per_tg = MTLSize {
-            width: block[0] as usize,
-            height: block[1] as usize,
-            depth: block[2] as usize,
-        };
-        enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
-        enc.endEncoding();
+        self.with_stream(stream, |s| {
+            let enc = s.compute_encoder()?;
+            enc.setComputePipelineState(&pipeline);
+            for (idx, arg) in args.iter().enumerate() {
+                match arg {
+                    KernelArg::Buffer(_) => {
+                        let (buf, offset) =
+                            resolved[idx].as_ref().expect("resolved buffer arg");
+                        unsafe {
+                            enc.setBuffer_offset_atIndex(Some(buf), *offset, idx);
+                        }
+                    }
+                    KernelArg::Bytes(b) => {
+                        let ptr = NonNull::new(b.as_ptr() as *mut c_void)
+                            .ok_or_else(|| anyhow!("launch_typed: arg #{idx} bytes is null"))?;
+                        unsafe {
+                            enc.setBytes_length_atIndex(ptr, b.len(), idx);
+                        }
+                    }
+                }
+            }
+
+            let threadgroups = MTLSize {
+                width: grid[0] as usize,
+                height: grid[1] as usize,
+                depth: grid[2] as usize,
+            };
+            let threads_per_tg = MTLSize {
+                width: block[0] as usize,
+                height: block[1] as usize,
+                depth: block[2] as usize,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            Ok(())
+        })?;
+
+        // Profile mode: serialize every launch and attribute its GPU
+        // time to the kernel name. Slow — measurement only.
+        if profile_enabled() {
+            let committed = self.with_stream(stream, |s| Ok(s.commit()))?;
+            if let Some(cb) = committed {
+                cb.waitUntilCompleted();
+                let busy = cb.GPUEndTime() - cb.GPUStartTime();
+                let name = self
+                    .pipeline_names
+                    .lock()
+                    .get(func.0 as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("handle{}", func.0));
+                profile_record(&name, busy);
+            }
+        }
         Ok(())
     }
 
     fn synchronize(&self, stream: u64) -> Result<()> {
-        if let Some(cb) = self.commit_in_flight(stream)? {
+        let committed = self.with_stream(stream, |s| Ok(s.commit()))?;
+        if let Some(cb) = committed {
             cb.waitUntilCompleted();
+            record_cb_timing(&cb);
         }
         Ok(())
+    }
+
+    fn flush(&self, stream: u64) -> Result<()> {
+        // Commit without waiting — lets the GPU start on the encoded
+        // prefix while the host keeps encoding into a fresh buffer.
+        self.with_stream(stream, |s| {
+            s.commit();
+            Ok(())
+        })
     }
 
     fn default_stream(&self) -> u64 {
@@ -523,6 +606,7 @@ impl GpuBackend for MetalGpuBackend {
         let handle = KernelHandle(slab.len() as u64);
         slab.push(pipeline);
         drop(slab);
+        self.pipeline_names.lock().push(func_name.to_string());
         self.pipeline_cache.lock().insert(key, handle);
         Ok(handle)
     }
@@ -584,6 +668,7 @@ impl GpuBackend for MetalGpuBackend {
         slab.push(MetalStream {
             queue,
             in_flight: None,
+            encoder: None,
         });
         // Handle = slab index + 1 so handle 0 stays reserved for
         // the default stream.
@@ -619,17 +704,21 @@ impl GpuBackend for MetalGpuBackend {
             slot.next += 1;
             v
         };
-        let cmd_buf = self.current_cmd_buf(stream)?;
         let event_obj = {
             let slab = self.events.lock();
             slab[(event - 1) as usize].event.clone()
         };
         // Encode the signal on the active command buffer. Metal will
         // signal value=`value` once everything queued on this buffer
-        // up to this point has completed.
-        let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
-        cmd_buf.encodeSignalEvent_value(proto, value);
-        Ok(())
+        // up to this point has completed. Event encoding must happen
+        // outside any active encoder.
+        self.with_stream(stream, |s| {
+            s.end_encoder();
+            let cmd_buf = s.cmd_buf()?;
+            let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
+            cmd_buf.encodeSignalEvent_value(proto, value);
+            Ok(())
+        })
     }
 
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
@@ -646,10 +735,13 @@ impl GpuBackend for MetalGpuBackend {
             // value is 0 — Metal treats wait-for-0 as a no-op.
             (slot.event.clone(), slot.next.saturating_sub(1))
         };
-        let cmd_buf = self.current_cmd_buf(stream)?;
-        let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
-        cmd_buf.encodeWaitForEvent_value(proto, value);
-        Ok(())
+        self.with_stream(stream, |s| {
+            s.end_encoder();
+            let cmd_buf = s.cmd_buf()?;
+            let proto: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event_obj);
+            cmd_buf.encodeWaitForEvent_value(proto, value);
+            Ok(())
+        })
     }
 
     fn destroy_event(&self, event: u64) -> Result<()> {
@@ -706,6 +798,79 @@ impl GpuBackend for MetalGpuBackend {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// `ATLAS_METAL_PROFILE=1` commits + waits after EVERY `launch_typed`
+/// and attributes each command buffer's GPU time to its kernel name.
+/// Massive serialization overhead — for finding where GPU time goes,
+/// never for serving. Dumps a sorted table every 8192 launches.
+fn profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ATLAS_METAL_PROFILE").is_some())
+}
+
+fn profile_record(name: &str, busy_s: f64) {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Mutex<HashMap<String, (u64, f64)>>> = OnceLock::new();
+    static SINCE_DUMP: OnceLock<Mutex<u64>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut t = table.lock();
+        let e = t.entry(name.to_string()).or_insert((0, 0.0));
+        e.0 += 1;
+        if busy_s.is_finite() && busy_s > 0.0 {
+            e.1 += busy_s;
+        }
+    }
+    let mut n = SINCE_DUMP.get_or_init(|| Mutex::new(0)).lock();
+    *n += 1;
+    if *n >= 8192 {
+        *n = 0;
+        let mut rows: Vec<(String, (u64, f64))> =
+            table.lock().iter().map(|(k, v)| (k.clone(), *v)).collect();
+        rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        let total: f64 = rows.iter().map(|r| r.1.1).sum();
+        let mut msg = format!("metal profile (cumulative GPU time, total {:.1} ms):", total * 1e3);
+        for (name, (count, secs)) in rows.iter().take(16) {
+            msg.push_str(&format!(
+                "\n  {:<32} {:>8} calls {:>9.1} ms ({:>4.1}%)",
+                name,
+                count,
+                secs * 1e3,
+                100.0 * secs / total
+            ));
+        }
+        tracing::info!("{msg}");
+    }
+}
+
+/// `ATLAS_METAL_CB_TIMING=1` accumulates per-command-buffer GPU busy
+/// time (GPUEndTime − GPUStartTime) and logs a window summary every 256
+/// completed buffers. Splits wall time into GPU-busy vs host overhead
+/// without an Instruments trace.
+fn record_cb_timing(cb: &ProtocolObject<dyn MTLCommandBuffer>) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("ATLAS_METAL_CB_TIMING").is_some()) {
+        return;
+    }
+    static BUSY_NS: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let busy_s = cb.GPUEndTime() - cb.GPUStartTime();
+    if busy_s.is_finite() && busy_s > 0.0 {
+        BUSY_NS.fetch_add((busy_s * 1e9) as u64, Ordering::Relaxed);
+    }
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(256) {
+        let busy_ms = BUSY_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        tracing::info!(
+            "metal cb timing: {busy_ms:.1} ms GPU-busy across last 256 command buffers \
+             ({:.3} ms avg)",
+            busy_ms / 256.0
+        );
+    }
+}
 
 /// Probe `hw.memsize` via libc::sysctl on macOS. Returns the total
 /// system RAM in bytes — on Apple Silicon UMA this is also the upper

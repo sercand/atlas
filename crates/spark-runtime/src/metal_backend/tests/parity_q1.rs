@@ -192,3 +192,76 @@ fn metal_q1_0_gemv_batchm_matches_single_rows() {
         );
     }
 }
+
+#[test]
+fn metal_q1_0_gemv_planar_matches_blocked() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    let Ok(kernel) = backend.kernel("q1_0_gemv", "q1_0_gemv_planar") else {
+        eprintln!("skipping: q1_0_gemv_planar not in this kernel build");
+        return;
+    };
+
+    // K = 1024 → 8 blocks/row: the smallest row that qualifies for the
+    // planar reorder (row bytes 144 = 16 × 9). 3 simdgroup row-quads.
+    let n = 12u32;
+    let k = 1024u32;
+    let (packed, w) = build_q1_fixture(n as usize, k as usize);
+    let planar =
+        crate::weights::gguf::value_transform::planarize_q1_rows(&packed, &[n as usize, k as usize])
+            .expect("shape qualifies for planar reorder");
+
+    let x: Vec<half::bf16> = (0..k as usize)
+        .map(|i| half::bf16::from_f32(test_val(i)))
+        .collect();
+    let mut expected = vec![0f32; n as usize];
+    for r in 0..n as usize {
+        let mut acc = 0f32;
+        for c in 0..k as usize {
+            acc += w[r * k as usize + c] * x[c].to_f32();
+        }
+        expected[r] = acc;
+    }
+
+    let packed_ptr = backend.alloc(planar.len()).expect("alloc packed");
+    let x_ptr = backend.alloc(x.len() * 2).expect("alloc x");
+    let y_ptr = backend.alloc(n as usize * 2).expect("alloc y");
+    backend.copy_h2d(&planar, packed_ptr).expect("h2d packed");
+    backend
+        .copy_h2d(&bf16_slice_to_bytes(&x), x_ptr)
+        .expect("h2d x");
+
+    backend
+        .launch_typed(
+            kernel,
+            [n.div_ceil(16), 1, 1],
+            [128, 1, 1],
+            0,
+            backend.default_stream(),
+            &[
+                KernelArg::Bytes(&n.to_le_bytes()),
+                KernelArg::Bytes(&k.to_le_bytes()),
+                KernelArg::Buffer(packed_ptr),
+                KernelArg::Buffer(x_ptr),
+                KernelArg::Buffer(y_ptr),
+            ],
+        )
+        .expect("launch q1_0_gemv_planar");
+    backend
+        .synchronize(backend.default_stream())
+        .expect("synchronize");
+
+    let mut y_raw = vec![0u8; n as usize * 2];
+    backend.copy_d2h(y_ptr, &mut y_raw).expect("d2h y");
+    let actual = bytes_to_bf16_vec(&y_raw);
+    for r in 0..n as usize {
+        let e = expected[r];
+        let a = actual[r].to_f32();
+        let tol = (e.abs() * 1e-2).max(2e-3);
+        assert!(
+            (e - a).abs() <= tol,
+            "row {r}: expected {e}, got {a} (tol {tol})"
+        );
+    }
+}

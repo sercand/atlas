@@ -31,7 +31,7 @@ pub fn forward_linear_attention<Q: QuantWeights>(
     gpu.launch_typed(
         k.rms,
         [1, 1, 1],
-        [128, 1, 1],
+        [512, 1, 1],
         0,
         stream,
         &[
@@ -90,10 +90,12 @@ pub fn forward_linear_attention<Q: QuantWeights>(
     // are mathematically equivalent — see the rationale in
     // `/Users/.../atlas/memory/feedback_mlx_rms_norm_vs_l2_norm.md`.
 
-    // 4. gate = exp(softplus(dt + dt_bias) * -exp(A_log))
+    // 4+5. Fused: gate = exp(softplus(dt + dt_bias) * -exp(A_log)),
+    // beta = sigmoid(b_raw) → FP32. One dispatch for both tiny
+    // per-head activations.
     let num_state_heads = cfg.num_state_heads();
     gpu.launch_typed(
-        k.gdn_gate,
+        k.gdn_gate_beta,
         [num_state_heads.div_ceil(32), 1, 1],
         [32, 1, 1],
         0,
@@ -103,19 +105,8 @@ pub fn forward_linear_attention<Q: QuantWeights>(
             KernelArg::Buffer(scratch.dt_raw),
             KernelArg::Buffer(layer.dt_bias),
             KernelArg::Buffer(layer.a_log),
-            KernelArg::Buffer(scratch.gate),
-        ],
-    )?;
-    // 5. beta = sigmoid(b_raw) → FP32
-    gpu.launch_typed(
-        k.sigmoid,
-        [num_state_heads.div_ceil(32), 1, 1],
-        [32, 1, 1],
-        0,
-        stream,
-        &[
-            KernelArg::Bytes(&num_state_heads.to_le_bytes()),
             KernelArg::Buffer(scratch.b_raw),
+            KernelArg::Buffer(scratch.gate),
             KernelArg::Buffer(scratch.beta),
         ],
     )?;
@@ -177,7 +168,7 @@ pub fn forward_linear_attention<Q: QuantWeights>(
     gpu.launch_typed(
         k.add_rms,
         [1, 1, 1],
-        [128, 1, 1],
+        [512, 1, 1],
         0,
         stream,
         &[
@@ -190,18 +181,13 @@ pub fn forward_linear_attention<Q: QuantWeights>(
             KernelArg::Buffer(scratch.x_norm2),
         ],
     )?;
-    // Fused dual-output GEMV: shares x_norm2 across gate_proj and up_proj.
-    layer.gate_proj.gemv_gate_up_with(
+    // Whole FFN tail (dual gemv with silu-in-epilogue + down gemv):
+    // x_final = x_resid + down_proj @ (silu(gate_proj@x) ⊙ (up_proj@x)).
+    layer.down_proj.gemv_ffn_swiglu(
+        layer.gate_proj,
         layer.up_proj,
         gpu,
         scratch.x_norm2,
-        scratch.gate_act,
-        scratch.up_act,
-        stream,
-    )?;
-    // Fused: x_final = x_resid + down_proj @ (silu(gate_act) ⊙ up_act).
-    layer.down_proj.gemv_silu_gate_resid(
-        gpu,
         scratch.gate_act,
         scratch.up_act,
         scratch.x_resid,
@@ -224,7 +210,10 @@ pub fn forward_linear_attention<Q: QuantWeights>(
     }
 
     // Copy x_final (post-MLP-residual) to caller's stable buffer so the
-    // next layer's input pointer stays the same across layers.
-    gpu.copy_d2d_async(scratch.x_final, x_buf, cfg.hidden as usize * 2, stream)?;
+    // next layer's input pointer stays the same across layers. Callers
+    // that alias x_final to x_buf (the serving model) skip the blit.
+    if scratch.x_final != x_buf {
+        gpu.copy_d2d_async(scratch.x_final, x_buf, cfg.hidden as usize * 2, stream)?;
+    }
     Ok(x_buf)
 }

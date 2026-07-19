@@ -59,7 +59,13 @@ impl MetalGgufModel {
     /// residual stream in `bufs.x_buf`. `cache_pos` is the PHYSICAL KV
     /// slot (sequence index); `pos3` is the MRoPE (t, h, w) triple,
     /// which equals `[p, p, p]` for text but diverges from `cache_pos`
-    /// after an image run. Synchronizes the stream before returning.
+    /// after an image run.
+    ///
+    /// `sync_after`: the host-side embed/position uploads at the top of
+    /// this function race with any still-queued GPU reads of the same
+    /// buffers, so a caller that will invoke `run_token` again before
+    /// another synchronize (the prefill loop) must pass `true`. Decode
+    /// passes `false` — `write_logits` synchronizes right after.
     pub(super) fn run_token(
         &self,
         bufs: &mut ForwardBufs,
@@ -68,6 +74,7 @@ impl MetalGgufModel {
         cache_pos: u32,
         pos3: [u32; 3],
         stream: u64,
+        sync_after: bool,
     ) -> Result<()> {
         self.embed_token(bufs, st, token)?;
         let mut pos_bytes = [0u8; 12];
@@ -79,6 +86,12 @@ impl MetalGgufModel {
 
         let mut x = bufs.x_buf;
         for (idx, layer) in self.layers.iter().enumerate() {
+            // Submit the encoded prefix every 16 layers so the GPU
+            // works while the host encodes the rest of the token
+            // (ordering across command buffers is hazard-tracked).
+            if idx > 0 && idx.is_multiple_of(16) {
+                self.gpu.flush(stream)?;
+            }
             match layer {
                 MetalLayer::Full(l) => {
                     let kv = &st.kv[self.kv_ord[idx].expect("kv ordinal for full layer")];
@@ -110,12 +123,16 @@ impl MetalGgufModel {
                         stream,
                     )
                     .with_context(|| format!("layer {idx} (full attention)"))?;
-                    self.gpu.copy_d2d_async(
-                        out,
-                        bufs.x_buf,
-                        self.cfg.hidden as usize * 2,
-                        stream,
-                    )?;
+                    // full_scratch.x_out aliases x_buf (init), so the
+                    // layer already wrote the residual stream in place.
+                    if out != bufs.x_buf {
+                        self.gpu.copy_d2d_async(
+                            out,
+                            bufs.x_buf,
+                            self.cfg.hidden as usize * 2,
+                            stream,
+                        )?;
+                    }
                     x = bufs.x_buf;
                 }
                 MetalLayer::Linear(l) => {
@@ -159,11 +176,16 @@ impl MetalGgufModel {
             self.gpu
                 .copy_d2d_async(x, bufs.x_buf, self.cfg.hidden as usize * 2, stream)?;
         }
-        self.gpu.synchronize(stream)
+        if sync_after {
+            self.gpu.synchronize(stream)?;
+        }
+        Ok(())
     }
 
     /// Final RMSNorm + packed LM-head GEMV from the residual in
-    /// `bufs.x_buf` into logits row `row` (`[vocab]` BF16).
+    /// `bufs.x_buf` into logits row `row` (`[vocab]` BF16). Does NOT
+    /// synchronize — the consumers do (`argmax_of` commits + waits;
+    /// `copy_logits_to_host` syncs the default stream before reading).
     pub(super) fn write_logits(
         &self,
         bufs: &ForwardBufs,
@@ -173,7 +195,7 @@ impl MetalGgufModel {
         self.gpu.launch_typed(
             self.kernels.rms,
             [1, 1, 1],
-            [128, 1, 1],
+            [512, 1, 1],
             0,
             stream,
             &[
@@ -185,8 +207,7 @@ impl MetalGgufModel {
             ],
         )?;
         self.lm_head
-            .gemv(self.gpu.as_ref(), bufs.x_final, row, stream)?;
-        self.gpu.synchronize(stream)
+            .gemv(self.gpu.as_ref(), bufs.x_final, row, stream)
     }
 
     /// On-device argmax over one `[vocab]` BF16 logits row.
@@ -194,7 +215,7 @@ impl MetalGgufModel {
         self.gpu.launch_typed(
             self.argmax,
             [1, 1, 1],
-            [128, 1, 1],
+            [512, 1, 1],
             0,
             stream,
             &[

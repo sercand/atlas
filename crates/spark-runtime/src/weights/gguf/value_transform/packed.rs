@@ -144,3 +144,42 @@ pub fn reorder_packed_out_cols(
     }
     Ok(out)
 }
+
+/// Reorder a `[n, k]` Q1_0 tensor's rows from block order
+/// (`[d0|s0][d1|s1]…`, 18-byte blocks) into the ROW-PLANAR gemv layout:
+/// all 16-byte sign runs first, then all fp16 scales
+/// (`[s0 s1 … s_{b-1} | d0 d1 … d_{b-1}]`, same 18·b bytes per row).
+/// With `18·b % 16 == 0` (⇔ `b % 8 == 0` ⇔ `k % 1024 == 0`) every row —
+/// and every 16-byte sign run in it — starts 16-byte aligned, which is
+/// what lets `q1_0_gemv_planar` load signs as single aligned `uint4`s.
+/// Returns `None` (caller keeps block order) when the shape doesn't
+/// qualify; `Some(planar_bytes)` otherwise.
+pub fn planarize_q1_rows(raw: &[u8], hf_shape: &[usize]) -> Option<Vec<u8>> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    const SIGN_BYTES: usize = 16;
+    if hf_shape.len() != 2 {
+        return None;
+    }
+    let (n, k) = (hf_shape[0], hf_shape[1]);
+    if k == 0 || !k.is_multiple_of(GROUP) {
+        return None;
+    }
+    let blocks_per_row = k / GROUP;
+    let row_bytes = blocks_per_row * BLOCK_BYTES;
+    if !row_bytes.is_multiple_of(16) || raw.len() != n * row_bytes {
+        return None;
+    }
+    let sign_plane = blocks_per_row * SIGN_BYTES;
+    let mut out = vec![0u8; raw.len()];
+    for row in 0..n {
+        let src = &raw[row * row_bytes..(row + 1) * row_bytes];
+        let dst = &mut out[row * row_bytes..(row + 1) * row_bytes];
+        for b in 0..blocks_per_row {
+            let blk = &src[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+            dst[sign_plane + b * 2..sign_plane + b * 2 + 2].copy_from_slice(&blk[..2]);
+            dst[b * SIGN_BYTES..(b + 1) * SIGN_BYTES].copy_from_slice(&blk[2..]);
+        }
+    }
+    Some(out)
+}

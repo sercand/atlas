@@ -171,6 +171,16 @@ pub trait GpuBackend: Send + Sync {
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
 
+    /// Submit any batched-but-unsubmitted work on the stream WITHOUT
+    /// waiting. On CUDA-style backends kernels are submitted at launch,
+    /// so this is a no-op; the Metal backend commits its in-flight
+    /// command buffer so the GPU starts executing while the host keeps
+    /// encoding (cross-buffer ordering is preserved by hazard tracking
+    /// on the shared queue).
+    fn flush(&self, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
 

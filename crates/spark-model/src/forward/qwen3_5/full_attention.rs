@@ -31,7 +31,7 @@ pub fn forward_full_attention<Q: QuantWeights>(
     gpu.launch_typed(
         k.rms,
         [1, 1, 1],
-        [128, 1, 1],
+        [512, 1, 1],
         0,
         stream,
         &[
@@ -61,8 +61,8 @@ pub fn forward_full_attention<Q: QuantWeights>(
     // before normalisation / RoPE / attention.
     gpu.launch_typed(
         k.qkv_split,
-        [cfg.head_dim, cfg.num_heads, 1],
-        [1, 1, 1],
+        [cfg.head_dim.div_ceil(64), cfg.num_heads, 1],
+        [64, 1, 1],
         0,
         stream,
         &[
@@ -111,8 +111,8 @@ pub fn forward_full_attention<Q: QuantWeights>(
     let n_tokens = 1u32;
     gpu.launch_typed(
         k.rope,
-        [half_dim, cfg.num_heads, 1],
-        [1, 1, 1],
+        [1, cfg.num_heads, 1],
+        [half_dim, 1, 1],
         0,
         stream,
         &[
@@ -127,8 +127,8 @@ pub fn forward_full_attention<Q: QuantWeights>(
     )?;
     gpu.launch_typed(
         k.rope,
-        [half_dim, cfg.num_kv_heads, 1],
-        [1, 1, 1],
+        [1, cfg.num_kv_heads, 1],
+        [half_dim, 1, 1],
         0,
         stream,
         &[
@@ -312,8 +312,8 @@ pub fn forward_full_attention<Q: QuantWeights>(
     } else {
         gpu.launch_typed(
             k.kvap,
-            [cfg.head_dim, cfg.num_kv_heads, 1],
-            [1, 1, 1],
+            [cfg.head_dim.div_ceil(64), cfg.num_kv_heads, 1],
+            [64, 1, 1],
             0,
             stream,
             &[
@@ -327,11 +327,13 @@ pub fn forward_full_attention<Q: QuantWeights>(
             ],
         )?;
 
-        // attention_decode with seq_len = seq_len_attn.
+        // attention_decode with seq_len = seq_len_attn. 128 threads —
+        // the kernel strides by tg_size; 32 lanes left 3/4 of each
+        // head's K-scan capacity idle.
         gpu.launch_typed(
             k.attn,
             [cfg.num_heads, 1, 1],
-            [32, 1, 1],
+            [128, 1, 1],
             0,
             stream,
             &[
@@ -373,7 +375,7 @@ pub fn forward_full_attention<Q: QuantWeights>(
     gpu.launch_typed(
         k.add_rms,
         [1, 1, 1],
-        [128, 1, 1],
+        [512, 1, 1],
         0,
         stream,
         &[
@@ -386,18 +388,13 @@ pub fn forward_full_attention<Q: QuantWeights>(
             KernelArg::Buffer(scratch.x_norm2),
         ],
     )?;
-    // Fused dual-output GEMV: shares x_norm2 across gate_proj and up_proj.
-    layer.gate_proj.gemv_gate_up_with(
+    // Whole FFN tail (dual gemv with silu-in-epilogue + down gemv):
+    // x_out = x_resid + down_proj @ (silu(gate_proj@x) ⊙ (up_proj@x)).
+    layer.down_proj.gemv_ffn_swiglu(
+        layer.gate_proj,
         layer.up_proj,
         gpu,
         scratch.x_norm2,
-        scratch.gate_act,
-        scratch.up_act,
-        stream,
-    )?;
-    // Fused: x_out = x_resid + down_proj @ (silu(gate_act) ⊙ up_act).
-    layer.down_proj.gemv_silu_gate_resid(
-        gpu,
         scratch.gate_act,
         scratch.up_act,
         scratch.x_resid,

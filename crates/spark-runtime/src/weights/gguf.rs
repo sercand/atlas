@@ -28,7 +28,7 @@ mod dequant_cpu;
 mod dequant_gpu;
 mod names;
 mod sidecar;
-mod value_transform;
+pub(crate) mod value_transform;
 
 pub use config::config_from_gguf_dir;
 

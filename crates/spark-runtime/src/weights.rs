@@ -55,6 +55,14 @@ pub enum WeightDtype {
     /// `q1_0_gemv` decode path. Only produced by the GGUF loader under the
     /// native-Q1 gate. Footprint is block-based like `PackedQ2_0`.
     PackedQ1_0,
+    /// [`WeightDtype::PackedQ1_0`] bytes reordered into the ROW-PLANAR gemv
+    /// layout: per weight row, all 16-byte sign runs first (one aligned
+    /// `uint4` per block) then all fp16 scales. Same size and information as
+    /// `PackedQ1_0` — only the byte order inside each row differs, so the
+    /// aligned-vector `q1_0_gemv_planar` kernels can stream it at full rate.
+    /// Produced by the GGUF loader for 2-D gemv weights whose row byte count
+    /// is 16-aligned; the embedding table (CPU row-dequant) stays blocked.
+    PackedQ1Planar,
 }
 
 impl WeightDtype {
@@ -72,7 +80,7 @@ impl WeightDtype {
             Self::UInt8 => 1,
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
-            Self::PackedQ1_0 => 0,
+            Self::PackedQ1_0 | Self::PackedQ1Planar => 0,
         }
     }
 
@@ -134,8 +142,11 @@ impl WeightTensor {
                 let n_blocks = self.num_elements() / g.max(1);
                 n_blocks * (2 + g / 4)
             }
-            // Packed Q1_0: fixed group 128, 18-byte block (fp16 d + 16 B bits).
-            WeightDtype::PackedQ1_0 => (self.num_elements() / 128) * 18,
+            // Packed Q1_0: fixed group 128, 18 B/block (fp16 d + 16 B bits);
+            // the planar reorder moves bytes within rows, size unchanged.
+            WeightDtype::PackedQ1_0 | WeightDtype::PackedQ1Planar => {
+                (self.num_elements() / 128) * 18
+            }
             d => self.num_elements() * d.byte_size(),
         }
     }
@@ -153,9 +164,13 @@ impl WeightTensor {
         matches!(self.dtype, WeightDtype::PackedQ2_0 { .. })
     }
 
-    /// True if this tensor holds keep-packed 1-bit Q1_0 blocks (id 41).
+    /// True if this tensor holds keep-packed 1-bit Q1_0 bytes (id 41),
+    /// in either block or row-planar order.
     pub fn is_packed_q1(&self) -> bool {
-        matches!(self.dtype, WeightDtype::PackedQ1_0)
+        matches!(
+            self.dtype,
+            WeightDtype::PackedQ1_0 | WeightDtype::PackedQ1Planar
+        )
     }
 }
 
@@ -309,7 +324,7 @@ pub fn parse_expert_index(name: &str) -> Option<usize> {
 }
 
 pub mod adapter;
-mod gguf;
+pub(crate) mod gguf;
 pub mod gguf_q1;
 mod loader;
 pub mod mlx_int8;

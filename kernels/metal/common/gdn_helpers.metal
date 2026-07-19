@@ -43,6 +43,34 @@ kernel void gdn_compute_gate(
     gate[h] = exp(dt * a_eff);
 }
 
+// ── gdn_gate_beta (fused gate + beta) ───────────────────────────
+//
+// One dispatch for both tiny per-head activations the GDN decode
+// needs (they were two separate launches — pure dispatch overhead
+// at 48 layers/token):
+//
+//   gate[h] = exp(softplus(dt_raw[h] + dt_bias[h]) * -exp(A_log[h]))
+//   beta[h] = sigmoid(b_raw[h])
+kernel void gdn_gate_beta(
+    constant uint &num_heads     [[buffer(0)]],
+    device const bfloat *dt_raw  [[buffer(1)]],
+    device const bfloat *dt_bias [[buffer(2)]],
+    device const float  *A_log   [[buffer(3)]],
+    device const bfloat *b_raw   [[buffer(4)]],
+    device float        *gate    [[buffer(5)]],
+    device float        *beta    [[buffer(6)]],
+    uint h [[thread_position_in_grid]])
+{
+    if (h >= num_heads) {
+        return;
+    }
+    float dt_pre = float(dt_raw[h]) + float(dt_bias[h]);
+    float dt = (dt_pre > 20.0f) ? dt_pre : log(1.0f + exp(dt_pre));
+    float a_eff = -exp(A_log[h]);
+    gate[h] = exp(dt * a_eff);
+    beta[h] = 1.0f / (1.0f + exp(-float(b_raw[h])));
+}
+
 // ── sigmoid_bf16 → float ────────────────────────────────────────
 //
 //   out[i] = 1 / (1 + exp(-in[i]))

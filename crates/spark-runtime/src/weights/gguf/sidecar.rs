@@ -113,6 +113,49 @@ fn packed_dtype(id: u32, q2_group: usize) -> WeightDtype {
     }
 }
 
+/// Upload keep-packed Q1_0 bytes, reordering gemv weights into the
+/// row-planar layout when the row byte count is 16-aligned (see
+/// [`value_transform::planarize_q1_rows`]). The embedding table always
+/// stays in block order — the model dequantizes embed rows on the CPU,
+/// and a tied LM head built from it takes the blocked gemv path so the
+/// two views can never disagree about the byte order.
+fn upload_q1(
+    gpu: &dyn GpuBackend,
+    raw: &[u8],
+    hf_name: &str,
+    hf_shape: Vec<usize>,
+    weights: &mut HashMap<String, WeightTensor>,
+) -> Result<()> {
+    // Benchmarked OFF by default on M4: the planar split (signs+scales
+    // in separate row planes) measured ~5% SLOWER than block order —
+    // the 18-byte block keeps each lane's scale+signs in one contiguous
+    // span. Kept behind ATLAS_Q1_PLANAR=1 for future re-evaluation.
+    let planar_enabled = matches!(
+        std::env::var("ATLAS_Q1_PLANAR").ok().as_deref(),
+        Some("1") | Some("true")
+    );
+    let planar = if !planar_enabled || hf_name == "model.embed_tokens.weight" {
+        None
+    } else {
+        value_transform::planarize_q1_rows(raw, &hf_shape)
+    };
+    let (bytes, dtype) = match &planar {
+        Some(p) => (p.as_slice(), WeightDtype::PackedQ1Planar),
+        None => (raw, WeightDtype::PackedQ1_0),
+    };
+    let ptr = gpu.alloc(bytes.len())?;
+    gpu.copy_h2d(bytes, ptr)?;
+    weights.insert(
+        hf_name.to_string(),
+        WeightTensor {
+            ptr,
+            shape: hf_shape,
+            dtype,
+        },
+    );
+    Ok(())
+}
+
 fn keep_packed_layout(
     id: u32,
     hf: &str,
@@ -225,16 +268,20 @@ pub fn load_pass(
                         || names::is_keep_packed_embed(hf_name))))
             && !value_transform::needs(hf_name)
         {
-            let ptr = gpu.alloc(raw.len())?;
-            gpu.copy_h2d(raw, ptr)?;
-            weights.insert(
-                hf_name.clone(),
-                WeightTensor {
-                    ptr,
-                    shape: hf_shape,
-                    dtype: packed_dtype(id, q2_group),
-                },
-            );
+            if id == 41 {
+                upload_q1(gpu, raw, hf_name, hf_shape, weights)?;
+            } else {
+                let ptr = gpu.alloc(raw.len())?;
+                gpu.copy_h2d(raw, ptr)?;
+                weights.insert(
+                    hf_name.clone(),
+                    WeightTensor {
+                        ptr,
+                        shape: hf_shape,
+                        dtype: packed_dtype(id, q2_group),
+                    },
+                );
+            }
             continue;
         }
 
@@ -267,16 +314,20 @@ pub fn load_pass(
                 block_bytes,
             )
             .with_context(|| format!("packed GDN row-permute {hf_name}"))?;
-            let ptr = gpu.alloc(permuted.len())?;
-            gpu.copy_h2d(&permuted, ptr)?;
-            weights.insert(
-                hf_name.clone(),
-                WeightTensor {
-                    ptr,
-                    shape: hf_shape,
-                    dtype: packed_dtype(id, q2_group),
-                },
-            );
+            if id == 41 {
+                upload_q1(gpu, &permuted, hf_name, hf_shape, weights)?;
+            } else {
+                let ptr = gpu.alloc(permuted.len())?;
+                gpu.copy_h2d(&permuted, ptr)?;
+                weights.insert(
+                    hf_name.clone(),
+                    WeightTensor {
+                        ptr,
+                        shape: hf_shape,
+                        dtype: packed_dtype(id, q2_group),
+                    },
+                );
+            }
             continue;
         }
 
@@ -296,16 +347,7 @@ pub fn load_pass(
         {
             let permuted = value_transform::reorder_packed_out_cols(raw, &hf_shape, &dims, 128, 18)
                 .with_context(|| format!("packed GDN out_proj col-permute {hf_name}"))?;
-            let ptr = gpu.alloc(permuted.len())?;
-            gpu.copy_h2d(&permuted, ptr)?;
-            weights.insert(
-                hf_name.clone(),
-                WeightTensor {
-                    ptr,
-                    shape: hf_shape,
-                    dtype: WeightDtype::PackedQ1_0,
-                },
-            );
+            upload_q1(gpu, &permuted, hf_name, hf_shape, weights)?;
             continue;
         }
 

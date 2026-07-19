@@ -142,6 +142,8 @@ pub struct Qwen35Kernels {
     pub conv1d: KernelHandle,
     pub gdn_gate: KernelHandle,
     pub sigmoid: KernelHandle,
+    /// Fused gate+beta helper (one dispatch instead of two tiny ones).
+    pub gdn_gate_beta: KernelHandle,
     pub gdn_dec: KernelHandle,
     /// TurboQuant KV cache paths (Turbo8/4/3/2): quantizing appends,
     /// dequantizing decode attentions, and the WHT rotation bookends.
@@ -181,6 +183,7 @@ impl Qwen35Kernels {
             conv1d: gpu.kernel("causal_conv1d_update_l2norm", "causal_conv1d_update_l2norm")?,
             gdn_gate: gpu.kernel("gdn_helpers", "gdn_compute_gate")?,
             sigmoid: gpu.kernel("gdn_helpers", "sigmoid_bf16_to_f32")?,
+            gdn_gate_beta: gpu.kernel("gdn_helpers", "gdn_gate_beta")?,
             gdn_dec: gpu.kernel("gated_delta_rule_decode", "gated_delta_rule_decode")?,
             kvap_turbo8: gpu.kernel("kv_cache_append_turbo8", "kv_cache_append_turbo8")?,
             attn_turbo8: gpu.kernel("attention_decode_turbo8", "attention_decode_turbo8")?,

@@ -150,6 +150,11 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
     let bf16 = |n: u32| -> Result<DevicePtr> { gpu.alloc(n as usize * 2) };
     let f32b = |n: u32| -> Result<DevicePtr> { gpu.alloc(n as usize * 4) };
 
+    // The residual stream. Both layer kinds write their final fused
+    // GEMV directly into this buffer (x_out / x_final alias it), which
+    // saves a per-layer blit — and the encoder round-trip a blit forces.
+    let x_buf = bf16(cfg.hidden)?;
+
     let full_scratch = FullAttentionScratch {
         x_norm: bf16(cfg.hidden)?,
         q_full: bf16(cfg.q_total())?,
@@ -166,7 +171,7 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
         x_norm2: bf16(cfg.hidden)?,
         gate_act: bf16(cfg.intermediate)?,
         up_act: bf16(cfg.intermediate)?,
-        x_out: bf16(cfg.hidden)?,
+        x_out: x_buf,
     };
     let lin_scratch = LinearAttentionScratch {
         x_norm: bf16(cfg.hidden)?,
@@ -184,7 +189,7 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
         x_norm2: bf16(cfg.hidden)?,
         gate_act: bf16(cfg.intermediate)?,
         up_act: bf16(cfg.intermediate)?,
-        x_final: bf16(cfg.hidden)?,
+        x_final: x_buf,
     };
 
     // Partial-RoPE inv_freq table: rotary_dim/2 entries.
@@ -197,7 +202,7 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
     gpu.copy_h2d(&inv_freq_bytes, inv_freq)?;
 
     Ok(ForwardBufs {
-        x_buf: bf16(cfg.hidden)?,
+        x_buf,
         x_final: bf16(cfg.hidden)?,
         // One token × 3 u32 MRoPE components (t, h, w).
         positions: gpu.alloc(12)?,

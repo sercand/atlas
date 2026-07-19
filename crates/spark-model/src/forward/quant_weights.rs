@@ -88,6 +88,35 @@ pub trait QuantWeights: Send + Sync {
         )
     }
 
+    /// The whole SwiGLU FFN tail, called on the DOWN projection:
+    /// `y = x_resid + self @ (silu(gate_w @ x) ⊙ (up_w @ x))`.
+    ///
+    /// The default composes the dual-output gemv with the fused
+    /// silu-gemv (correct on every backend that ships those two).
+    /// Backends with an activation-in-epilogue dual gemv override this
+    /// to drop the elementwise-activation dispatch between them.
+    /// `gate_scratch`/`act_scratch` are caller scratch of length
+    /// `gate_w.out_features()`; both may be clobbered.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_ffn_swiglu(
+        &self,
+        gate_w: &Self,
+        up_w: &Self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        gate_scratch: DevicePtr,
+        act_scratch: DevicePtr,
+        x_resid: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()>
+    where
+        Self: Sized,
+    {
+        gate_w.gemv_gate_up_with(up_w, gpu, x, gate_scratch, act_scratch, stream)?;
+        self.gemv_silu_gate_resid(gpu, gate_scratch, act_scratch, x_resid, y, stream)
+    }
+
     /// Same as [`Self::gemv_silu_gate`] but additionally folds the
     /// layer-output residual addition into the same kernel:
     ///   `y[n] = x_resid[n] + sum_k self[n, k] * (silu(gate[k]) ⊙ up[k])`.

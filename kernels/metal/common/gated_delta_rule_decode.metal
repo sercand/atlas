@@ -106,7 +106,10 @@ kernel void gated_delta_rule_decode(
     float v_new_i = (v_i - g * hk_dot) * bt;
 
     // Steps 3+4 fused: state update + output dot product in one pass.
+    // The norm-clamp sum of squares accumulates here too — the updated
+    // h values are already in registers, saving a third sweep over H.
     float q_dot = 0.0f;
+    float local_sq = 0.0f;
     for (uint j = 0; j < k_dim; j += 4) {
         float h0 = H[(j + 0) * v_dim + tid];
         float h1 = H[(j + 1) * v_dim + tid];
@@ -122,17 +125,13 @@ kernel void gated_delta_rule_decode(
         H[(j + 3) * v_dim + tid] = h3;
         q_dot += h0 * smem_q[j] + h1 * smem_q[j + 1]
                + h2 * smem_q[j + 2] + h3 * smem_q[j + 3];
+        local_sq += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3;
     }
 
     // ── SSM state-norm clamp (Stuffed Mamba mitigation) ──
-    // Per-thread sum of squares over k_dim rows for this v_dim
-    // column → block-wide reduction → if ||H||_F > MAX, scale down.
+    // Block-wide reduction of the per-thread sums; if ||H||_F > MAX,
+    // scale the state down (rare — costs a re-read only when it fires).
     {
-        float local_sq = 0.0f;
-        for (uint j = 0; j < k_dim; ++j) {
-            float hv = H[j * v_dim + tid];
-            local_sq += hv * hv;
-        }
         // simdgroup (32-lane) sum, then cross-simdgroup reduction.
         float warp_sum = simd_sum(local_sq);
         threadgroup float norm_sums[4];

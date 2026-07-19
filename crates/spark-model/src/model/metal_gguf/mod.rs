@@ -150,6 +150,29 @@ impl QuantWeights for MetalQw {
         match (self, other) {
             // Both packed → fused dual-output kernel (one x read).
             (Self::Q1(a), Self::Q1(b)) => gguf_q1::gemv_gate_up(gpu, a, b, x, gate_y, up_y, stream),
+            // Both dense with matching shapes → dual kernel (one
+            // dispatch instead of two; the GDN in_proj_a/b pair).
+            (Self::Dense(a), Self::Dense(b))
+                if a.out_features == b.out_features && a.in_features == b.in_features =>
+            {
+                let kernel = gpu.kernel("dense_gemv_bf16", "dense_gemv_bf16_dual")?;
+                gpu.launch_typed(
+                    kernel,
+                    [a.out_features, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    stream,
+                    &[
+                        KernelArg::Bytes(&a.out_features.to_le_bytes()),
+                        KernelArg::Bytes(&a.in_features.to_le_bytes()),
+                        KernelArg::Buffer(a.ptr),
+                        KernelArg::Buffer(b.ptr),
+                        KernelArg::Buffer(x),
+                        KernelArg::Buffer(gate_y),
+                        KernelArg::Buffer(up_y),
+                    ],
+                )
+            }
             _ => {
                 self.gemv(gpu, x, gate_y, stream)?;
                 other.gemv(gpu, x, up_y, stream)
@@ -186,6 +209,32 @@ impl QuantWeights for MetalQw {
                 "gemv_silu_gate_resid on a dense BF16 weight — the FFN down_proj should be keep-packed"
             ),
         }
+    }
+    fn gemv_ffn_swiglu(
+        &self,
+        gate_w: &Self,
+        up_w: &Self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        gate_scratch: DevicePtr,
+        act_scratch: DevicePtr,
+        x_resid: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        // All-packed blocked layout → activation folded into the dual
+        // gemv's epilogue (2 dispatches for the whole FFN tail).
+        if let (Self::Q1(d), Self::Q1(g), Self::Q1(u)) = (self, gate_w, up_w)
+            && !d.planar
+            && !g.planar
+            && !u.planar
+        {
+            return gguf_q1::gemv_ffn_swiglu(
+                gpu, g, u, d, x, act_scratch, x_resid, y, stream,
+            );
+        }
+        gate_w.gemv_gate_up_with(up_w, gpu, x, gate_scratch, act_scratch, stream)?;
+        self.gemv_silu_gate_resid(gpu, gate_scratch, act_scratch, x_resid, y, stream)
     }
 }
 

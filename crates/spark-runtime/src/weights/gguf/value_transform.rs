@@ -40,7 +40,8 @@ use super::container::GgufFile;
 
 mod packed;
 pub use packed::{
-    packed_reorder_out_cols, packed_reorder_rows, reorder_packed_out_cols, reorder_packed_rows,
+    packed_reorder_out_cols, packed_reorder_rows, planarize_q1_rows, reorder_packed_out_cols,
+    reorder_packed_rows,
 };
 
 /// GDN head geometry, read from the GGUF `*.ssm.*` metadata keys.
