@@ -168,14 +168,57 @@ on every PR:
    `libnccl` — guards against a stray `rustc-link-lib=cuda`
    slipping through any build.rs.
 
-## What's still required to serve a token
+## Production serving: Bonsai-27B (Q1_0 GGUF)
 
-The kernel + runtime + weight-format + dependency-graph layers
-are complete. What remains is integration shape:
+The `spark serve` path now serves the Qwen3.5/3.6 GDN-hybrid dense
+family end-to-end on Apple Silicon through `MetalGgufModel`
+(`crates/spark-model/src/model/metal_gguf/`), which routes the
+scheduler's `Model` trait through the vendor-agnostic
+`forward::qwen3_5` per-layer orchestration. Validated with PrismML
+**Bonsai-27B** (1-bit Q1_0 GGUF, 64 layers = 48 GDN + 16
+full-attention, vocab 248320) on an M4/16 GB — 3.6 GB resident
+weights, coherent chat, XML tool-calls (`qwen3_coder` parser +
+constrained decoding), all three API surfaces, 2-seq concurrency:
+
+```sh
+# Build with the Bonsai kernel target embedded:
+ATLAS_TARGET_HW=metal ATLAS_TARGET_MODEL=bonsai-27b ATLAS_TARGET_QUANT=q1_0 \
+  cargo build --release -p spark-server --no-default-features --features metal
+
+# Model dir: MLX-pack config.json (both `quantization` blocks stripped) +
+# tokenizer files + Bonsai-27B-Q1_0.gguf (+ optional mmproj sidecar).
+./target/release/spark serve --model-from-path ~/models/bonsai-27b-atlas \
+  --port 8899 --max-seq-len 4096 --max-num-seqs 2 --max-batch-size 2 \
+  --kv-cache-dtype bf16 --disable-thinking
+
+# Smoke suite (9 tests: chat, coherence, tool calls, /v1/messages,
+# count_tokens, /v1/responses, concurrency):
+./scripts/test-bonsai-metal.sh
+```
+
+Key mechanics:
+- **Q1_0 keep-packed** (`ATLAS_GGUF_NATIVE_Q1`, default-on for metal
+  builds): projections, GDN in-projections (packed row-permute),
+  out_proj (packed column-block permute — value_head_dim 128 = one
+  block), embedding + LM head all stay 1-bit resident. Embed lookup
+  is a CPU row dequant (UMA); LM head runs `q1_0_gemv` over the
+  packed table.
+- **Norm convention**: the loader normalizes GGUF norms to the
+  zero-centered HF form for CUDA's `x·(1+w)/rms` kernels; the metal
+  `rms_norm` is vanilla `x·w/rms`, so `MetalGgufModel` re-adds the +1
+  at init (`norm_plus_one`). GDN `linear_attn.norm` ships vanilla and
+  stays raw.
+- **Kernels**: `q1_0_gemv(+_batchm)`, fused `q1_0_gemv_gate_up` and
+  `q1_0_gemv_silu_gate(_resid)` (`kernels/metal/common/`), parity-
+  tested against the loader's CPU oracle (`parity_q1.rs`).
+- Per-token prefill / serial decode (weight-bandwidth-bound); batched
+  prefill via `attention_prefill` + GEMM is the open perf follow-up.
+
+## What's still required beyond text
 
 | Lift | Notes |
 |---|---|
-| Metal-side `Model` impl wiring spark-model's layer dispatch through the metal kernels | spark-model currently has CUDA-specific layer impls; a `MetalQwen35Model` parallel implementation is the next big lift |
-| Qwen3.5-VL-specific weight loader handling MLX-int8 + vision_tower | Currently routes to existing `Qwen3VLWeightLoader` via `is_qwen3_vl()` detection — exact tensor-name handling for the MLX-quant trunk is the gap |
-| Token-level parity vs `mlx_lm.generate` reference | Run greedy decode of "The capital of France is" on both Atlas Metal + MLX-LM; first ≥5 tokens must match |
+| Vision (mmproj) forward | The Q8_0 clip sidecar already loads into the store (`model.visual.*`, BF16) and the ViT kernels are parity-tested; `MetalGgufModel::prepare_vision_embed` + the prefill embedding splice + MRoPE image positions are the gap |
+| Batched prefill | Per-token prefill runs ~6 tok/s at 27B; the llama.cpp Metal reference does ~130 tok/s with real GEMM prefill |
+| Token-level parity harness vs `llama-cli` reference | Greedy-decode comparison against the PrismML llama.cpp fork on the same GGUF |
 EOF
