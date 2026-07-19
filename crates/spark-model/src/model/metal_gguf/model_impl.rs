@@ -16,6 +16,25 @@ use crate::traits::{Model, SequenceState};
 use super::{MetalGgufModel, SlotState};
 
 impl MetalGgufModel {
+    /// Free every device buffer of a per-sequence state.
+    fn free_slot_state(&self, st: SlotState) -> Result<()> {
+        for kv in st.kv {
+            self.gpu.free(kv.k)?;
+            self.gpu.free(kv.v)?;
+            if let Some(p) = kv.k_scales {
+                self.gpu.free(p)?;
+            }
+            if let Some(p) = kv.v_scales {
+                self.gpu.free(p)?;
+            }
+        }
+        for lin in st.lin {
+            self.gpu.free(lin.conv1d_state)?;
+            self.gpu.free(lin.gdn_state)?;
+        }
+        Ok(())
+    }
+
     /// Run prompt positions `[chunk_start, chunk_start + chunk_len)` and
     /// emit logits into the slot's prefill row when `emit_logits`.
     fn prefill_range(
@@ -231,32 +250,43 @@ impl Model for MetalGgufModel {
             return Ok(()); // migrated to a survivor by compact_sequence
         }
         if let Some(st) = self.states.lock().expect("states lock").remove(&slot) {
-            for kv in st.kv {
-                self.gpu.free(kv.k)?;
-                self.gpu.free(kv.v)?;
-                if let Some(p) = kv.k_scales {
-                    self.gpu.free(p)?;
-                }
-                if let Some(p) = kv.v_scales {
-                    self.gpu.free(p)?;
-                }
-            }
-            for lin in st.lin {
-                self.gpu.free(lin.conv1d_state)?;
-                self.gpu.free(lin.gdn_state)?;
-            }
+            self.free_slot_state(st)?;
         }
-        self.free_slots.lock().expect("slot lock").push(slot);
+        let mut free = self.free_slots.lock().expect("slot lock");
+        if !free.contains(&slot) {
+            free.push(slot);
+        }
         Ok(())
     }
 
+    /// Scheduler contract (see `compact_survivors_into_range`): `new_slot`
+    /// was released to the pool by a just-retired sequence; this migration
+    /// must CLAIM it exclusively and release the old slot back — otherwise
+    /// a later `alloc_sequence` hands the same slot to a fresh request and
+    /// clobbers the survivor's device state (observed as
+    /// "decode: no device state for slot" + cross-request content bleed).
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         let old = seq.slot_idx;
+        if old == new_slot {
+            return Ok(());
+        }
+        let mut free = self.free_slots.lock().expect("slot lock");
         let mut map = self.states.lock().expect("states lock");
+        // Claim the target from the pool.
+        free.retain(|&s| s != new_slot);
+        // Swap-out path: the target key may still hold the outgoing victim's
+        // state (the victim is detached right after, so its free_sequence
+        // becomes a no-op) — free those buffers instead of leaking them.
+        if let Some(prev) = map.remove(&new_slot) {
+            self.free_slot_state(prev)?;
+        }
         if let Some(st) = map.remove(&old) {
             map.insert(new_slot, st);
         }
         seq.slot_idx = new_slot;
+        if !free.contains(&old) {
+            free.push(old);
+        }
         Ok(())
     }
 
