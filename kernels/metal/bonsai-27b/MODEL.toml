@@ -53,3 +53,6 @@ presence_penalty = 0.0
 [behavior]
 default_kv_dtype = "bf16"
 thinking_default = true
+# Bonsai emits the Qwen3-Coder XML tool grammar:
+#   <tool_call><function=NAME><parameter=ARG>VALUE</parameter></function></tool_call>
+tool_call_parser = "qwen3_coder"

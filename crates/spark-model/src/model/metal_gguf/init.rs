@@ -80,13 +80,36 @@ fn widen_bf16_to_f32(gpu: &dyn GpuBackend, src: DevicePtr, n: usize) -> Result<D
     Ok(dst)
 }
 
-fn load_full_layer(store: &WeightStore, i: usize) -> Result<MetalFullLayer> {
+/// RMSNorm weights that carry the Qwen3-Next `+1` offset. The GGUF loader
+/// normalizes them to the zero-centered HF form (`w_hf = w_gguf − 1`) for
+/// the CUDA kernels, which compute `x·(1+w)/rms`. The Metal `rms_norm`
+/// kernel is VANILLA (`x·w/rms` — it was built for MLX checkpoints, which
+/// ship vanilla weights), so re-add the 1 here into a fresh BF16 buffer.
+/// The GDN `linear_attn.norm` is untouched by the loader and stays raw.
+fn norm_plus_one(gpu: &dyn GpuBackend, store: &WeightStore, name: &str) -> Result<DevicePtr> {
+    let t = store.get(name)?;
+    if t.dtype != spark_runtime::weights::WeightDtype::BF16 {
+        bail!("{name}: expected BF16 norm weight, got {:?}", t.dtype);
+    }
+    let n = t.num_elements();
+    let mut raw = vec![0u8; n * 2];
+    gpu.copy_d2h(t.ptr, &mut raw)?;
+    for chunk in raw.chunks_exact_mut(2) {
+        let v = half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32() + 1.0;
+        chunk.copy_from_slice(&half::bf16::from_f32(v).to_le_bytes());
+    }
+    let dst = gpu.alloc(raw.len())?;
+    gpu.copy_h2d(&raw, dst)?;
+    Ok(dst)
+}
+
+fn load_full_layer(store: &WeightStore, gpu: &dyn GpuBackend, i: usize) -> Result<MetalFullLayer> {
     let p = |s: &str| format!("model.layers.{i}.{s}");
     Ok(MetalFullLayer {
-        input_ln: bf16_ptr(store, &p("input_layernorm.weight"))?,
-        q_norm: bf16_ptr(store, &p("self_attn.q_norm.weight"))?,
-        k_norm: bf16_ptr(store, &p("self_attn.k_norm.weight"))?,
-        post_ln: bf16_ptr(store, &p("post_attention_layernorm.weight"))?,
+        input_ln: norm_plus_one(gpu, store, &p("input_layernorm.weight"))?,
+        q_norm: norm_plus_one(gpu, store, &p("self_attn.q_norm.weight"))?,
+        k_norm: norm_plus_one(gpu, store, &p("self_attn.k_norm.weight"))?,
+        post_ln: norm_plus_one(gpu, store, &p("post_attention_layernorm.weight"))?,
         q_proj: MetalQw::from_store(store, &p("self_attn.q_proj.weight"))?,
         k_proj: MetalQw::from_store(store, &p("self_attn.k_proj.weight"))?,
         v_proj: MetalQw::from_store(store, &p("self_attn.v_proj.weight"))?,
@@ -106,12 +129,12 @@ fn load_lin_layer(
     let p = |s: &str| format!("model.layers.{i}.{s}");
     let a_log_bf16 = bf16_ptr(store, &p("linear_attn.A_log"))?;
     Ok(MetalLinLayer {
-        input_ln: bf16_ptr(store, &p("input_layernorm.weight"))?,
+        input_ln: norm_plus_one(gpu, store, &p("input_layernorm.weight"))?,
         a_log: widen_bf16_to_f32(gpu, a_log_bf16, cfg.num_state_heads() as usize)?,
         dt_bias: bf16_ptr(store, &p("linear_attn.dt_bias"))?,
         conv1d: bf16_ptr(store, &p("linear_attn.conv1d.weight"))?,
         norm_w: bf16_ptr(store, &p("linear_attn.norm.weight"))?,
-        post_ln: bf16_ptr(store, &p("post_attention_layernorm.weight"))?,
+        post_ln: norm_plus_one(gpu, store, &p("post_attention_layernorm.weight"))?,
         in_proj_a: MetalQw::from_store(store, &p("linear_attn.in_proj_a.weight"))?,
         in_proj_b: MetalQw::from_store(store, &p("linear_attn.in_proj_b.weight"))?,
         in_proj_qkv: MetalQw::from_store(store, &p("linear_attn.in_proj_qkv.weight"))?,
@@ -210,7 +233,8 @@ pub(super) fn build(
                 kv_ord[i] = Some(n_kv);
                 n_kv += 1;
                 layers.push(MetalLayer::Full(
-                    load_full_layer(store, i).with_context(|| format!("layer {i} (full)"))?,
+                    load_full_layer(store, gpu.as_ref(), i)
+                        .with_context(|| format!("layer {i} (full)"))?,
                 ));
             }
             LayerType::LinearAttention => {
@@ -250,7 +274,7 @@ pub(super) fn build(
         GgufQ1Weight::from_tensor(embed_t, "model.embed_tokens.weight (tied lm_head)")?
     };
 
-    let final_norm = bf16_ptr(store, "model.norm.weight")?;
+    let final_norm = norm_plus_one(gpu.as_ref(), store, "model.norm.weight")?;
     let fwd = alloc_forward_bufs(gpu.as_ref(), &cfg)?;
 
     let max_batch = max_batch_size.max(1);

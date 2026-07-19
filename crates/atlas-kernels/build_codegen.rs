@@ -104,17 +104,14 @@ pub(super) fn generate_target_ptx_rs(
          }\n\n",
     );
 
-    // Non-CUDA backends (Metal) have their own registry path; emit an
-    // empty `all_ptx_sets()` so the shared surface still type-checks.
-    if !cuda_api {
-        g.push_str(
-            "/// Empty registry stub — this build targets a non-CUDA backend.\n\
-             pub fn all_ptx_sets() -> Vec<TargetPtxSet> { Vec::new() }\n",
-        );
-        return g;
-    }
+    // all_ptx_sets() is generated for every backend: the serve path's
+    // target matcher (`ptx_for_config`) and the MODEL.toml-derived
+    // sampling/behavior presets are backend-agnostic, and Metal blobs are
+    // plain `&[u8]` like everything else. (Metal consumers additionally
+    // read the `metallib_modules()` alias above.)
+    let _ = cuda_api;
 
-    // all_ptx_sets() function — always generated for cuda targets
+    // all_ptx_sets() function
     g.push_str(
         "/// All compiled kernel targets and their PTX module sets.\n\
          pub fn all_ptx_sets() -> Vec<TargetPtxSet> {\n\

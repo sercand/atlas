@@ -1091,7 +1091,13 @@ fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bool {
         ("nvfp4", "bf16") |
         // BF16 reference bundle handles any quant by dequant on load.
         ("bf16", "fp8") |
-        ("bf16", "nvfp4")
+        ("bf16", "nvfp4") |
+        // The metal q1_0 bundle serves GGUF checkpoints whose config.json
+        // declares no quantization_config (the on-disk GGUF is
+        // self-describing; big projections stay keep-packed 1-bit and
+        // everything else dequants to BF16 — dense_gemv_bf16 is in the
+        // same bundle).
+        ("q1_0", "bf16")
     )
 }
 
