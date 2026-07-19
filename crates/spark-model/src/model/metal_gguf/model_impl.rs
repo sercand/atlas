@@ -32,6 +32,9 @@ impl MetalGgufModel {
             self.gpu.free(lin.conv1d_state)?;
             self.gpu.free(lin.gdn_state)?;
         }
+        if let Some(vrows) = st.vision {
+            self.gpu.free(vrows.buf)?;
+        }
         Ok(())
     }
 
@@ -63,12 +66,39 @@ impl MetalGgufModel {
         }
 
         let mut bufs = self.fwd.lock().expect("forward lock");
-        let states = self.states.lock().expect("states lock");
+        let mut states = self.states.lock().expect("states lock");
         let st = states
-            .get(&seq.slot_idx)
+            .get_mut(&seq.slot_idx)
             .context("prefill: no device state for slot (alloc_sequence not called?)")?;
+        if chunk_start == 0 {
+            // Adopt the rows `prepare_vision_embed` staged for this request
+            // (freeing any leftovers from a previous occupant), then build
+            // the whole prompt's MRoPE position plan.
+            if let Some(prev) = st.vision.take() {
+                self.gpu.free(prev.buf)?;
+            }
+            st.vision = self.pending_vision.lock().expect("vision lock").take();
+            let pad_id = self.vision.as_ref().map(|v| v.pad_token_id);
+            let grids = st
+                .vision
+                .as_ref()
+                .map(|v| v.grids.clone())
+                .unwrap_or_default();
+            let (mrope, next) = build_mrope(tokens, pad_id, &grids);
+            st.mrope = mrope;
+            st.next_pos = next;
+            if let Some(rows) = &mut st.vision {
+                rows.cursor = 0;
+            }
+        }
         for (i, &tok) in tokens[chunk_start..end].iter().enumerate() {
-            self.run_token(&mut bufs, st, tok, (chunk_start + i) as u32, stream)?;
+            let cache_pos = (chunk_start + i) as u32;
+            let pos3 = st
+                .mrope
+                .get(chunk_start + i)
+                .copied()
+                .unwrap_or([cache_pos; 3]);
+            self.run_token(&mut bufs, st, tok, cache_pos, pos3, stream)?;
         }
         let row = self.prefill_logits_row(seq.slot_idx);
         if emit_logits {
@@ -102,11 +132,15 @@ impl MetalGgufModel {
             );
         }
         let mut bufs = self.fwd.lock().expect("forward lock");
-        let states = self.states.lock().expect("states lock");
+        let mut states = self.states.lock().expect("states lock");
         let st = states
-            .get(&seq.slot_idx)
+            .get_mut(&seq.slot_idx)
             .context("decode: no device state for slot")?;
-        self.run_token(&mut bufs, st, token, pos, stream)?;
+        // Rope position continues from the prompt's MRoPE plan (after an
+        // image run it is offset from the physical KV position).
+        let rope_pos = if st.next_pos > 0 { st.next_pos } else { pos };
+        st.next_pos = rope_pos + 1;
+        self.run_token(&mut bufs, st, token, pos, [rope_pos; 3], stream)?;
         self.write_logits(&bufs, row, stream)?;
         drop(states);
         drop(bufs);
@@ -116,9 +150,96 @@ impl MetalGgufModel {
     }
 }
 
+/// Build the (t, h, w) MRoPE position triple for every prompt token
+/// (port of the CUDA `upload_meta` walk): text tokens advance a scalar
+/// cursor with t = h = w; each `<|image_pad|>` run consumes its image's
+/// post-merge grid with t = base, h = base + k/gw, w = base + k%gw, and
+/// the cursor continues from `base + max(gh, gw)`. Returns the plan and
+/// the first DECODE position.
+fn build_mrope(
+    tokens: &[u32],
+    pad_id: Option<u32>,
+    grids: &[(usize, usize)],
+) -> (Vec<[u32; 3]>, u32) {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut cur: u32 = 0;
+    let mut gi = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if pad_id == Some(tokens[i]) && gi < grids.len() {
+            let (gh, gw) = grids[gi];
+            gi += 1;
+            let base = cur;
+            let mut k = 0usize;
+            while k < gh * gw && i < tokens.len() && pad_id == Some(tokens[i]) {
+                out.push([
+                    base,
+                    base + (k / gw.max(1)) as u32,
+                    base + (k % gw.max(1)) as u32,
+                ]);
+                k += 1;
+                i += 1;
+            }
+            cur = base + gh.max(gw) as u32;
+        } else {
+            out.push([cur; 3]);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (out, cur)
+}
+
 impl Model for MetalGgufModel {
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
         self.prefill_range(tokens, seq, 0, tokens.len(), true, stream)
+    }
+
+    fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let Some(v) = &self.vision else {
+            bail!("request carries images but no mmproj vision sidecar is loaded");
+        };
+        // Serialize with the forward lock — the tower shares the GPU queue.
+        let _fwd = self.fwd.lock().expect("forward lock");
+        let stream = self.gpu.default_stream();
+        let ctx = super::vision::VisionCtx {
+            gpu: self.gpu.as_ref(),
+            stream,
+        };
+        let merge = 2usize;
+        let total_rows: usize = images
+            .iter()
+            .map(|(_, gh, gw)| (gh / merge) * (gw / merge))
+            .sum();
+        let buf = self.gpu.alloc(total_rows.max(1) * v.out_hidden * 2)?;
+        let mut rows = 0usize;
+        let mut grids = Vec::with_capacity(images.len());
+        for (pixels, gh, gw) in images {
+            let out_ptr = buf.offset(rows * v.out_hidden * 2);
+            let merged = v
+                .forward_image(&ctx, pixels, *gh, *gw, out_ptr)
+                .with_context(|| format!("vision encode ({gh}x{gw} patches)"))
+                .inspect_err(|_| {
+                    let _ = self.gpu.free(buf);
+                })?;
+            rows += merged;
+            grids.push((gh / merge, gw / merge));
+        }
+        let mut pending = self.pending_vision.lock().expect("vision lock");
+        if let Some(prev) = pending.take() {
+            self.gpu.free(prev.buf)?;
+        }
+        *pending = Some(super::vision::VisionRows {
+            buf,
+            rows,
+            cursor: 0,
+            grids,
+        });
+        tracing::info!("vision: encoded {} image(s) into {rows} rows", images.len());
+        Ok(())
     }
 
     fn prefill_chunk(
@@ -202,7 +323,13 @@ impl Model for MetalGgufModel {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(SlotState { kv, lin })
+            Ok(SlotState {
+                kv,
+                lin,
+                vision: None,
+                mrope: Vec::new(),
+                next_pos: 0,
+            })
         };
         let st = match build() {
             Ok(st) => st,

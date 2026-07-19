@@ -151,11 +151,16 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // kernel target (qwen3.5-27b) ships no `vision_encoder` PTX module. Drop the
     // vision tower to text-only; image inputs are unsupported until the target
     // is rebuilt with vision.
+    // The metal vision tower dispatches through `attention_full` +
+    // `bias_add_rows` (there is no monolithic `vision_encoder` module on
+    // that backend), so accept either spelling of "this target can see".
     if config.vision.is_some()
         && !ptx_set
             .modules
             .iter()
             .any(|(name, _)| *name == "vision_encoder")
+        && !(ptx_set.modules.iter().any(|(n, _)| *n == "attention_full")
+            && ptx_set.modules.iter().any(|(n, _)| *n == "bias_add_rows"))
     {
         tracing::warn!(
             "Checkpoint declares a vision tower but kernel target {} ships no \

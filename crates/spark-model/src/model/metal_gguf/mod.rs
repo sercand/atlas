@@ -49,6 +49,7 @@ use crate::traits::Model;
 mod forward;
 mod init;
 mod model_impl;
+mod vision;
 
 /// A dense BF16 `[N, K]` weight driven through the `dense_gemv_bf16`
 /// kernel — the fallback for the small tensors the GGUF loader does not
@@ -228,10 +229,18 @@ pub(crate) enum MetalLayer {
 }
 
 /// Per-sequence device state: contiguous KV for the 16 full-attention
-/// layers + conv/GDN recurrent state for the 48 linear layers.
+/// layers + conv/GDN recurrent state for the 48 linear layers, plus the
+/// request's encoded vision rows and MRoPE position plan.
 pub(crate) struct SlotState {
     pub kv: Vec<LayerKvCache>,
     pub lin: Vec<LinearAttentionState>,
+    /// Encoded image rows + splice cursor (taken from the model's
+    /// pending slot on the first prefill chunk).
+    pub vision: Option<vision::VisionRows>,
+    /// Per-prompt-token (t, h, w) MRoPE positions, built on chunk 0.
+    pub mrope: Vec<[u32; 3]>,
+    /// Next decode position (continues past the image spatial extent).
+    pub next_pos: u32,
 }
 
 /// Shared per-forward buffers (scratch, residual stream, rope tables).
@@ -275,6 +284,11 @@ pub struct MetalGgufModel {
     /// `max_batch..` are per-slot prefill rows.
     pub(crate) logits: DevicePtr,
     pub(crate) argmax_out: DevicePtr,
+    /// Vision tower (present when the mmproj sidecar loaded).
+    pub(crate) vision: Option<vision::MetalVision>,
+    /// Rows encoded by `prepare_vision_embed`, awaiting the next
+    /// first-chunk prefill (which moves them into that slot's state).
+    pub(crate) pending_vision: Mutex<Option<vision::VisionRows>>,
 }
 
 impl MetalGgufModel {

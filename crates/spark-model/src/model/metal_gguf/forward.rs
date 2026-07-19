@@ -13,11 +13,28 @@ use crate::forward::qwen3_5::{self, FullAttentionLayer, LinearAttentionLayer};
 use super::{ForwardBufs, MetalGgufModel, MetalLayer, SlotState};
 
 impl MetalGgufModel {
-    /// Embed one token: dequantize its packed Q1 embedding row on the
-    /// CPU (UMA — the table never exists in BF16 anywhere) and upload
-    /// the BF16 row into the residual stream buffer.
-    fn embed_token(&self, bufs: &mut ForwardBufs, token: u32) -> Result<()> {
+    /// Embed one token into the residual stream buffer. Text tokens
+    /// dequantize their packed Q1 embedding row on the CPU (UMA — the
+    /// table never exists in BF16 anywhere); `<|image_pad|>` tokens
+    /// splice the next encoded vision row instead.
+    fn embed_token(&self, bufs: &mut ForwardBufs, st: &mut SlotState, token: u32) -> Result<()> {
         let hidden = self.cfg.hidden as usize;
+        if let Some(v) = &self.vision
+            && token == v.pad_token_id
+            && let Some(rows) = &mut st.vision
+        {
+            if rows.cursor >= rows.rows {
+                bail!(
+                    "more <|image_pad|> tokens than encoded vision rows ({})",
+                    rows.rows
+                );
+            }
+            let row_ptr = rows.buf.offset(rows.cursor * v.out_hidden * 2);
+            rows.cursor += 1;
+            return self
+                .gpu
+                .copy_d2d(row_ptr, bufs.x_buf, v.out_hidden.min(hidden) * 2);
+        }
         if token >= self.cfg.vocab {
             bail!("token id {token} out of vocab range {}", self.cfg.vocab);
         }
@@ -38,19 +55,27 @@ impl MetalGgufModel {
         self.gpu.copy_h2d(&bufs.embed_bf16, bufs.x_buf)
     }
 
-    /// Run one token at absolute position `pos` through every decoder
-    /// layer, leaving the final residual stream in `bufs.x_buf`.
-    /// Synchronizes the stream before returning.
+    /// Run one token through every decoder layer, leaving the final
+    /// residual stream in `bufs.x_buf`. `cache_pos` is the PHYSICAL KV
+    /// slot (sequence index); `pos3` is the MRoPE (t, h, w) triple,
+    /// which equals `[p, p, p]` for text but diverges from `cache_pos`
+    /// after an image run. Synchronizes the stream before returning.
     pub(super) fn run_token(
         &self,
         bufs: &mut ForwardBufs,
-        st: &SlotState,
+        st: &mut SlotState,
         token: u32,
-        pos: u32,
+        cache_pos: u32,
+        pos3: [u32; 3],
         stream: u64,
     ) -> Result<()> {
-        self.embed_token(bufs, token)?;
-        self.gpu.copy_h2d(&pos.to_le_bytes(), bufs.positions)?;
+        self.embed_token(bufs, st, token)?;
+        let mut pos_bytes = [0u8; 12];
+        for (i, p) in pos3.iter().enumerate() {
+            pos_bytes[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        self.gpu.copy_h2d(&pos_bytes, bufs.positions)?;
+        let pos = cache_pos;
 
         let mut x = bufs.x_buf;
         for (idx, layer) in self.layers.iter().enumerate() {

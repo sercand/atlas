@@ -199,7 +199,8 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
     Ok(ForwardBufs {
         x_buf: bf16(cfg.hidden)?,
         x_final: bf16(cfg.hidden)?,
-        positions: gpu.alloc(4)?,
+        // One token × 3 u32 MRoPE components (t, h, w).
+        positions: gpu.alloc(12)?,
         inv_freq,
         full_scratch,
         lin_scratch,
@@ -217,8 +218,13 @@ pub(super) fn build(
     kv_dtype: KvCacheDtype,
 ) -> Result<MetalGgufModel> {
     let cfg = forward_config(config)?;
-    let kernels = Qwen35Kernels::resolve(gpu.as_ref())
+    let mut kernels = Qwen35Kernels::resolve(gpu.as_ref())
         .context("resolving metal kernels (was the binary built with ATLAS_TARGET_HW=metal?)")?;
+    // The LLM trunk always rotates through the 3-stream interleaved MRoPE
+    // kernel; for text tokens all three streams carry the same position,
+    // which reproduces scalar `rope_apply` bit-for-bit. The positions
+    // buffer is [1, 3] u32 (see `ForwardBufs`).
+    kernels.rope = gpu.kernel("rope_mrope_interleaved", "rope_mrope_interleaved")?;
     let argmax = gpu.kernel("argmax_bf16", "argmax_bf16")?;
 
     // Layer roles + weights.
@@ -287,7 +293,31 @@ pub(super) fn build(
         kv_dtype
     );
 
+    // Vision tower: present when the config declares one AND the mmproj
+    // sidecar tensors landed in the store.
+    let vision = match &config.vision {
+        Some(vc) if store.contains("model.visual.patch_embed.proj.weight") => {
+            let v = super::vision::MetalVision::from_store(store, gpu.as_ref(), vc)
+                .context("building metal vision tower from mmproj tensors")?;
+            tracing::info!(
+                "MetalGgufModel: vision tower ready ({} blocks, pad token {})",
+                vc.depth,
+                v.pad_token_id
+            );
+            Some(v)
+        }
+        Some(_) => {
+            tracing::info!(
+                "MetalGgufModel: config declares vision but no mmproj tensors loaded — text-only"
+            );
+            None
+        }
+        None => None,
+    };
+
     Ok(MetalGgufModel {
+        vision,
+        pending_vision: Mutex::new(None),
         gpu,
         cfg,
         kernels,
