@@ -71,6 +71,32 @@ kernel void gdn_gate_beta(
     beta[h] = 1.0f / (1.0f + exp(-float(b_raw[h])));
 }
 
+// ── gdn_gate_beta_batch (prefill) ───────────────────────────────
+//
+// Token-batched `gdn_gate_beta`: dt_raw/b_raw are `[num_tokens,
+// num_heads]`; dt_bias/A_log stay per-head. One thread per (t, h).
+kernel void gdn_gate_beta_batch(
+    constant uint &num_heads     [[buffer(0)]],
+    constant uint &num_tokens    [[buffer(1)]],
+    device const bfloat *dt_raw  [[buffer(2)]],
+    device const bfloat *dt_bias [[buffer(3)]],
+    device const float  *A_log   [[buffer(4)]],
+    device const bfloat *b_raw   [[buffer(5)]],
+    device float        *gate    [[buffer(6)]],
+    device float        *beta    [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= num_heads * num_tokens) {
+        return;
+    }
+    uint h = gid % num_heads;
+    float dt_pre = float(dt_raw[gid]) + float(dt_bias[h]);
+    float dt = (dt_pre > 20.0f) ? dt_pre : log(1.0f + exp(dt_pre));
+    float a_eff = -exp(A_log[h]);
+    gate[gid] = exp(dt * a_eff);
+    beta[gid] = 1.0f / (1.0f + exp(-float(b_raw[gid])));
+}
+
 // ── sigmoid_bf16 → float ────────────────────────────────────────
 //
 //   out[i] = 1 / (1 + exp(-in[i]))

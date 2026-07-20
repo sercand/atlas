@@ -146,7 +146,11 @@ fn load_lin_layer(
     })
 }
 
-fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result<ForwardBufs> {
+fn alloc_forward_bufs(
+    gpu: &dyn GpuBackend,
+    cfg: &Qwen35ForwardConfig,
+    max_seq_len: usize,
+) -> Result<ForwardBufs> {
     let bf16 = |n: u32| -> Result<DevicePtr> { gpu.alloc(n as usize * 2) };
     let f32b = |n: u32| -> Result<DevicePtr> { gpu.alloc(n as usize * 4) };
 
@@ -201,6 +205,11 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
     let inv_freq = gpu.alloc(inv_freq_bytes.len())?;
     gpu.copy_h2d(&inv_freq_bytes, inv_freq)?;
 
+    // Prefill staging: up to `stage_cap` tokens of embeddings +
+    // positions per upload (10 KB/token at hidden = 5120 — capping at
+    // 1024 keeps it ~10 MB while amortizing the per-sub-chunk sync).
+    let stage_cap = max_seq_len.clamp(1, 1024);
+
     Ok(ForwardBufs {
         x_buf,
         x_final: bf16(cfg.hidden)?,
@@ -211,6 +220,11 @@ fn alloc_forward_bufs(gpu: &dyn GpuBackend, cfg: &Qwen35ForwardConfig) -> Result
         lin_scratch,
         embed_f32: vec![0f32; cfg.hidden as usize],
         embed_bf16: vec![0u8; cfg.hidden as usize * 2],
+        x_stage: gpu.alloc(stage_cap * cfg.hidden as usize * 2)?,
+        pos_stage: gpu.alloc(stage_cap * 12)?,
+        stage_cap,
+        stage_host: vec![0u8; stage_cap * cfg.hidden as usize * 2],
+        pos_host: vec![0u8; stage_cap * 12],
     })
 }
 
@@ -286,7 +300,7 @@ pub(super) fn build(
     };
 
     let final_norm = norm_plus_one(gpu.as_ref(), store, "model.norm.weight")?;
-    let fwd = alloc_forward_bufs(gpu.as_ref(), &cfg)?;
+    let fwd = alloc_forward_bufs(gpu.as_ref(), &cfg, max_seq_len)?;
 
     let max_batch = max_batch_size.max(1);
     let logits = gpu.alloc(2 * max_batch * cfg.vocab as usize * 2)?;

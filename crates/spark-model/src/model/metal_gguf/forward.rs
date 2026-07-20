@@ -55,17 +55,94 @@ impl MetalGgufModel {
         self.gpu.copy_h2d(&bufs.embed_bf16, bufs.x_buf)
     }
 
+    /// Stage a prompt sub-chunk's embedding rows into `bufs.x_stage`
+    /// and its MRoPE triples into `bufs.pos_stage` — one host upload
+    /// for the whole sub-chunk, so the per-token layer loop that
+    /// follows issues no host writes. Text rows CPU-dequant into the
+    /// host mirror; `<|image_pad|>` rows splice their encoded vision
+    /// row with a stream-ordered blit after the upload.
+    ///
+    /// Caller must drain still-queued GPU readers of the staging
+    /// buffers (`synchronize`) before calling — the upload is a plain
+    /// UMA memcpy.
+    pub(super) fn stage_prefill_inputs(
+        &self,
+        bufs: &mut ForwardBufs,
+        st: &mut SlotState,
+        tokens: &[u32],
+        pos3: &[[u32; 3]],
+        stream: u64,
+    ) -> Result<()> {
+        let hidden = self.cfg.hidden as usize;
+        let row_bytes = hidden * 2;
+        let n = tokens.len();
+        debug_assert!(n <= bufs.stage_cap && n == pos3.len());
+
+        // (staged row index, encoded vision row ptr) splices, resolved
+        // in token order so the cursor walk matches `embed_token`'s.
+        let mut splices: Vec<(usize, DevicePtr)> = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            let dst = &mut bufs.stage_host[i * row_bytes..(i + 1) * row_bytes];
+            if let Some(v) = &self.vision
+                && tok == v.pad_token_id
+                && let Some(rows) = &mut st.vision
+            {
+                if rows.cursor >= rows.rows {
+                    bail!(
+                        "more <|image_pad|> tokens than encoded vision rows ({})",
+                        rows.rows
+                    );
+                }
+                splices.push((i, rows.buf.offset(rows.cursor * v.out_hidden * 2)));
+                rows.cursor += 1;
+                dst.fill(0);
+                continue;
+            }
+            if tok >= self.cfg.vocab {
+                bail!("token id {tok} out of vocab range {}", self.cfg.vocab);
+            }
+            let packed_row_bytes = (hidden / Q1_GROUP) * Q1_BLOCK_BYTES;
+            let start = tok as usize * packed_row_bytes;
+            let row = self
+                .embed_host
+                .get(start..start + packed_row_bytes)
+                .context("embedding row out of bounds")?;
+            gguf_q1::dequant_row_f32(row, hidden, &mut bufs.embed_f32)?;
+            for (d, &v) in dst.chunks_exact_mut(2).zip(bufs.embed_f32.iter()) {
+                d.copy_from_slice(&half::bf16::from_f32(v).to_le_bytes());
+            }
+        }
+        for (i, p3) in pos3.iter().enumerate() {
+            for (c, p) in p3.iter().enumerate() {
+                bufs.pos_host[i * 12 + c * 4..i * 12 + c * 4 + 4]
+                    .copy_from_slice(&p.to_le_bytes());
+            }
+        }
+        self.gpu
+            .copy_h2d(&bufs.stage_host[..n * row_bytes], bufs.x_stage)?;
+        self.gpu.copy_h2d(&bufs.pos_host[..n * 12], bufs.pos_stage)?;
+        let vision_hidden = self.vision.as_ref().map_or(hidden, |v| v.out_hidden);
+        for (i, src) in splices {
+            self.gpu.copy_d2d_async(
+                src,
+                bufs.x_stage.offset(i * row_bytes),
+                vision_hidden.min(hidden) * 2,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Run one token through every decoder layer, leaving the final
     /// residual stream in `bufs.x_buf`. `cache_pos` is the PHYSICAL KV
     /// slot (sequence index); `pos3` is the MRoPE (t, h, w) triple,
     /// which equals `[p, p, p]` for text but diverges from `cache_pos`
     /// after an image run.
     ///
-    /// `sync_after`: the host-side embed/position uploads at the top of
-    /// this function race with any still-queued GPU reads of the same
-    /// buffers, so a caller that will invoke `run_token` again before
-    /// another synchronize (the prefill loop) must pass `true`. Decode
-    /// passes `false` — `write_logits` synchronizes right after.
+    /// Decode-path entry: the embed/position host uploads at the top
+    /// race any still-queued GPU reads of the same buffers, so callers
+    /// rely on the sampler's read having drained the previous step
+    /// (and `decode_batch` drains between sequences).
     pub(super) fn run_token(
         &self,
         bufs: &mut ForwardBufs,
@@ -74,7 +151,6 @@ impl MetalGgufModel {
         cache_pos: u32,
         pos3: [u32; 3],
         stream: u64,
-        sync_after: bool,
     ) -> Result<()> {
         self.embed_token(bufs, st, token)?;
         let mut pos_bytes = [0u8; 12];
@@ -82,9 +158,24 @@ impl MetalGgufModel {
             pos_bytes[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
         }
         self.gpu.copy_h2d(&pos_bytes, bufs.positions)?;
-        let pos = cache_pos;
+        self.run_layers(bufs, st, bufs.x_buf, bufs.positions, cache_pos, stream)
+    }
 
-        let mut x = bufs.x_buf;
+    /// The 64-layer chain from an arbitrary layer-0 input row (`x_in`)
+    /// and positions pointer, leaving the final residual in
+    /// `bufs.x_buf`. Issues no host writes — safe to call in a loop
+    /// without synchronizing (the prefill path feeds it staged rows).
+    pub(super) fn run_layers(
+        &self,
+        bufs: &ForwardBufs,
+        st: &SlotState,
+        x_in: DevicePtr,
+        positions: DevicePtr,
+        cache_pos: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let pos = cache_pos;
+        let mut x = x_in;
         for (idx, layer) in self.layers.iter().enumerate() {
             // Submit the encoded prefix every 16 layers so the GPU
             // works while the host encodes the rest of the token
@@ -116,7 +207,7 @@ impl MetalGgufModel {
                         &bufs.full_scratch,
                         kv,
                         bufs.inv_freq,
-                        bufs.positions,
+                        positions,
                         x,
                         pos,
                         pos + 1,
@@ -175,9 +266,6 @@ impl MetalGgufModel {
         if x != bufs.x_buf {
             self.gpu
                 .copy_d2d_async(x, bufs.x_buf, self.cfg.hidden as usize * 2, stream)?;
-        }
-        if sync_after {
-            self.gpu.synchronize(stream)?;
         }
         Ok(())
     }

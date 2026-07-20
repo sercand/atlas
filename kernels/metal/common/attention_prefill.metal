@@ -113,3 +113,97 @@ kernel void attention_prefill(
         out[(m * num_heads + h) * head_dim + d] = bfloat(acc);
     }
 }
+
+// Chunked-prefill variant: the query block occupies ABSOLUTE positions
+// `[pos_base, pos_base + num_tokens)` of a K/V history of `seq_len`
+// (= pos_base + num_tokens) entries — query m may attend keys
+// [0, pos_base + m]. `pos_base = 0` reproduces `attention_prefill`.
+kernel void attention_prefill_offset(
+    constant uint  &num_tokens   [[buffer(0)]],
+    constant uint  &seq_len      [[buffer(1)]],
+    constant uint  &pos_base     [[buffer(2)]],
+    constant uint  &num_heads    [[buffer(3)]],
+    constant uint  &num_kv_heads [[buffer(4)]],
+    constant uint  &head_dim     [[buffer(5)]],
+    constant float &scale        [[buffer(6)]],
+    device const bfloat *q       [[buffer(7)]],
+    device const bfloat *k       [[buffer(8)]],
+    device const bfloat *v       [[buffer(9)]],
+    device bfloat       *out     [[buffer(10)]],
+    uint  tg_idx  [[threadgroup_position_in_grid]],
+    uint  tid     [[thread_position_in_threadgroup]],
+    uint  tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float scores[MAX_SEQ_PREFILL];
+    threadgroup float max_score;
+    threadgroup float sum_exp;
+
+    // Flat 1-D grid dispatch: caller sends `num_heads * num_tokens`
+    // threadgroups; we decode (m, h) here. Using uint3 builtins for
+    // a 2-D grid would also work but Metal forbids mixing scalar
+    // and vector position attributes in one entry point.
+    uint h = tg_idx % num_heads;
+    uint m = tg_idx / num_heads;
+    if (m >= num_tokens || h >= num_heads) {
+        return;
+    }
+    uint group = num_heads / num_kv_heads;
+    uint kv_h  = h / group;
+    // Causal cutoff: query m sits at absolute position pos_base + m
+    // and may attend keys [0, pos_base + m] inclusive.
+    uint cutoff = pos_base + m + 1u;
+
+    // Stage 1: scores. Mask everything past the causal cutoff to -∞
+    // so the softmax exp drives them to 0.
+    for (uint s = tid; s < seq_len && s < MAX_SEQ_PREFILL; s += tg_size) {
+        if (s >= cutoff) {
+            scores[s] = -INFINITY;
+            continue;
+        }
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            float qv = float(q[(m * num_heads + h) * head_dim + d]);
+            float kvv = float(k[(s * num_kv_heads + kv_h) * head_dim + d]);
+            dot += qv * kvv;
+        }
+        scores[s] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2: max reduction.
+    if (tid == 0) {
+        float mx = -INFINITY;
+        for (uint s = 0; s < seq_len; ++s) {
+            if (scores[s] > mx) mx = scores[s];
+        }
+        max_score = mx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 3: exp(score - max).
+    for (uint s = tid; s < seq_len; s += tg_size) {
+        scores[s] = exp(scores[s] - max_score);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 4: sum.
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint s = 0; s < seq_len; ++s) {
+            sum += scores[s];
+        }
+        sum_exp = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 5: out[m, h, d] = sum_s(softmax_s * V[s, kv_h, d]).
+    float inv_sum = 1.0f / sum_exp;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        float acc = 0.0f;
+        for (uint s = 0; s < seq_len; ++s) {
+            float vv = float(v[(s * num_kv_heads + kv_h) * head_dim + d]);
+            acc += scores[s] * inv_sum * vv;
+        }
+        out[(m * num_heads + h) * head_dim + d] = bfloat(acc);
+    }
+}

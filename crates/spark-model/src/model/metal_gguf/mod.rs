@@ -305,6 +305,17 @@ pub(crate) struct ForwardBufs {
     /// Host-side staging for the CPU embed-row dequant.
     pub embed_f32: Vec<f32>,
     pub embed_bf16: Vec<u8>,
+    /// Prefill staging: `stage_cap` embedding rows (`[stage_cap,
+    /// hidden]` BF16) + MRoPE triples (`[stage_cap, 3]` u32), uploaded
+    /// once per prompt sub-chunk. The per-token prefill loop then reads
+    /// its layer-0 input straight from a staged row, so it issues no
+    /// host writes — and therefore needs no per-token synchronize.
+    pub x_stage: DevicePtr,
+    pub pos_stage: DevicePtr,
+    pub stage_cap: usize,
+    /// Host mirrors filled by the CPU embed dequant before the upload.
+    pub stage_host: Vec<u8>,
+    pub pos_host: Vec<u8>,
 }
 
 pub struct MetalGgufModel {

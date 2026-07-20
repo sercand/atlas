@@ -36,3 +36,30 @@ kernel void kv_cache_append(
     k_cache[cache_off] = new_k[new_off];
     v_cache[cache_off] = new_v[new_off];
 }
+
+// Batched (prefill) variant: append `num_tokens` rows starting at slot
+// `base_pos`. `new_k`/`new_v` are `[num_tokens, num_kv_heads, head_dim]`;
+// grid gains a token dimension in z.
+kernel void kv_cache_append_batch(
+    constant uint &num_kv_heads [[buffer(0)]],
+    constant uint &head_dim     [[buffer(1)]],
+    constant uint &base_pos     [[buffer(2)]],
+    constant uint &num_tokens   [[buffer(3)]],
+    device const bfloat *new_k  [[buffer(4)]],
+    device const bfloat *new_v  [[buffer(5)]],
+    device bfloat       *k_cache [[buffer(6)]],
+    device bfloat       *v_cache [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d = gid.x;
+    uint h = gid.y;
+    uint t = gid.z;
+    if (h >= num_kv_heads || d >= head_dim || t >= num_tokens) {
+        return;
+    }
+    uint row = num_kv_heads * head_dim;
+    uint cache_off = (base_pos + t) * row + h * head_dim + d;
+    uint new_off   = t * row + h * head_dim + d;
+    k_cache[cache_off] = new_k[new_off];
+    v_cache[cache_off] = new_v[new_off];
+}

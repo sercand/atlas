@@ -91,14 +91,40 @@ impl MetalGgufModel {
                 rows.cursor = 0;
             }
         }
-        for (i, &tok) in tokens[chunk_start..end].iter().enumerate() {
-            let cache_pos = (chunk_start + i) as u32;
-            let pos3 = st
-                .mrope
-                .get(chunk_start + i)
-                .copied()
-                .unwrap_or([cache_pos; 3]);
-            self.run_token(&mut bufs, st, tok, cache_pos, pos3, stream, true)?;
+        // Sub-chunk loop: stage up to `stage_cap` tokens of embeddings
+        // + positions in ONE host upload, then run the layer chain per
+        // token with no host writes in between — the per-token
+        // synchronize the old loop needed (embed h2d racing queued GPU
+        // reads of x_buf) disappears, so the GPU pipelines across
+        // token boundaries.
+        let row_bytes = self.cfg.hidden as usize * 2;
+        let mut off = 0usize;
+        while off < chunk_len {
+            let t0 = chunk_start + off;
+            let n = (chunk_len - off).min(bufs.stage_cap);
+            // Drain queued readers of the staging buffers (previous
+            // sub-chunk / previous request) before the UMA memcpy.
+            self.gpu.synchronize(stream)?;
+            let pos3: Vec<[u32; 3]> = (0..n)
+                .map(|i| {
+                    st.mrope
+                        .get(t0 + i)
+                        .copied()
+                        .unwrap_or([(t0 + i) as u32; 3])
+                })
+                .collect();
+            self.stage_prefill_inputs(&mut bufs, st, &tokens[t0..t0 + n], &pos3, stream)?;
+            for i in 0..n {
+                self.run_layers(
+                    &bufs,
+                    st,
+                    bufs.x_stage.offset(i * row_bytes),
+                    bufs.pos_stage.offset(i * 12),
+                    (t0 + i) as u32,
+                    stream,
+                )?;
+            }
+            off += n;
         }
         let row = self.prefill_logits_row(seq.slot_idx);
         if emit_logits {
@@ -140,7 +166,7 @@ impl MetalGgufModel {
         // image run it is offset from the physical KV position).
         let rope_pos = if st.next_pos > 0 { st.next_pos } else { pos };
         st.next_pos = rope_pos + 1;
-        self.run_token(&mut bufs, st, token, pos, [rope_pos; 3], stream, false)?;
+        self.run_token(&mut bufs, st, token, pos, [rope_pos; 3], stream)?;
         self.write_logits(&bufs, row, stream)?;
         drop(states);
         drop(bufs);
