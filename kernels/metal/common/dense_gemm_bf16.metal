@@ -35,8 +35,20 @@ kernel void dense_gemm_bf16(
         return;
     }
     float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(x[m * K + k]) * float(w[n * K + k]);
+    if ((K & 3u) == 0u) {
+        // K % 4 == 0 keeps every row bfloat4-aligned → vector loads.
+        device const bfloat4 *x4 = reinterpret_cast<device const bfloat4*>(x + m * K);
+        device const bfloat4 *w4 = reinterpret_cast<device const bfloat4*>(w + n * K);
+        for (uint k4 = 0; k4 < K / 4u; ++k4) {
+            const bfloat4 a = x4[k4];
+            const bfloat4 b = w4[k4];
+            acc += float(a.x) * float(b.x) + float(a.y) * float(b.y)
+                 + float(a.z) * float(b.z) + float(a.w) * float(b.w);
+        }
+    } else {
+        for (uint k = 0; k < K; ++k) {
+            acc += float(x[m * K + k]) * float(w[n * K + k]);
+        }
     }
     y[m * N + n] = bfloat(acc);
 }

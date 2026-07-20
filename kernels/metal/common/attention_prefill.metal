@@ -23,6 +23,7 @@
 using namespace metal;
 
 constant uint MAX_SEQ_PREFILL = 4096;
+constant uint MAX_HEAD_DIM_PREFILL = 256;
 
 kernel void attention_prefill(
     constant uint  &num_tokens   [[buffer(0)]],
@@ -157,16 +158,29 @@ kernel void attention_prefill_offset(
     uint cutoff = pos_base + m + 1u;
     uint num_simds = (tg_size + 31u) / 32u;
 
-    // Stage 1: scores over the visible keys, tracking a running
-    // per-thread max (keys past the cutoff are never written — the
-    // later stages only walk [0, cutoff)).
+    // Stage 0: this (m, h) pair's query row into threadgroup memory —
+    // stage 1 walks it once per KEY, and re-reading it from device
+    // cost ~6× on this kernel (MAX_HEAD_DIM_PREFILL caps head_dim).
+    threadgroup float q_row[MAX_HEAD_DIM_PREFILL];
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        q_row[d] = float(q[(m * num_heads + h) * head_dim + d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 1: scores over the visible keys (vectorized k loads),
+    // tracking a running per-thread max (keys past the cutoff are
+    // never written — the later stages only walk [0, cutoff)).
     float local_max = -INFINITY;
     for (uint s = tid; s < cutoff && s < MAX_SEQ_PREFILL; s += tg_size) {
+        device const bfloat4 *k4 =
+            reinterpret_cast<device const bfloat4*>(k + (s * num_kv_heads + kv_h) * head_dim);
         float dot = 0.0f;
-        for (uint d = 0; d < head_dim; ++d) {
-            float qv = float(q[(m * num_heads + h) * head_dim + d]);
-            float kvv = float(k[(s * num_kv_heads + kv_h) * head_dim + d]);
-            dot += qv * kvv;
+        for (uint d4 = 0; d4 < head_dim / 4u; ++d4) {
+            const bfloat4 kv4 = k4[d4];
+            dot += q_row[d4 * 4u]      * float(kv4.x)
+                 + q_row[d4 * 4u + 1u] * float(kv4.y)
+                 + q_row[d4 * 4u + 2u] * float(kv4.z)
+                 + q_row[d4 * 4u + 3u] * float(kv4.w);
         }
         float sc = dot * scale;
         scores[s] = sc;
