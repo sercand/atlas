@@ -13,6 +13,16 @@
 //! rope cos/sin tables, f32→bf16 pixel conversion, and the 2×2 merge
 //! gather — all ports of the CUDA host code in `pos_embed.rs` /
 //! `merger.rs`.
+//!
+//! Perf shape: every GEMM weight converts BF16→F16 IN PLACE at init and
+//! runs through the simdgroup-matrix `dense_gemm_f16_bias` (activations
+//! cast per GEMM input into a zero-padded device-half image, mirroring
+//! the trunk's `q1_0_gemm` contract); attention is the GEMM-based SDPA
+//! (`VisionCtx::attention` — per head QKᵀ GEMM → row softmax → P·V
+//! GEMM, the CUDA `vit_attention_gemm` port). The naive
+//! one-thread-per-cell `dense_gemm_bf16` + serial-softmax
+//! `attention_full` tower took ~83 s for a 3072-patch image; this path
+//! takes ~2 s.
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::VisionConfig;
@@ -90,7 +100,18 @@ impl MetalVision {
         let p = |s: &str| format!("model.visual.{s}");
         let get =
             |s: &str| -> Result<DevicePtr> { Ok(store.get(&p(s)).with_context(|| p(s))?.ptr) };
+        // GEMM weights additionally register for the in-place BF16→F16
+        // convert at the end of construction (biases/norms stay BF16).
+        let to_f16: std::cell::RefCell<Vec<(DevicePtr, usize)>> = std::cell::RefCell::new(vec![]);
+        let getw = |s: &str| -> Result<DevicePtr> {
+            let t = store.get(&p(s)).with_context(|| p(s))?;
+            to_f16.borrow_mut().push((t.ptr, t.num_elements()));
+            Ok(t.ptr)
+        };
         let patch_t = store.get(&p("patch_embed.proj.weight"))?;
+        to_f16
+            .borrow_mut()
+            .push((patch_t.ptr, patch_t.num_elements()));
         let (hidden, patch_in) = (patch_t.shape[0], patch_t.shape[1]);
         let pos_t = store.get(&p("pos_embed.weight"))?;
         let grid_side = (pos_t.shape[0] as f64).sqrt() as usize;
@@ -115,18 +136,19 @@ impl MetalVision {
         let mut blocks = Vec::with_capacity(vc.depth);
         for i in 0..vc.depth {
             let b = |s: &str| get(&format!("blocks.{i}.{s}"));
+            let bw = |s: &str| getw(&format!("blocks.{i}.{s}"));
             blocks.push(VisionBlockW {
                 norm1_w: b("norm1.weight")?,
                 norm1_b: b("norm1.bias")?,
                 norm2_w: b("norm2.weight")?,
                 norm2_b: b("norm2.bias")?,
-                qkv_w: b("attn.qkv.weight")?,
+                qkv_w: bw("attn.qkv.weight")?,
                 qkv_b: b("attn.qkv.bias")?,
-                proj_w: b("attn.proj.weight")?,
+                proj_w: bw("attn.proj.weight")?,
                 proj_b: b("attn.proj.bias")?,
-                fc1_w: b("mlp.linear_fc1.weight")?,
+                fc1_w: bw("mlp.linear_fc1.weight")?,
                 fc1_b: b("mlp.linear_fc1.bias")?,
-                fc2_w: b("mlp.linear_fc2.weight")?,
+                fc2_w: bw("mlp.linear_fc2.weight")?,
                 fc2_b: b("mlp.linear_fc2.bias")?,
             });
         }
@@ -135,6 +157,26 @@ impl MetalVision {
         } else {
             151655
         };
+        let merger_fc1_w = getw("merger.linear_fc1.weight")?;
+        let merger_fc2_w = getw("merger.linear_fc2.weight")?;
+        // In-place BF16→F16 of every GEMM weight (same byte size; each
+        // thread rewrites its own element). One sync covers them all.
+        let cvt = gpu.kernel("dense_gemm_f16", "bf16_to_half_inplace")?;
+        let stream = gpu.default_stream();
+        for (ptr, n) in to_f16.into_inner() {
+            gpu.launch_typed(
+                cvt,
+                [(n as u32).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+                stream,
+                &[
+                    KernelArg::Bytes(&(n as u32).to_le_bytes()),
+                    KernelArg::Buffer(ptr),
+                ],
+            )?;
+        }
+        gpu.synchronize(stream)?;
         Ok(Self {
             hidden,
             heads: vc.num_heads,
@@ -152,9 +194,9 @@ impl MetalVision {
             blocks,
             merger_norm_w: get("merger.norm.weight")?,
             merger_norm_b: get("merger.norm.bias")?,
-            merger_fc1_w: get("merger.linear_fc1.weight")?,
+            merger_fc1_w,
             merger_fc1_b: get("merger.linear_fc1.bias")?,
-            merger_fc2_w: get("merger.linear_fc2.weight")?,
+            merger_fc2_w,
             merger_fc2_b: get("merger.linear_fc2.bias")?,
         })
     }
@@ -246,6 +288,25 @@ pub(crate) struct VisionCtx<'a> {
 }
 
 impl VisionCtx<'_> {
+    /// `ATLAS_VISION_DEBUG=1` parity probe: sync, pull `n` BF16 elements
+    /// and log their f32 sum. Names/values line up with the tensor sums
+    /// `llama-mtmd-debug -p encode` prints for the same mmproj, so the
+    /// first diverging stage localizes a numerics bug.
+    fn dbg_sum(&self, name: &str, ptr: DevicePtr, n: usize) {
+        if !std::env::var("ATLAS_VISION_DEBUG").is_ok_and(|v| v != "0") {
+            return;
+        }
+        let mut raw = vec![0u8; n * 2];
+        if self.gpu.synchronize(self.stream).is_err() || self.gpu.copy_d2h(ptr, &mut raw).is_err() {
+            return;
+        }
+        let sum: f64 = raw
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32() as f64)
+            .sum();
+        tracing::info!("vdbg {name}: sum {sum:.4}");
+    }
+
     fn ln(
         &self,
         v: &MetalVision,
@@ -273,47 +334,64 @@ impl VisionCtx<'_> {
         )
     }
 
-    fn gemm(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        x: DevicePtr,
-        w: DevicePtr,
-        y: DevicePtr,
-    ) -> Result<()> {
-        let kern = self.gpu.kernel("dense_gemm_bf16", "dense_gemm_bf16")?;
+    /// Cast `rows × k` BF16 rows at `src` into the shared device-half
+    /// GEMM input image `dst` (`[rows_pad, k_pad]`, both tails ZERO —
+    /// the GEMM's caller contract). Returns `k_pad`.
+    fn cast_pad(&self, rows: usize, k: usize, src: DevicePtr, dst: DevicePtr) -> Result<usize> {
+        let kern = self.gpu.kernel("dense_gemm_f16", "bf16_to_half_pad")?;
+        let rows_pad = rows.next_multiple_of(128);
+        let k_pad = k.next_multiple_of(64);
+        let total = (rows_pad * k_pad) as u32;
         self.gpu.launch_typed(
             kern,
-            [(n as u32).div_ceil(16), (m as u32).div_ceil(16), 1],
-            [16, 16, 1],
-            0,
-            self.stream,
-            &[
-                KernelArg::Bytes(&(m as u32).to_le_bytes()),
-                KernelArg::Bytes(&(n as u32).to_le_bytes()),
-                KernelArg::Bytes(&(k as u32).to_le_bytes()),
-                KernelArg::Buffer(x),
-                KernelArg::Buffer(w),
-                KernelArg::Buffer(y),
-            ],
-        )
-    }
-
-    fn bias(&self, rows: usize, cols: usize, bias: DevicePtr, x: DevicePtr) -> Result<()> {
-        let k = self.gpu.kernel("bias_add_rows", "bias_add_rows")?;
-        let n = (rows * cols) as u32;
-        self.gpu.launch_typed(
-            k,
-            [n.div_ceil(256), 1, 1],
+            [total.div_ceil(256), 1, 1],
             [256, 1, 1],
             0,
             self.stream,
             &[
                 KernelArg::Bytes(&(rows as u32).to_le_bytes()),
-                KernelArg::Bytes(&(cols as u32).to_le_bytes()),
+                KernelArg::Bytes(&(k as u32).to_le_bytes()),
+                KernelArg::Bytes(&(rows_pad as u32).to_le_bytes()),
+                KernelArg::Bytes(&(k_pad as u32).to_le_bytes()),
+                KernelArg::Buffer(src),
+                KernelArg::Buffer(dst),
+            ],
+        )?;
+        Ok(k_pad)
+    }
+
+    /// `y[m, n] = bias[n] + x @ W[n, k]ᵀ` over the pre-cast half input
+    /// (`x_half` from [`Self::cast_pad`], row stride `k_pad`).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_bias(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        k_pad: usize,
+        x_half: DevicePtr,
+        w: DevicePtr,
+        bias: DevicePtr,
+        y: DevicePtr,
+    ) -> Result<()> {
+        let kern = self.gpu.kernel("dense_gemm_f16", "dense_gemm_f16_bias")?;
+        let row_tiles = (n as u32).div_ceil(32);
+        let t_tiles = (m as u32).div_ceil(128);
+        self.gpu.launch_typed(
+            kern,
+            [row_tiles * t_tiles, 1, 1],
+            [128, 1, 1],
+            0,
+            self.stream,
+            &[
+                KernelArg::Bytes(&(n as u32).to_le_bytes()),
+                KernelArg::Bytes(&(k as u32).to_le_bytes()),
+                KernelArg::Bytes(&(m as u32).to_le_bytes()),
+                KernelArg::Bytes(&(k_pad as u32).to_le_bytes()),
+                KernelArg::Buffer(w),
+                KernelArg::Buffer(x_half),
                 KernelArg::Buffer(bias),
-                KernelArg::Buffer(x),
+                KernelArg::Buffer(y),
             ],
         )
     }
@@ -381,37 +459,131 @@ impl VisionCtx<'_> {
         )
     }
 
+    /// Head-slice cast into a zero-padded half image (see
+    /// `bf16_to_half_pad_strided`). `src` is pre-offset to the head.
+    #[allow(clippy::too_many_arguments)]
+    fn cast_head(
+        &self,
+        rows: usize,
+        k: usize,
+        rows_pad: usize,
+        k_pad: usize,
+        src_stride: usize,
+        src: DevicePtr,
+        dst: DevicePtr,
+    ) -> Result<()> {
+        let kern = self.gpu.kernel("dense_gemm_f16", "bf16_to_half_pad_strided")?;
+        let total = (rows_pad * k_pad) as u32;
+        self.gpu.launch_typed(
+            kern,
+            [total.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            self.stream,
+            &[
+                KernelArg::Bytes(&(rows as u32).to_le_bytes()),
+                KernelArg::Bytes(&(k as u32).to_le_bytes()),
+                KernelArg::Bytes(&(rows_pad as u32).to_le_bytes()),
+                KernelArg::Bytes(&(k_pad as u32).to_le_bytes()),
+                KernelArg::Bytes(&(src_stride as u32).to_le_bytes()),
+                KernelArg::Buffer(src),
+                KernelArg::Buffer(dst),
+            ],
+        )
+    }
+
+    /// GEMM-based SDPA (the CUDA `vit_attention_gemm` port): per head,
+    /// scores = Q·Kᵀ through the simdgroup-matrix GEMM (f32 out), row
+    /// softmax (scale folded, half out, zero-padded), then P·V through
+    /// the direct-B GEMM back into the head's slice of `out`. One-query-
+    /// per-threadgroup attention kernels re-stream all of K/V per query
+    /// (~630 ms/layer at P=3072); this runs the same math as two ~82%-
+    /// FMA-peak GEMMs (~30 ms/layer).
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         v: &MetalVision,
         p: usize,
+        sc: &AttnScratch,
         q: DevicePtr,
         k: DevicePtr,
         val: DevicePtr,
         out: DevicePtr,
     ) -> Result<()> {
-        let kern = self.gpu.kernel("attention_full", "attention_full")?;
-        let scale = 1.0f32 / (v.head_dim as f32).sqrt();
-        self.gpu.launch_typed(
-            kern,
-            [(v.heads * p) as u32, 1, 1],
-            [32, 1, 1],
-            0,
-            self.stream,
-            &[
-                KernelArg::Bytes(&(p as u32).to_le_bytes()),
-                KernelArg::Bytes(&(p as u32).to_le_bytes()),
-                KernelArg::Bytes(&(v.heads as u32).to_le_bytes()),
-                KernelArg::Bytes(&(v.heads as u32).to_le_bytes()),
-                KernelArg::Bytes(&(v.head_dim as u32).to_le_bytes()),
-                KernelArg::Bytes(&scale.to_le_bytes()),
-                KernelArg::Buffer(q),
-                KernelArg::Buffer(k),
-                KernelArg::Buffer(val),
-                KernelArg::Buffer(out),
-            ],
-        )
+        let hd = v.head_dim;
+        let hidden = v.hidden;
+        let p_pad = p.next_multiple_of(128);
+        let s_pad = p.next_multiple_of(64);
+        let n_pad = hd.next_multiple_of(32);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let gemm1 = self.gpu.kernel("dense_gemm_f16", "dense_gemm_f16_f32out")?;
+        let softmax = self.gpu.kernel("dense_gemm_f16", "vit_softmax_half")?;
+        let gemm2 = self.gpu.kernel("dense_gemm_f16", "dense_gemm_f16_nt")?;
+        for h in 0..v.heads {
+            let off = h * hd * 2;
+            self.cast_head(p, hd, p_pad, 128, hidden, q.offset(off), sc.xq)?;
+            self.cast_head(p, hd, p, hd, hidden, k.offset(off), sc.wk)?;
+            self.gpu.launch_typed(
+                gemm1,
+                [(p as u32).div_ceil(32) * (p as u32).div_ceil(128), 1, 1],
+                [128, 1, 1],
+                0,
+                self.stream,
+                &[
+                    KernelArg::Bytes(&(p as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(hd as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(p as u32).to_le_bytes()),
+                    KernelArg::Bytes(&128u32.to_le_bytes()),
+                    KernelArg::Buffer(sc.wk),
+                    KernelArg::Buffer(sc.xq),
+                    KernelArg::Buffer(sc.scores),
+                ],
+            )?;
+            self.gpu.launch_typed(
+                softmax,
+                [p_pad as u32, 1, 1],
+                [128, 1, 1],
+                0,
+                self.stream,
+                &[
+                    KernelArg::Bytes(&(p as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(p as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(s_pad as u32).to_le_bytes()),
+                    KernelArg::Bytes(&scale.to_le_bytes()),
+                    KernelArg::Buffer(sc.scores),
+                    KernelArg::Buffer(sc.probs),
+                ],
+            )?;
+            self.cast_head(p, hd, s_pad, n_pad, hidden, val.offset(off), sc.wv)?;
+            self.gpu.launch_typed(
+                gemm2,
+                [(n_pad as u32).div_ceil(32) * (p as u32).div_ceil(128), 1, 1],
+                [128, 1, 1],
+                0,
+                self.stream,
+                &[
+                    KernelArg::Bytes(&(hd as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(p as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(s_pad as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(n_pad as u32).to_le_bytes()),
+                    KernelArg::Bytes(&(hidden as u32).to_le_bytes()),
+                    KernelArg::Buffer(sc.wv),
+                    KernelArg::Buffer(sc.probs),
+                    KernelArg::Buffer(out.offset(off)),
+                ],
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// Per-image device scratch for the GEMM attention path.
+struct AttnScratch {
+    xq: DevicePtr,     // [p_pad, 128] half — Q head image
+    wk: DevicePtr,     // [p, head_dim] half — K head image (GEMM1 W)
+    scores: DevicePtr, // [p, p] f32 — raw Q·Kᵀ
+    probs: DevicePtr,  // [p_pad, s_pad] half — softmax rows, zero-padded
+    wv: DevicePtr,     // [s_pad, n_pad] half — V head image (GEMM2 B)
 }
 
 impl MetalVision {
@@ -440,15 +612,36 @@ impl MetalVision {
         let h = self.hidden;
         let alloc = |n_elems: usize| -> Result<DevicePtr> { gpu.alloc(n_elems * 2) };
 
+        // Shared device-half GEMM input image (`cast_pad` fills it per
+        // GEMM input; rows pad to 128, K to 64 — see dense_gemm_f16).
+        let pad_t = |t: usize| t.next_multiple_of(128);
+        let pad_k = |k: usize| k.next_multiple_of(64);
+        let ms = self.merge;
+        let (mh, mw) = (grid_h / ms, grid_w / ms);
+        let merged_p = mh * mw;
+        let merge_dim = ms * ms * h;
+        let x_half_elems = [
+            pad_t(p) * pad_k(self.patch_in),
+            pad_t(p) * pad_k(self.intermediate),
+            pad_t(merged_p) * pad_k(merge_dim),
+        ]
+        .into_iter()
+        .max()
+        .expect("non-empty");
+        let x_half = alloc(x_half_elems)?;
+
         // Patch rows f32→bf16 → GEMM (+bias) → + interpolated pos_embed.
         let pix = alloc(p * self.patch_in)?;
         gpu.copy_h2d(&bf16_bytes(pixels), pix)?;
         let h1 = alloc(p * h)?;
-        ctx.gemm(p, h, self.patch_in, pix, self.patch_w, h1)?;
-        ctx.bias(p, h, self.patch_b, h1)?;
+        let kp = ctx.cast_pad(p, self.patch_in, pix, x_half)?;
+        ctx.gemm_bias(p, h, self.patch_in, kp, x_half, self.patch_w, self.patch_b, h1)?;
+        ctx.dbg_sum("patch_bias", h1, p * h);
         let pos = alloc(p * h)?;
         gpu.copy_h2d(&self.interp_pos_embed(grid_h, grid_w), pos)?;
+        ctx.dbg_sum("pos_interp", pos, p * h);
         ctx.add(p * h, h1, pos, h1)?;
+        ctx.dbg_sum("inp_pos_emb", h1, p * h);
 
         // 2D rope tables.
         let (cos_b, sin_b) = self.rope_tables(grid_h, grid_w);
@@ -465,44 +658,83 @@ impl MetalVision {
         let v = alloc(p * h)?;
         let attn = alloc(p * h)?;
         let f = alloc(p * self.intermediate)?;
+        let p_pad = p.next_multiple_of(128);
+        let s_pad = p.next_multiple_of(64);
+        let n_pad = self.head_dim.next_multiple_of(32);
+        let attn_sc = AttnScratch {
+            xq: alloc(p_pad * 128)?,
+            wk: alloc(p * self.head_dim)?,
+            scores: gpu.alloc(p * p * 4)?,
+            probs: alloc(p_pad * s_pad)?,
+            wv: alloc(s_pad * n_pad)?,
+        };
         let wrow = h * 2; // W row-major stride in bytes
+        let dbg_on = std::env::var("ATLAS_VISION_DEBUG").is_ok_and(|v| v != "0");
 
-        for blk in &self.blocks {
+        for (bi, blk) in self.blocks.iter().enumerate() {
+            let d = |name: &str, ptr: DevicePtr, n: usize| {
+                if dbg_on {
+                    ctx.dbg_sum(&format!("{name}-{bi}"), ptr, n);
+                }
+            };
             gpu.copy_d2d_async(h1, resid, p * h * 2, ctx.stream)?;
             ctx.ln(self, p, h1, blk.norm1_w, blk.norm1_b, t1)?;
+            d("ln1", t1, p * h);
             // Q/K/V as three GEMMs over the fused weight's row blocks —
             // outputs land contiguous [P, h] each (no interleave split).
-            ctx.gemm(p, h, h, t1, blk.qkv_w, q)?;
-            ctx.gemm(p, h, h, t1, blk.qkv_w.offset(h * wrow), kbuf)?;
-            ctx.gemm(p, h, h, t1, blk.qkv_w.offset(2 * h * wrow), v)?;
-            ctx.bias(p, h, blk.qkv_b, q)?;
-            ctx.bias(p, h, blk.qkv_b.offset(h * 2), kbuf)?;
-            ctx.bias(p, h, blk.qkv_b.offset(2 * h * 2), v)?;
+            let kp = ctx.cast_pad(p, h, t1, x_half)?;
+            ctx.gemm_bias(p, h, h, kp, x_half, blk.qkv_w, blk.qkv_b, q)?;
+            ctx.gemm_bias(
+                p,
+                h,
+                h,
+                kp,
+                x_half,
+                blk.qkv_w.offset(h * wrow),
+                blk.qkv_b.offset(h * 2),
+                kbuf,
+            )?;
+            ctx.gemm_bias(
+                p,
+                h,
+                h,
+                kp,
+                x_half,
+                blk.qkv_w.offset(2 * h * wrow),
+                blk.qkv_b.offset(2 * h * 2),
+                v,
+            )?;
+            d("q_bias", q, p * h);
+            d("k_bias", kbuf, p * h);
+            d("v_bias", v, p * h);
             ctx.vision_rope(self, p, cs, sn, q)?;
             ctx.vision_rope(self, p, cs, sn, kbuf)?;
-            ctx.attention(self, p, q, kbuf, v, attn)?;
-            ctx.gemm(p, h, h, attn, blk.proj_w, t1)?;
-            ctx.bias(p, h, blk.proj_b, t1)?;
+            d("q_rope", q, p * h);
+            ctx.attention(self, p, &attn_sc, q, kbuf, v, attn)?;
+            d("attn", attn, p * h);
+            let kp = ctx.cast_pad(p, h, attn, x_half)?;
+            ctx.gemm_bias(p, h, h, kp, x_half, blk.proj_w, blk.proj_b, t1)?;
+            d("attn_out", t1, p * h);
             ctx.add(p * h, resid, t1, h1)?;
+            d("ffn_inp", h1, p * h);
 
             gpu.copy_d2d_async(h1, resid, p * h * 2, ctx.stream)?;
             ctx.ln(self, p, h1, blk.norm2_w, blk.norm2_b, t1)?;
-            ctx.gemm(p, self.intermediate, h, t1, blk.fc1_w, f)?;
-            ctx.bias(p, self.intermediate, blk.fc1_b, f)?;
+            let kp = ctx.cast_pad(p, h, t1, x_half)?;
+            ctx.gemm_bias(p, self.intermediate, h, kp, x_half, blk.fc1_w, blk.fc1_b, f)?;
+            d("ffn_up_b", f, p * self.intermediate);
             ctx.gelu(p * self.intermediate, f)?;
-            ctx.gemm(p, h, self.intermediate, f, blk.fc2_w, t1)?;
-            ctx.bias(p, h, blk.fc2_b, t1)?;
+            let kp = ctx.cast_pad(p, self.intermediate, f, x_half)?;
+            ctx.gemm_bias(p, h, self.intermediate, kp, x_half, blk.fc2_w, blk.fc2_b, t1)?;
             ctx.add(p * h, resid, t1, h1)?;
+            d("layer_out", h1, p * h);
         }
 
         // Merger: LN (pre-merge) → 2×2 spatial merge (host gather) →
         // fc1 → GELU → fc2 → out rows.
         ctx.ln(self, p, h1, self.merger_norm_w, self.merger_norm_b, t1)?;
+        ctx.dbg_sum("merger_ln", t1, p * h);
         gpu.synchronize(ctx.stream)?;
-        let ms = self.merge;
-        let (mh, mw) = (grid_h / ms, grid_w / ms);
-        let merged_p = mh * mw;
-        let merge_dim = ms * ms * h;
         let mut ln_host = vec![0u8; p * h * 2];
         gpu.copy_d2h(t1, &mut ln_host)?;
         let row = |r: usize, c: usize| -> &[u8] {
@@ -522,22 +754,36 @@ impl MetalVision {
         let merged = alloc(merged_p * merge_dim)?;
         gpu.copy_h2d(&merged_host, merged)?;
         let g = alloc(merged_p * merge_dim)?;
-        ctx.gemm(merged_p, merge_dim, merge_dim, merged, self.merger_fc1_w, g)?;
-        ctx.bias(merged_p, merge_dim, self.merger_fc1_b, g)?;
+        let kp = ctx.cast_pad(merged_p, merge_dim, merged, x_half)?;
+        ctx.gemm_bias(
+            merged_p,
+            merge_dim,
+            merge_dim,
+            kp,
+            x_half,
+            self.merger_fc1_w,
+            self.merger_fc1_b,
+            g,
+        )?;
+        ctx.dbg_sum("merger_fc1_b", g, merged_p * merge_dim);
         ctx.gelu(merged_p * merge_dim, g)?;
-        ctx.gemm(
+        let kp = ctx.cast_pad(merged_p, merge_dim, g, x_half)?;
+        ctx.gemm_bias(
             merged_p,
             self.out_hidden,
             merge_dim,
-            g,
+            kp,
+            x_half,
             self.merger_fc2_w,
+            self.merger_fc2_b,
             out,
         )?;
-        ctx.bias(merged_p, self.out_hidden, self.merger_fc2_b, out)?;
+        ctx.dbg_sum("out_rows", out, merged_p * self.out_hidden);
         gpu.synchronize(ctx.stream)?;
 
         for buf in [
-            pix, h1, pos, cs, sn, t1, resid, q, kbuf, v, attn, f, merged, g,
+            pix, h1, pos, cs, sn, t1, resid, q, kbuf, v, attn, f, merged, g, x_half, attn_sc.xq,
+            attn_sc.wk, attn_sc.scores, attn_sc.probs, attn_sc.wv,
         ] {
             gpu.free(buf)?;
         }

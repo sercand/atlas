@@ -30,7 +30,11 @@ kernel void gelu(
     }
     float v = float(x[gid]);
     float v3 = v * v * v;
-    float arg = SQRT_2_OVER_PI * (v + GELU_C * v3);
+    // Clamp: this file builds with -ffast-math, where tanh(x) goes
+    // through exp(2x) and overflows to NaN past x ≈ 44. ViT mid-tower
+    // activations reach that (observed: NaN residual stream from block
+    // 9 of the Bonsai mmproj). tanh saturates to ±1 well before ±15.
+    float arg = clamp(SQRT_2_OVER_PI * (v + GELU_C * v3), -15.0f, 15.0f);
     float t = tanh(arg);
     out[gid] = bfloat(0.5f * v * (1.0f + t));
 }
