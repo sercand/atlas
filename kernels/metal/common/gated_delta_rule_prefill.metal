@@ -42,20 +42,28 @@ using namespace metal;
 constant float SSM_STATE_MAX_NORM_P = 1000.0f;
 constant uint  DIM = 128u; // k_dim == v_dim
 
-kernel void gated_delta_rule_prefill(
-    device float        *h_state [[buffer(0)]],
-    device const bfloat *qkv     [[buffer(1)]],
-    device const float  *gate    [[buffer(2)]],
-    device const float  *beta    [[buffer(3)]],
-    device bfloat       *output  [[buffer(4)]],
-    constant uint &num_tokens    [[buffer(5)]],
-    constant uint &num_k_heads   [[buffer(6)]],
-    constant uint &num_v_heads   [[buffer(7)]],
-    constant uint &qkv_stride    [[buffer(8)]],
-    uint  tg_idx    [[threadgroup_position_in_grid]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  simd_lane [[thread_index_in_simdgroup]],
-    uint  simd_grp  [[simdgroup_index_in_threadgroup]])
+// Body shared by the FP32- and FP16-state entry points (state math is
+// FP32 in registers either way; StateT only changes the load/store
+// format — it must match the decode kernel variant the same slot uses).
+template <typename StateT>
+static inline void gdr_prefill_impl(
+    device StateT       *h_state,
+    device const bfloat *qkv,
+    device const float  *gate,
+    device const float  *beta,
+    device bfloat       *output,
+    threadgroup float   *smem_k,     // [DIM]
+    threadgroup float   *smem_q,     // [DIM]
+    threadgroup float   *norm_sums,  // [4]
+    threadgroup float   *head_store, // [1]
+    uint num_tokens,
+    uint num_k_heads,
+    uint num_v_heads,
+    uint qkv_stride,
+    uint tg_idx,
+    uint tid,
+    uint simd_lane,
+    uint simd_grp)
 {
     const uint vh = tg_idx;
     if (vh >= num_v_heads) {
@@ -69,17 +77,12 @@ kernel void gated_delta_rule_prefill(
     const uint v_off = 2u * num_k_heads * DIM + vh * DIM;
 
     // This thread's state column H[:, tid], register-resident.
-    device float *H = h_state + (ulong)vh * DIM * DIM;
+    device StateT *H = h_state + (ulong)vh * DIM * DIM;
     float hcol[DIM];
     #pragma unroll
     for (uint j = 0; j < DIM; ++j) {
-        hcol[j] = H[j * DIM + tid];
+        hcol[j] = float(H[j * DIM + tid]);
     }
-
-    threadgroup float smem_k[DIM];
-    threadgroup float smem_q[DIM];
-    threadgroup float norm_sums[4];
-    threadgroup float head_norm_sq_storage;
 
     const float inv_sqrt_d = rsqrt(float(DIM));
 
@@ -123,11 +126,11 @@ kernel void gated_delta_rule_prefill(
             float s = (tid < 4u) ? norm_sums[tid] : 0.0f;
             s = simd_sum(s);
             if (tid == 0) {
-                head_norm_sq_storage = s;
+                head_store[0] = s;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float head_norm_sq = head_norm_sq_storage;
+        const float head_norm_sq = head_store[0];
         if (head_norm_sq > SSM_STATE_MAX_NORM_P * SSM_STATE_MAX_NORM_P) {
             const float scale = SSM_STATE_MAX_NORM_P * rsqrt(head_norm_sq);
             #pragma unroll
@@ -144,6 +147,56 @@ kernel void gated_delta_rule_prefill(
 
     #pragma unroll
     for (uint j = 0; j < DIM; ++j) {
-        H[j * DIM + tid] = hcol[j];
+        H[j * DIM + tid] = StateT(hcol[j]);
     }
+}
+
+kernel void gated_delta_rule_prefill(
+    device float        *h_state [[buffer(0)]],
+    device const bfloat *qkv     [[buffer(1)]],
+    device const float  *gate    [[buffer(2)]],
+    device const float  *beta    [[buffer(3)]],
+    device bfloat       *output  [[buffer(4)]],
+    constant uint &num_tokens    [[buffer(5)]],
+    constant uint &num_k_heads   [[buffer(6)]],
+    constant uint &num_v_heads   [[buffer(7)]],
+    constant uint &qkv_stride    [[buffer(8)]],
+    uint  tg_idx    [[threadgroup_position_in_grid]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  simd_lane [[thread_index_in_simdgroup]],
+    uint  simd_grp  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float smem_k[DIM];
+    threadgroup float smem_q[DIM];
+    threadgroup float norm_sums[4];
+    threadgroup float head_store[1];
+    gdr_prefill_impl<float>(h_state, qkv, gate, beta, output,
+                            smem_k, smem_q, norm_sums, head_store, num_tokens,
+                            num_k_heads, num_v_heads, qkv_stride,
+                            tg_idx, tid, simd_lane, simd_grp);
+}
+
+kernel void gated_delta_rule_prefill_f16(
+    device half         *h_state [[buffer(0)]],
+    device const bfloat *qkv     [[buffer(1)]],
+    device const float  *gate    [[buffer(2)]],
+    device const float  *beta    [[buffer(3)]],
+    device bfloat       *output  [[buffer(4)]],
+    constant uint &num_tokens    [[buffer(5)]],
+    constant uint &num_k_heads   [[buffer(6)]],
+    constant uint &num_v_heads   [[buffer(7)]],
+    constant uint &qkv_stride    [[buffer(8)]],
+    uint  tg_idx    [[threadgroup_position_in_grid]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  simd_lane [[thread_index_in_simdgroup]],
+    uint  simd_grp  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float smem_k[DIM];
+    threadgroup float smem_q[DIM];
+    threadgroup float norm_sums[4];
+    threadgroup float head_store[1];
+    gdr_prefill_impl<half>(h_state, qkv, gate, beta, output,
+                           smem_k, smem_q, norm_sums, head_store, num_tokens,
+                           num_k_heads, num_v_heads, qkv_stride,
+                           tg_idx, tid, simd_lane, simd_grp);
 }

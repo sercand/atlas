@@ -595,3 +595,136 @@ fn metal_q1_0_gemm_micro_bench() {
         gmac
     );
 }
+
+/// The f16-state GDN variants must agree with each other the same way
+/// the f32 pair does (prefill == token-by-token decode walk), starting
+/// from an identical half-precision state image.
+#[test]
+fn metal_gdn_prefill_f16_matches_decode_f16_walk() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    let Ok(prefill) = backend.kernel("gated_delta_rule_prefill", "gated_delta_rule_prefill_f16")
+    else {
+        eprintln!("skipping: gated_delta_rule_prefill_f16 not in this kernel build");
+        return;
+    };
+    let decode = backend
+        .kernel("gated_delta_rule_decode", "gated_delta_rule_decode_f16")
+        .expect("decode f16 kernel");
+
+    let dim = 128usize;
+    let num_k_heads = 2u32;
+    let num_v_heads = 6u32;
+    let t = 5usize;
+    let qkv_stride = (2 * num_k_heads as usize + num_v_heads as usize) * dim;
+
+    let qkv: Vec<half::bf16> = (0..t * qkv_stride)
+        .map(|i| half::bf16::from_f32(test_val(i) * 0.5))
+        .collect();
+    let gate: Vec<f32> = (0..t * num_v_heads as usize)
+        .map(|i| 0.55 + 0.4 * ((i % 7) as f32 / 7.0))
+        .collect();
+    let beta: Vec<f32> = (0..t * num_v_heads as usize)
+        .map(|i| 0.3 + 0.6 * ((i % 5) as f32 / 5.0))
+        .collect();
+    let state0: Vec<half::f16> = (0..num_v_heads as usize * dim * dim)
+        .map(|i| half::f16::from_f32(test_val(i * 7) * 0.02))
+        .collect();
+    let state0_bytes: Vec<u8> = state0.iter().flat_map(|h| h.to_le_bytes()).collect();
+
+    let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+    let qkv_ptr = backend.alloc(qkv.len() * 2).expect("alloc qkv");
+    backend
+        .copy_h2d(&bf16_slice_to_bytes(&qkv), qkv_ptr)
+        .expect("h2d qkv");
+    let gate_ptr = backend.alloc(gate.len() * 4).expect("alloc gate");
+    backend.copy_h2d(&f32_bytes(&gate), gate_ptr).expect("h2d");
+    let beta_ptr = backend.alloc(beta.len() * 4).expect("alloc beta");
+    backend.copy_h2d(&f32_bytes(&beta), beta_ptr).expect("h2d");
+
+    let state_ref = backend.alloc(state0_bytes.len()).expect("alloc state");
+    let state_new = backend.alloc(state0_bytes.len()).expect("alloc state");
+    backend.copy_h2d(&state0_bytes, state_ref).expect("h2d");
+    backend.copy_h2d(&state0_bytes, state_new).expect("h2d");
+
+    let z_dim = num_v_heads as usize * dim;
+    let y_ref = backend.alloc(t * z_dim * 2).expect("alloc y_ref");
+    let y_new = backend.alloc(t * z_dim * 2).expect("alloc y_new");
+
+    let stream = backend.default_stream();
+    let batch_one = 1u32;
+    let dim_u32 = dim as u32;
+    for tok in 0..t {
+        let row = qkv_ptr.offset(tok * qkv_stride * 2);
+        let k_off = num_k_heads as usize * dim * 2;
+        let v_off = 2 * num_k_heads as usize * dim * 2;
+        backend
+            .launch_typed(
+                decode,
+                [num_v_heads, 1, 1],
+                [128, 1, 1],
+                0,
+                stream,
+                &[
+                    KernelArg::Buffer(state_ref),
+                    KernelArg::Buffer(row),
+                    KernelArg::Buffer(row.offset(k_off)),
+                    KernelArg::Buffer(row.offset(v_off)),
+                    KernelArg::Buffer(gate_ptr.offset(tok * num_v_heads as usize * 4)),
+                    KernelArg::Buffer(beta_ptr.offset(tok * num_v_heads as usize * 4)),
+                    KernelArg::Buffer(y_ref.offset(tok * z_dim * 2)),
+                    KernelArg::Bytes(&batch_one.to_le_bytes()),
+                    KernelArg::Bytes(&num_k_heads.to_le_bytes()),
+                    KernelArg::Bytes(&num_v_heads.to_le_bytes()),
+                    KernelArg::Bytes(&dim_u32.to_le_bytes()),
+                    KernelArg::Bytes(&dim_u32.to_le_bytes()),
+                ],
+            )
+            .expect("launch decode f16");
+    }
+    let t_u32 = t as u32;
+    let stride_u32 = qkv_stride as u32;
+    backend
+        .launch_typed(
+            prefill,
+            [num_v_heads, 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Buffer(state_new),
+                KernelArg::Buffer(qkv_ptr),
+                KernelArg::Buffer(gate_ptr),
+                KernelArg::Buffer(beta_ptr),
+                KernelArg::Buffer(y_new),
+                KernelArg::Bytes(&t_u32.to_le_bytes()),
+                KernelArg::Bytes(&num_k_heads.to_le_bytes()),
+                KernelArg::Bytes(&num_v_heads.to_le_bytes()),
+                KernelArg::Bytes(&stride_u32.to_le_bytes()),
+            ],
+        )
+        .expect("launch prefill f16");
+    backend.synchronize(stream).expect("synchronize");
+
+    let mut yr = vec![0u8; t * z_dim * 2];
+    let mut yn = vec![0u8; t * z_dim * 2];
+    backend.copy_d2h(y_ref, &mut yr).expect("d2h");
+    backend.copy_d2h(y_new, &mut yn).expect("d2h");
+    let yr = bytes_to_bf16_vec(&yr);
+    let yn = bytes_to_bf16_vec(&yn);
+    for i in 0..t * z_dim {
+        let e = yr[i].to_f32();
+        let a = yn[i].to_f32();
+        // f16 state rounding differs between the register-resident
+        // prefill walk and the store/reload decode walk — wider band
+        // than the f32 pair.
+        let tol = (e.abs() * 3e-2).max(1e-2);
+        assert!(
+            (e - a).abs() <= tol,
+            "y[{i}] (tok {}): decode-f16 walk {e}, prefill-f16 {a}",
+            i / z_dim
+        );
+    }
+}

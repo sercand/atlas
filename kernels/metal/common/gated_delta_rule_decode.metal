@@ -35,8 +35,171 @@ using namespace metal;
 // contexts but caps it before FP32 overflow.
 constant float SSM_STATE_MAX_NORM = 1000.0f;
 
+// Body shared by the FP32- and FP16-state entry points. All arithmetic
+// is FP32 regardless; StateT only changes the storage format of H.
+// The serving model runs the f16 variant (the state is norm-clamped to
+// ≤1000, well inside half range, and halving the ~300 MB/token of
+// state traffic is a straight decode win); the example drivers keep
+// their f32 buffers on the f32 entry.
+template <typename StateT>
+static inline void gdr_decode_impl(
+    device StateT       *h_state,
+    device const bfloat *query,
+    device const bfloat *key,
+    device const bfloat *value,
+    device const float  *gate,
+    device const float  *beta,
+    device bfloat       *output,
+    threadgroup float   *smem_k,     // [128]
+    threadgroup float   *smem_q,     // [128]
+    threadgroup float   *norm_sums,  // [4]
+    threadgroup float   *head_store, // [1]
+    uint batch_size,
+    uint num_k_heads,
+    uint num_v_heads,
+    uint k_dim,
+    uint v_dim,
+    uint tg_idx,
+    uint tid,
+    uint simd_lane,
+    uint simd_grp)
+{
+    // Flat 1-D grid: caller dispatches `num_v_heads * batch_size`
+    // threadgroups; we decode (vh, b) here. Metal forbids mixing
+    // scalar and uint3 position attributes in one entry point.
+    const uint vh = tg_idx % num_v_heads;
+    const uint b  = tg_idx / num_v_heads;
+    if (vh >= num_v_heads || b >= batch_size) {
+        return;
+    }
+    const uint head_repeat = num_v_heads / num_k_heads;
+    const uint kh = vh / head_repeat;
+
+    // H slice: [k_dim, v_dim] for this (batch, value_head)
+    device StateT *H = h_state + ((b * num_v_heads + vh) * k_dim * v_dim);
+    device const bfloat *q_ptr = query + (b * num_k_heads + kh) * k_dim;
+    device const bfloat *k_ptr = key   + (b * num_k_heads + kh) * k_dim;
+    device const bfloat *v_ptr = value + (b * num_v_heads + vh) * v_dim;
+
+    // Gate decay clamped to (0, 1) — same numeric guard as CUDA ref.
+    float g_raw = gate[b * num_v_heads + vh];
+    const float g  = fmin(fmax(g_raw, 1e-6f), 1.0f - 1e-6f);
+    const float bt = beta[b * num_v_heads + vh];
+
+    // Shared K and Q vectors (k_dim ≤ 128 here; sized for the
+    // Qwen3.5 GDN where k_dim = v_dim = 128).
+    if (tid < k_dim) {
+        smem_k[tid] = float(k_ptr[tid]);
+        smem_q[tid] = float(q_ptr[tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid >= v_dim) {
+        return;
+    }
+    float v_i = float(v_ptr[tid]);
+
+    // Step 1: hk_dot = sum_j H[j, tid] * k[j]
+    float hk_dot = 0.0f;
+    for (uint j = 0; j < k_dim; j += 4) {
+        float h0 = float(H[(j + 0) * v_dim + tid]);
+        float h1 = float(H[(j + 1) * v_dim + tid]);
+        float h2 = float(H[(j + 2) * v_dim + tid]);
+        float h3 = float(H[(j + 3) * v_dim + tid]);
+        hk_dot += h0 * smem_k[j] + h1 * smem_k[j + 1]
+                + h2 * smem_k[j + 2] + h3 * smem_k[j + 3];
+    }
+
+    // Step 2: gated residual value (HF reference order — decay applied
+    // before the correction term, then beta scales the residual).
+    float v_new_i = (v_i - g * hk_dot) * bt;
+
+    // Steps 3+4 fused: state update + output dot product in one pass.
+    // The norm-clamp sum of squares accumulates here too — the updated
+    // h values are already in registers, saving a third sweep over H.
+    float q_dot = 0.0f;
+    float local_sq = 0.0f;
+    for (uint j = 0; j < k_dim; j += 4) {
+        float h0 = float(H[(j + 0) * v_dim + tid]);
+        float h1 = float(H[(j + 1) * v_dim + tid]);
+        float h2 = float(H[(j + 2) * v_dim + tid]);
+        float h3 = float(H[(j + 3) * v_dim + tid]);
+        h0 = g * h0 + smem_k[j]     * v_new_i;
+        h1 = g * h1 + smem_k[j + 1] * v_new_i;
+        h2 = g * h2 + smem_k[j + 2] * v_new_i;
+        h3 = g * h3 + smem_k[j + 3] * v_new_i;
+        H[(j + 0) * v_dim + tid] = StateT(h0);
+        H[(j + 1) * v_dim + tid] = StateT(h1);
+        H[(j + 2) * v_dim + tid] = StateT(h2);
+        H[(j + 3) * v_dim + tid] = StateT(h3);
+        q_dot += h0 * smem_q[j] + h1 * smem_q[j + 1]
+               + h2 * smem_q[j + 2] + h3 * smem_q[j + 3];
+        local_sq += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3;
+    }
+
+    // ── SSM state-norm clamp (Stuffed Mamba mitigation) ──
+    // Block-wide reduction of the per-thread sums; if ||H||_F > MAX,
+    // scale the state down (rare — costs a re-read only when it fires).
+    {
+        // simdgroup (32-lane) sum, then cross-simdgroup reduction.
+        float warp_sum = simd_sum(local_sq);
+        if (simd_lane == 0) {
+            norm_sums[simd_grp] = warp_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_grp == 0) {
+            // 4 simdgroups for tg_size = 128.
+            float s = (tid < 4u) ? norm_sums[tid] : 0.0f;
+            s = simd_sum(s);
+            if (tid == 0) {
+                head_store[0] = s;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float head_norm_sq = head_store[0];
+        if (head_norm_sq > SSM_STATE_MAX_NORM * SSM_STATE_MAX_NORM) {
+            float scale = SSM_STATE_MAX_NORM * rsqrt(head_norm_sq);
+            for (uint j = 0; j < k_dim; ++j) {
+                H[j * v_dim + tid] = StateT(float(H[j * v_dim + tid]) * scale);
+            }
+        }
+    }
+
+    // Output scaled by 1/sqrt(k_dim) — matches CUDA + HF reference.
+    float inv_sqrt_d = rsqrt(float(k_dim));
+    output[(b * num_v_heads + vh) * v_dim + tid] = bfloat(q_dot * inv_sqrt_d);
+}
+
 kernel void gated_delta_rule_decode(
     device float        *h_state    [[buffer(0)]],
+    device const bfloat *query      [[buffer(1)]],
+    device const bfloat *key        [[buffer(2)]],
+    device const bfloat *value     [[buffer(3)]],
+    device const float  *gate       [[buffer(4)]],
+    device const float  *beta       [[buffer(5)]],
+    device bfloat       *output     [[buffer(6)]],
+    constant uint &batch_size       [[buffer(7)]],
+    constant uint &num_k_heads      [[buffer(8)]],
+    constant uint &num_v_heads      [[buffer(9)]],
+    constant uint &k_dim            [[buffer(10)]],
+    constant uint &v_dim            [[buffer(11)]],
+    uint  tg_idx    [[threadgroup_position_in_grid]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  simd_lane [[thread_index_in_simdgroup]],
+    uint  simd_grp  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float smem_k[128];
+    threadgroup float smem_q[128];
+    threadgroup float norm_sums[4];
+    threadgroup float head_store[1];
+    gdr_decode_impl<float>(h_state, query, key, value, gate, beta, output,
+                           smem_k, smem_q, norm_sums, head_store,
+                           batch_size, num_k_heads, num_v_heads, k_dim, v_dim,
+                           tg_idx, tid, simd_lane, simd_grp);
+}
+
+kernel void gated_delta_rule_decode_f16(
+    device half         *h_state    [[buffer(0)]],
     device const bfloat *query      [[buffer(1)]],
     device const bfloat *key        [[buffer(2)]],
     device const bfloat *value      [[buffer(3)]],
@@ -53,112 +216,12 @@ kernel void gated_delta_rule_decode(
     uint  simd_lane [[thread_index_in_simdgroup]],
     uint  simd_grp  [[simdgroup_index_in_threadgroup]])
 {
-    // Flat 1-D grid: caller dispatches `num_v_heads * batch_size`
-    // threadgroups; we decode (vh, b) here. Metal forbids mixing
-    // scalar and uint3 position attributes in one entry point.
-    const uint vh = tg_idx % num_v_heads;
-    const uint b  = tg_idx / num_v_heads;
-    if (vh >= num_v_heads || b >= batch_size) {
-        return;
-    }
-    const uint head_repeat = num_v_heads / num_k_heads;
-    const uint kh = vh / head_repeat;
-
-    // H slice: [k_dim, v_dim] for this (batch, value_head)
-    device float *H = h_state + ((b * num_v_heads + vh) * k_dim * v_dim);
-    device const bfloat *q_ptr = query + (b * num_k_heads + kh) * k_dim;
-    device const bfloat *k_ptr = key   + (b * num_k_heads + kh) * k_dim;
-    device const bfloat *v_ptr = value + (b * num_v_heads + vh) * v_dim;
-
-    // Gate decay clamped to (0, 1) — same numeric guard as CUDA ref.
-    float g_raw = gate[b * num_v_heads + vh];
-    const float g  = fmin(fmax(g_raw, 1e-6f), 1.0f - 1e-6f);
-    const float bt = beta[b * num_v_heads + vh];
-
-    // Shared K and Q vectors (k_dim ≤ 128 here; sized for the
-    // Qwen3.5 GDN where k_dim = v_dim = 128).
     threadgroup float smem_k[128];
     threadgroup float smem_q[128];
-    if (tid < k_dim) {
-        smem_k[tid] = float(k_ptr[tid]);
-        smem_q[tid] = float(q_ptr[tid]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid >= v_dim) {
-        return;
-    }
-    float v_i = float(v_ptr[tid]);
-
-    // Step 1: hk_dot = sum_j H[j, tid] * k[j]
-    float hk_dot = 0.0f;
-    for (uint j = 0; j < k_dim; j += 4) {
-        float h0 = H[(j + 0) * v_dim + tid];
-        float h1 = H[(j + 1) * v_dim + tid];
-        float h2 = H[(j + 2) * v_dim + tid];
-        float h3 = H[(j + 3) * v_dim + tid];
-        hk_dot += h0 * smem_k[j] + h1 * smem_k[j + 1]
-                + h2 * smem_k[j + 2] + h3 * smem_k[j + 3];
-    }
-
-    // Step 2: gated residual value (HF reference order — decay applied
-    // before the correction term, then beta scales the residual).
-    float v_new_i = (v_i - g * hk_dot) * bt;
-
-    // Steps 3+4 fused: state update + output dot product in one pass.
-    // The norm-clamp sum of squares accumulates here too — the updated
-    // h values are already in registers, saving a third sweep over H.
-    float q_dot = 0.0f;
-    float local_sq = 0.0f;
-    for (uint j = 0; j < k_dim; j += 4) {
-        float h0 = H[(j + 0) * v_dim + tid];
-        float h1 = H[(j + 1) * v_dim + tid];
-        float h2 = H[(j + 2) * v_dim + tid];
-        float h3 = H[(j + 3) * v_dim + tid];
-        h0 = g * h0 + smem_k[j]     * v_new_i;
-        h1 = g * h1 + smem_k[j + 1] * v_new_i;
-        h2 = g * h2 + smem_k[j + 2] * v_new_i;
-        h3 = g * h3 + smem_k[j + 3] * v_new_i;
-        H[(j + 0) * v_dim + tid] = h0;
-        H[(j + 1) * v_dim + tid] = h1;
-        H[(j + 2) * v_dim + tid] = h2;
-        H[(j + 3) * v_dim + tid] = h3;
-        q_dot += h0 * smem_q[j] + h1 * smem_q[j + 1]
-               + h2 * smem_q[j + 2] + h3 * smem_q[j + 3];
-        local_sq += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3;
-    }
-
-    // ── SSM state-norm clamp (Stuffed Mamba mitigation) ──
-    // Block-wide reduction of the per-thread sums; if ||H||_F > MAX,
-    // scale the state down (rare — costs a re-read only when it fires).
-    {
-        // simdgroup (32-lane) sum, then cross-simdgroup reduction.
-        float warp_sum = simd_sum(local_sq);
-        threadgroup float norm_sums[4];
-        if (simd_lane == 0) {
-            norm_sums[simd_grp] = warp_sum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        threadgroup float head_norm_sq_storage;
-        if (simd_grp == 0) {
-            // 4 simdgroups for tg_size = 128.
-            float s = (tid < 4u) ? norm_sums[tid] : 0.0f;
-            s = simd_sum(s);
-            if (tid == 0) {
-                head_norm_sq_storage = s;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float head_norm_sq = head_norm_sq_storage;
-        if (head_norm_sq > SSM_STATE_MAX_NORM * SSM_STATE_MAX_NORM) {
-            float scale = SSM_STATE_MAX_NORM * rsqrt(head_norm_sq);
-            for (uint j = 0; j < k_dim; ++j) {
-                H[j * v_dim + tid] *= scale;
-            }
-        }
-    }
-
-    // Output scaled by 1/sqrt(k_dim) — matches CUDA + HF reference.
-    float inv_sqrt_d = rsqrt(float(k_dim));
-    output[(b * num_v_heads + vh) * v_dim + tid] = bfloat(q_dot * inv_sqrt_d);
+    threadgroup float norm_sums[4];
+    threadgroup float head_store[1];
+    gdr_decode_impl<half>(h_state, query, key, value, gate, beta, output,
+                           smem_k, smem_q, norm_sums, head_store,
+                           batch_size, num_k_heads, num_v_heads, k_dim, v_dim,
+                           tg_idx, tid, simd_lane, simd_grp);
 }

@@ -349,8 +349,17 @@ pub(super) fn build(
         && cfg.k_head_dim_lin == 128
         && cfg.v_head_dim_lin == 128
         && !layers.iter().any(layer_has_planar);
+    // FP16 GDN state: the recurrent state is norm-clamped to ≤1000
+    // (well inside half range) and moves ~300 MB per decoded token
+    // across the 48 GDN layers — halving it is a direct decode win.
+    // The math stays FP32 in-kernel; the example drivers keep their
+    // own f32 buffers on the f32 entry points. Decode and prefill
+    // kernel variants must agree — both key off this flag.
+    let gdn_f16 = std::env::var("ATLAS_METAL_GDN_F16")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let prefill_kernels = if batched_ok {
-        match super::prefill::PrefillKernels::resolve(gpu.as_ref()) {
+        match super::prefill::PrefillKernels::resolve(gpu.as_ref(), gdn_f16) {
             Ok(k) => Some(k),
             Err(e) => {
                 tracing::warn!("batched prefill kernels unavailable — per-token prefill: {e:#}");
@@ -363,6 +372,14 @@ pub(super) fn build(
         );
         None
     };
+
+    if gdn_f16 {
+        kernels.gdn_dec = gpu.kernel("gated_delta_rule_decode", "gated_delta_rule_decode_f16")?;
+    }
+    tracing::info!(
+        "MetalGgufModel: GDN state dtype {}",
+        if gdn_f16 { "f16" } else { "f32" }
+    );
 
     let fwd = alloc_forward_bufs(gpu.as_ref(), &cfg, max_seq_len, prefill_kernels.is_some())?;
 
@@ -416,6 +433,7 @@ pub(super) fn build(
         max_seq_len: max_seq_len as u32,
         max_batch,
         kv_dtype,
+        gdn_f16,
         fwd: Mutex::new(fwd),
         free_slots: Mutex::new((0..max_batch).rev().collect()),
         states: Mutex::new(HashMap::new()),

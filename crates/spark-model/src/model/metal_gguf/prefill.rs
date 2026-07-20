@@ -43,7 +43,9 @@ pub(crate) struct PrefillKernels {
 }
 
 impl PrefillKernels {
-    pub(super) fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
+    /// `gdn_f16` must match the model's GDN-state dtype — the prefill
+    /// and decode kernels share the per-slot state buffers.
+    pub(super) fn resolve(gpu: &dyn GpuBackend, gdn_f16: bool) -> Result<Self> {
         Ok(Self {
             attn: gpu.kernel("attention_prefill", "attention_prefill_offset")?,
             kvap: gpu.kernel("kv_cache_append", "kv_cache_append_batch")?,
@@ -51,7 +53,14 @@ impl PrefillKernels {
             gate_beta: gpu.kernel("gdn_helpers", "gdn_gate_beta_batch")?,
             conv: gpu.kernel("causal_conv1d_prefill", "causal_conv1d_prefill_l2norm")?,
             conv_state: gpu.kernel("causal_conv1d_prefill", "causal_conv1d_prefill_state")?,
-            gdn: gpu.kernel("gated_delta_rule_prefill", "gated_delta_rule_prefill")?,
+            gdn: gpu.kernel(
+                "gated_delta_rule_prefill",
+                if gdn_f16 {
+                    "gated_delta_rule_prefill_f16"
+                } else {
+                    "gated_delta_rule_prefill"
+                },
+            )?,
             silu: gpu.kernel("silu_gate", "silu_gate")?,
             sigmoid: gpu.kernel("sigmoid_gate", "sigmoid_gate")?,
             cast_half: gpu.kernel("gdn_helpers", "bf16_to_half_rows")?,

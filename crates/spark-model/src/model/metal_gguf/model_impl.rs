@@ -365,15 +365,17 @@ impl Model for MetalGgufModel {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let conv_bytes = (self.cfg.qkv_total_lin() * self.cfg.conv_kernel_size) as usize * 4;
-            let gdn_floats = (self.cfg.num_v_heads_lin
+            let gdn_elem = if self.gdn_f16 { 2 } else { 4 };
+            let gdn_bytes = (self.cfg.num_v_heads_lin
                 * self.cfg.k_head_dim_lin
-                * self.cfg.v_head_dim_lin) as usize;
+                * self.cfg.v_head_dim_lin) as usize
+                * gdn_elem;
             let lin = (0..n_lin)
                 .map(|_| -> Result<LinearAttentionState> {
                     let conv1d_state = self.gpu.alloc(conv_bytes)?;
-                    let gdn_state = self.gpu.alloc(gdn_floats * 4)?;
+                    let gdn_state = self.gpu.alloc(gdn_bytes)?;
                     self.gpu.memset(conv1d_state, 0, conv_bytes)?;
-                    self.gpu.memset(gdn_state, 0, gdn_floats * 4)?;
+                    self.gpu.memset(gdn_state, 0, gdn_bytes)?;
                     Ok(LinearAttentionState {
                         conv1d_state,
                         gdn_state,

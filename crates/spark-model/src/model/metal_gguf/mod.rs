@@ -344,6 +344,9 @@ pub struct MetalGgufModel {
     pub(crate) max_seq_len: u32,
     pub(crate) max_batch: usize,
     pub(crate) kv_dtype: MetalKvDtype,
+    /// GDN recurrent state stored as FP16 (2 bytes/elem instead of 4);
+    /// the f16 decode/prefill kernel variants are swapped in at init.
+    pub(crate) gdn_f16: bool,
     pub(crate) fwd: Mutex<ForwardBufs>,
     pub(crate) free_slots: Mutex<Vec<usize>>,
     pub(crate) states: Mutex<HashMap<usize, SlotState>>,
