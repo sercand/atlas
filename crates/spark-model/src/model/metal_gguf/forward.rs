@@ -270,13 +270,14 @@ impl MetalGgufModel {
         Ok(())
     }
 
-    /// Final RMSNorm + packed LM-head GEMV from the residual in
-    /// `bufs.x_buf` into logits row `row` (`[vocab]` BF16). Does NOT
+    /// Final RMSNorm + packed LM-head GEMV from the residual row at
+    /// `x` into logits row `row` (`[vocab]` BF16). Does NOT
     /// synchronize — the consumers do (`argmax_of` commits + waits;
     /// `copy_logits_to_host` syncs the default stream before reading).
     pub(super) fn write_logits(
         &self,
         bufs: &ForwardBufs,
+        x: DevicePtr,
         row: DevicePtr,
         stream: u64,
     ) -> Result<()> {
@@ -289,7 +290,7 @@ impl MetalGgufModel {
             &[
                 KernelArg::Bytes(&self.cfg.hidden.to_le_bytes()),
                 KernelArg::Bytes(&self.cfg.rms_eps.to_le_bytes()),
-                KernelArg::Buffer(bufs.x_buf),
+                KernelArg::Buffer(x),
                 KernelArg::Buffer(self.final_norm),
                 KernelArg::Buffer(bufs.x_final),
             ],

@@ -13,10 +13,11 @@
 //! scheduler drives.
 //!
 //! Simplifications vs the CUDA path (deliberate, v1):
-//! - Single-token forward only: prefill walks the prompt through the
-//!   decode-shaped forward one position at a time; `decode_batch` runs
-//!   sequences serially. Correct, and decode is weight-bandwidth-bound
-//!   anyway; batched-prefill GEMM is a follow-up.
+//! - Decode is single-token; `decode_batch` runs sequences serially
+//!   (weight-bandwidth-bound, so serial decode is the honest shape).
+//!   Prefill is token-BATCHED (`prefill.rs`: staged embeds → q1 GEMM
+//!   tiles → chunked GDN/conv kernels) when the config allows, with a
+//!   per-token fallback for planar weights / quantized KV.
 //! - No speculative / MTP / LoRA / prefix-cache / paged-KV — those trait
 //!   methods stub exactly like `NllbGpuModel`'s.
 //! - KV is a contiguous per-slot cache (`LayerKvCache`), allocated at
@@ -49,6 +50,7 @@ use crate::traits::Model;
 mod forward;
 mod init;
 mod model_impl;
+mod prefill;
 mod vision;
 
 /// A dense BF16 `[N, K]` weight driven through the `dense_gemv_bf16`
@@ -316,12 +318,18 @@ pub(crate) struct ForwardBufs {
     /// Host mirrors filled by the CPU embed dequant before the upload.
     pub stage_host: Vec<u8>,
     pub pos_host: Vec<u8>,
+    /// Token-batched prefill scratch (`None` when the batched path is
+    /// gated off — planar weights / non-BF16 KV / env kill-switch).
+    pub prefill: Option<prefill::PrefillBufs>,
 }
 
 pub struct MetalGgufModel {
     pub(crate) gpu: Box<dyn GpuBackend>,
     pub(crate) cfg: Qwen35ForwardConfig,
     pub(crate) kernels: Qwen35Kernels,
+    /// Batched-prefill kernel handles; `Some` iff the batched path is
+    /// enabled (BF16 KV, blocked weights, 128×128 GDN heads).
+    pub(crate) prefill_kernels: Option<prefill::PrefillKernels>,
     pub(crate) argmax: KernelHandle,
     pub(crate) layers: Vec<MetalLayer>,
     /// layer idx → ordinal among full-attention layers (KV slot index).

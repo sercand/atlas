@@ -237,6 +237,74 @@ impl GgufQ1Weight {
         self.gemv(gpu, up, y, stream)
     }
 
+    /// Prefill-path matmul `y[t] = W @ x[t]` for `t` staged token rows
+    /// (x `[T, K]`, y `[T, N]`). The kernel dequantizes 32-row weight
+    /// tiles into threadgroup half (amortized over 32 token columns)
+    /// and runs the MACs on the simdgroup-matrix pipe — packed bytes
+    /// stream once per 32 tokens AND the per-MAC ALU cost drops off
+    /// the scalar select/add pipe. Blocked byte order only.
+    pub fn gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        t: u32,
+        x: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        if self.planar {
+            bail!("q1_0_gemm has no planar variant (gate batched prefill off for planar)");
+        }
+        let kernel = gpu.kernel("q1_0_gemm", "q1_0_gemm")?;
+        gpu.launch_typed(
+            kernel,
+            [self.out_features.div_ceil(32) * t.div_ceil(128), 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&self.out_features.to_le_bytes()),
+                KernelArg::Bytes(&self.in_features.to_le_bytes()),
+                KernelArg::Bytes(&t.to_le_bytes()),
+                KernelArg::Buffer(self.packed),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(y),
+            ],
+        )
+    }
+
+    /// [`Self::gemm`] with the residual rows folded into the epilogue:
+    /// `y[t, n] = x_resid[t, n] + Σ_k W[n,k]·x[t, k]`.
+    pub fn gemm_resid(
+        &self,
+        gpu: &dyn GpuBackend,
+        t: u32,
+        x: DevicePtr,
+        x_resid: DevicePtr,
+        y: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        if self.planar {
+            bail!("q1_0_gemm_resid has no planar variant");
+        }
+        let kernel = gpu.kernel("q1_0_gemm", "q1_0_gemm_resid")?;
+        gpu.launch_typed(
+            kernel,
+            [self.out_features.div_ceil(32) * t.div_ceil(128), 1, 1],
+            [128, 1, 1],
+            0,
+            stream,
+            &[
+                KernelArg::Bytes(&self.out_features.to_le_bytes()),
+                KernelArg::Bytes(&self.in_features.to_le_bytes()),
+                KernelArg::Bytes(&t.to_le_bytes()),
+                KernelArg::Buffer(self.packed),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(x_resid),
+                KernelArg::Buffer(y),
+            ],
+        )
+    }
+
     /// Matvec with the residual-stream add folded into the epilogue:
     /// `y[n] = x_resid[n] + Σ_k W[n,k]·x[k]`.
     pub fn gemv_resid(

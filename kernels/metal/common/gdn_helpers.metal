@@ -97,6 +97,26 @@ kernel void gdn_gate_beta_batch(
     beta[gid] = 1.0f / (1.0f + exp(-float(b_raw[gid])));
 }
 
+// ── bf16 → half row cast (batched-prefill GEMM input) ───────────
+//
+// The prefill GEMM reads x as device HALF so its A fragments can
+// simdgroup_load straight from device memory (bf16 has no simdgroup
+// matrix type). One cast per gemm INPUT, hoisted out of the kernel's
+// row-tile loop. Elements past `n_valid` (token-tile padding rows the
+// GEMM may touch) are zero-filled so stray NaNs can't form.
+kernel void bf16_to_half_rows(
+    constant uint &n_valid   [[buffer(0)]],
+    constant uint &n_total   [[buffer(1)]],
+    device const bfloat *x   [[buffer(2)]],
+    device half         *out [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_total) {
+        return;
+    }
+    out[gid] = (gid < n_valid) ? half(float(x[gid])) : half(0.0f);
+}
+
 // ── sigmoid_bf16 → float ────────────────────────────────────────
 //
 //   out[i] = 1 / (1 + exp(-in[i]))

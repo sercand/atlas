@@ -146,10 +146,38 @@ fn load_lin_layer(
     })
 }
 
+/// Any packed-Q1 projection in the loader's row-planar byte order?
+/// (Planar has no GEMM kernel variant — it gates batched prefill off.)
+fn layer_has_planar(l: &MetalLayer) -> bool {
+    let p = |q: &MetalQw| matches!(q, MetalQw::Q1(w) if w.planar);
+    match l {
+        MetalLayer::Full(f) => {
+            p(&f.q_proj)
+                || p(&f.k_proj)
+                || p(&f.v_proj)
+                || p(&f.o_proj)
+                || p(&f.gate_proj)
+                || p(&f.up_proj)
+                || p(&f.down_proj)
+        }
+        MetalLayer::Linear(g) => {
+            p(&g.in_proj_a)
+                || p(&g.in_proj_b)
+                || p(&g.in_proj_qkv)
+                || p(&g.in_proj_z)
+                || p(&g.out_proj)
+                || p(&g.gate_proj)
+                || p(&g.up_proj)
+                || p(&g.down_proj)
+        }
+    }
+}
+
 fn alloc_forward_bufs(
     gpu: &dyn GpuBackend,
     cfg: &Qwen35ForwardConfig,
     max_seq_len: usize,
+    batched_prefill: bool,
 ) -> Result<ForwardBufs> {
     let bf16 = |n: u32| -> Result<DevicePtr> { gpu.alloc(n as usize * 2) };
     let f32b = |n: u32| -> Result<DevicePtr> { gpu.alloc(n as usize * 4) };
@@ -225,6 +253,15 @@ fn alloc_forward_bufs(
         stage_cap,
         stage_host: vec![0u8; stage_cap * cfg.hidden as usize * 2],
         pos_host: vec![0u8; stage_cap * 12],
+        prefill: if batched_prefill {
+            Some(super::prefill::PrefillBufs::alloc(
+                gpu,
+                cfg,
+                super::prefill::PREFILL_TILE.min(stage_cap),
+            )?)
+        } else {
+            None
+        },
     })
 }
 
@@ -300,16 +337,44 @@ pub(super) fn build(
     };
 
     let final_norm = norm_plus_one(gpu.as_ref(), store, "model.norm.weight")?;
-    let fwd = alloc_forward_bufs(gpu.as_ref(), &cfg, max_seq_len)?;
+
+    let kv_dtype = metal_kv_dtype(kv_dtype);
+    // Batched prefill: needs the GEMM kernels (blocked byte order), a
+    // BF16 KV cache, and register-resident GDN state (128×128 heads).
+    let batch_env = std::env::var("ATLAS_METAL_PREFILL_BATCH")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let batched_ok = batch_env
+        && kv_dtype == crate::forward::qwen3_5::MetalKvDtype::Bf16
+        && cfg.k_head_dim_lin == 128
+        && cfg.v_head_dim_lin == 128
+        && !layers.iter().any(layer_has_planar);
+    let prefill_kernels = if batched_ok {
+        match super::prefill::PrefillKernels::resolve(gpu.as_ref()) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!("batched prefill kernels unavailable — per-token prefill: {e:#}");
+                None
+            }
+        }
+    } else {
+        tracing::info!(
+            "batched prefill disabled (env={batch_env}, kv={kv_dtype:?}, planar or non-128 GDN dims)"
+        );
+        None
+    };
+
+    let fwd = alloc_forward_bufs(gpu.as_ref(), &cfg, max_seq_len, prefill_kernels.is_some())?;
 
     let max_batch = max_batch_size.max(1);
     let logits = gpu.alloc(2 * max_batch * cfg.vocab as usize * 2)?;
     let argmax_out = gpu.alloc(4 * max_batch)?;
 
-    let kv_dtype = metal_kv_dtype(kv_dtype);
     tracing::info!(
-        "MetalGgufModel: kv dtype {:?}, max_seq_len {max_seq_len}, max concurrent seqs {max_batch}",
-        kv_dtype
+        "MetalGgufModel: kv dtype {:?}, max_seq_len {max_seq_len}, max concurrent seqs {max_batch}, \
+         batched prefill {}",
+        kv_dtype,
+        if prefill_kernels.is_some() { "on" } else { "off" }
     );
 
     // Vision tower: present when the config declares one AND the mmproj
@@ -340,6 +405,7 @@ pub(super) fn build(
         gpu,
         cfg,
         kernels,
+        prefill_kernels,
         argmax,
         layers,
         kv_ord,

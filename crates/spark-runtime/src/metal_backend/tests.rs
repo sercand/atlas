@@ -14,6 +14,7 @@ mod parity_attention_full;
 mod parity_basic;
 mod parity_gdn;
 mod parity_norms;
+mod parity_prefill;
 mod parity_q1;
 mod parity_quant;
 mod parity_turbo;

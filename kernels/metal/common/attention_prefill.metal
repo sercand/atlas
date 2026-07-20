@@ -132,9 +132,12 @@ kernel void attention_prefill_offset(
     device bfloat       *out     [[buffer(10)]],
     uint  tg_idx  [[threadgroup_position_in_grid]],
     uint  tid     [[thread_position_in_threadgroup]],
-    uint  tg_size [[threads_per_threadgroup]])
+    uint  tg_size [[threads_per_threadgroup]],
+    uint  simd_lane [[thread_index_in_simdgroup]],
+    uint  simd_grp  [[simdgroup_index_in_threadgroup]])
 {
     threadgroup float scores[MAX_SEQ_PREFILL];
+    threadgroup float red[32];
     threadgroup float max_score;
     threadgroup float sum_exp;
 
@@ -152,47 +155,57 @@ kernel void attention_prefill_offset(
     // Causal cutoff: query m sits at absolute position pos_base + m
     // and may attend keys [0, pos_base + m] inclusive.
     uint cutoff = pos_base + m + 1u;
+    uint num_simds = (tg_size + 31u) / 32u;
 
-    // Stage 1: scores. Mask everything past the causal cutoff to -∞
-    // so the softmax exp drives them to 0.
-    for (uint s = tid; s < seq_len && s < MAX_SEQ_PREFILL; s += tg_size) {
-        if (s >= cutoff) {
-            scores[s] = -INFINITY;
-            continue;
-        }
+    // Stage 1: scores over the visible keys, tracking a running
+    // per-thread max (keys past the cutoff are never written — the
+    // later stages only walk [0, cutoff)).
+    float local_max = -INFINITY;
+    for (uint s = tid; s < cutoff && s < MAX_SEQ_PREFILL; s += tg_size) {
         float dot = 0.0f;
         for (uint d = 0; d < head_dim; ++d) {
             float qv = float(q[(m * num_heads + h) * head_dim + d]);
             float kvv = float(k[(s * num_kv_heads + kv_h) * head_dim + d]);
             dot += qv * kvv;
         }
-        scores[s] = dot * scale;
+        float sc = dot * scale;
+        scores[s] = sc;
+        local_max = max(local_max, sc);
+    }
+
+    // Stage 2: parallel max reduction (simd, then cross-simd).
+    float simd_max_v = simd_max(local_max);
+    if (simd_lane == 0) {
+        red[simd_grp] = simd_max_v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Stage 2: max reduction.
-    if (tid == 0) {
-        float mx = -INFINITY;
-        for (uint s = 0; s < seq_len; ++s) {
-            if (scores[s] > mx) mx = scores[s];
+    if (simd_grp == 0) {
+        float v0 = (tid < num_simds) ? red[tid] : -INFINITY;
+        v0 = simd_max(v0);
+        if (tid == 0) {
+            max_score = v0;
         }
-        max_score = mx;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Stage 3: exp(score - max).
-    for (uint s = tid; s < seq_len; s += tg_size) {
-        scores[s] = exp(scores[s] - max_score);
+    // Stage 3+4: exp(score - max) with a parallel sum reduction.
+    float local_sum = 0.0f;
+    for (uint s = tid; s < cutoff; s += tg_size) {
+        float e = exp(scores[s] - max_score);
+        scores[s] = e;
+        local_sum += e;
+    }
+    float simd_sum_v = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        red[simd_grp] = simd_sum_v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Stage 4: sum.
-    if (tid == 0) {
-        float sum = 0.0f;
-        for (uint s = 0; s < seq_len; ++s) {
-            sum += scores[s];
+    if (simd_grp == 0) {
+        float v0 = (tid < num_simds) ? red[tid] : 0.0f;
+        v0 = simd_sum(v0);
+        if (tid == 0) {
+            sum_exp = v0;
         }
-        sum_exp = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -200,7 +213,7 @@ kernel void attention_prefill_offset(
     float inv_sum = 1.0f / sum_exp;
     for (uint d = tid; d < head_dim; d += tg_size) {
         float acc = 0.0f;
-        for (uint s = 0; s < seq_len; ++s) {
+        for (uint s = 0; s < cutoff; ++s) {
             float vv = float(v[(s * num_kv_heads + kv_h) * head_dim + d]);
             acc += scores[s] * inv_sum * vv;
         }

@@ -92,12 +92,16 @@ impl MetalGgufModel {
             }
         }
         // Sub-chunk loop: stage up to `stage_cap` tokens of embeddings
-        // + positions in ONE host upload, then run the layer chain per
-        // token with no host writes in between — the per-token
-        // synchronize the old loop needed (embed h2d racing queued GPU
-        // reads of x_buf) disappears, so the GPU pipelines across
-        // token boundaries.
+        // + positions in ONE host upload, then run the staged tokens
+        // with no host writes in between — the per-token synchronize
+        // the old loop needed (embed h2d racing queued GPU reads of
+        // x_buf) disappears, so the GPU pipelines across tokens.
+        // With batched prefill enabled the staged rows go through the
+        // token-batched layer pass in tiles; otherwise one run_layers
+        // call per token.
         let row_bytes = self.cfg.hidden as usize * 2;
+        let batched = self.prefill_kernels.is_some() && bufs.prefill.is_some();
+        let mut last_x = bufs.x_buf;
         let mut off = 0usize;
         while off < chunk_len {
             let t0 = chunk_start + off;
@@ -114,21 +118,41 @@ impl MetalGgufModel {
                 })
                 .collect();
             self.stage_prefill_inputs(&mut bufs, st, &tokens[t0..t0 + n], &pos3, stream)?;
-            for i in 0..n {
-                self.run_layers(
-                    &bufs,
-                    st,
-                    bufs.x_stage.offset(i * row_bytes),
-                    bufs.pos_stage.offset(i * 12),
-                    (t0 + i) as u32,
-                    stream,
-                )?;
+            if batched {
+                let tile_cap = bufs.prefill.as_ref().expect("prefill bufs").tile;
+                let mut t = 0usize;
+                while t < n {
+                    let tn = (n - t).min(tile_cap);
+                    self.run_tile_batched(
+                        &bufs,
+                        st,
+                        bufs.x_stage.offset(t * row_bytes),
+                        bufs.pos_stage.offset(t * 12),
+                        (t0 + t) as u32,
+                        tn as u32,
+                        stream,
+                    )?;
+                    t += tn;
+                }
+                last_x = bufs.x_stage.offset((n - 1) * row_bytes);
+            } else {
+                for i in 0..n {
+                    self.run_layers(
+                        &bufs,
+                        st,
+                        bufs.x_stage.offset(i * row_bytes),
+                        bufs.pos_stage.offset(i * 12),
+                        (t0 + i) as u32,
+                        stream,
+                    )?;
+                }
+                last_x = bufs.x_buf;
             }
             off += n;
         }
         let row = self.prefill_logits_row(seq.slot_idx);
         if emit_logits {
-            self.write_logits(&bufs, row, stream)?;
+            self.write_logits(&bufs, last_x, row, stream)?;
         }
         drop(states);
         drop(bufs);
@@ -167,7 +191,7 @@ impl MetalGgufModel {
         let rope_pos = if st.next_pos > 0 { st.next_pos } else { pos };
         st.next_pos = rope_pos + 1;
         self.run_token(&mut bufs, st, token, pos, [rope_pos; 3], stream)?;
-        self.write_logits(&bufs, row, stream)?;
+        self.write_logits(&bufs, bufs.x_buf, row, stream)?;
         drop(states);
         drop(bufs);
         seq.tokens.push(token);
