@@ -327,13 +327,22 @@ pub fn forward_full_attention<Q: QuantWeights>(
             ],
         )?;
 
-        // attention_decode with seq_len = seq_len_attn. 128 threads —
-        // the kernel strides by tg_size; 32 lanes left 3/4 of each
-        // head's K-scan capacity idle.
+        // attention_decode with seq_len = seq_len_attn. The kernel
+        // strides its K-scan by tg_size; the grid is only num_heads
+        // threadgroups, so at long context the per-thread serial key
+        // walk dominates decode — scale the block with context (128
+        // measured best short, 512 recovers 2-4k contexts).
+        let attn_block: u32 = if seq_len_attn > 2048 {
+            1024
+        } else if seq_len_attn > 512 {
+            512
+        } else {
+            128
+        };
         gpu.launch_typed(
             k.attn,
             [cfg.num_heads, 1, 1],
-            [128, 1, 1],
+            [attn_block, 1, 1],
             0,
             stream,
             &[

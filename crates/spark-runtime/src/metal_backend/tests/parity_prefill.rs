@@ -728,3 +728,110 @@ fn metal_gdn_prefill_f16_matches_decode_f16_walk() {
         );
     }
 }
+
+/// The reworked `attention_decode` (staged q, parallel reductions,
+/// striped V pass) against a CPU softmax reference at every block size
+/// the host heuristic picks — the 512/1024-thread paths only run at
+/// 2-4k contexts, which the end-to-end suites never reach.
+#[test]
+fn metal_attention_decode_wide_blocks_match_cpu() {
+    let Some(backend) = maybe_backend() else {
+        return;
+    };
+    let kernel = backend
+        .kernel("attention_decode", "attention_decode")
+        .expect("kernel");
+
+    let seq_len = 2500u32;
+    let num_heads = 4u32;
+    let num_kv_heads = 2u32;
+    let head_dim = 64u32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let hd = head_dim as usize;
+
+    let q: Vec<half::bf16> = (0..(num_heads * head_dim) as usize)
+        .map(|i| half::bf16::from_f32(test_val(i)))
+        .collect();
+    let kk: Vec<half::bf16> = (0..(seq_len * num_kv_heads * head_dim) as usize)
+        .map(|i| half::bf16::from_f32(test_val(i * 3 + 1) * 0.2))
+        .collect();
+    let vv: Vec<half::bf16> = (0..(seq_len * num_kv_heads * head_dim) as usize)
+        .map(|i| half::bf16::from_f32(test_val(i * 7 + 2) * 0.2))
+        .collect();
+
+    let group = (num_heads / num_kv_heads) as usize;
+    let mut expected = vec![0f32; (num_heads * head_dim) as usize];
+    for h in 0..num_heads as usize {
+        let kv_h = h / group;
+        let mut scores = vec![0f32; seq_len as usize];
+        let mut mx = f32::NEG_INFINITY;
+        for s in 0..seq_len as usize {
+            let mut dot = 0f32;
+            for d in 0..hd {
+                dot += q[h * hd + d].to_f32()
+                    * kk[(s * num_kv_heads as usize + kv_h) * hd + d].to_f32();
+            }
+            scores[s] = dot * scale;
+            mx = mx.max(scores[s]);
+        }
+        let mut sum = 0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - mx).exp();
+            sum += *s;
+        }
+        for d in 0..hd {
+            let mut acc = 0f32;
+            for s in 0..seq_len as usize {
+                acc += scores[s] / sum
+                    * vv[(s * num_kv_heads as usize + kv_h) * hd + d].to_f32();
+            }
+            expected[h * hd + d] = acc;
+        }
+    }
+
+    let q_ptr = backend.alloc(q.len() * 2).expect("alloc");
+    let k_ptr = backend.alloc(kk.len() * 2).expect("alloc");
+    let v_ptr = backend.alloc(vv.len() * 2).expect("alloc");
+    let o_ptr = backend.alloc(q.len() * 2).expect("alloc");
+    backend.copy_h2d(&bf16_slice_to_bytes(&q), q_ptr).expect("h2d");
+    backend.copy_h2d(&bf16_slice_to_bytes(&kk), k_ptr).expect("h2d");
+    backend.copy_h2d(&bf16_slice_to_bytes(&vv), v_ptr).expect("h2d");
+
+    for block in [128u32, 512, 1024] {
+        backend
+            .launch_typed(
+                kernel,
+                [num_heads, 1, 1],
+                [block, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&seq_len.to_le_bytes()),
+                    KernelArg::Bytes(&num_heads.to_le_bytes()),
+                    KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
+                    KernelArg::Bytes(&head_dim.to_le_bytes()),
+                    KernelArg::Bytes(&scale.to_le_bytes()),
+                    KernelArg::Buffer(q_ptr),
+                    KernelArg::Buffer(k_ptr),
+                    KernelArg::Buffer(v_ptr),
+                    KernelArg::Buffer(o_ptr),
+                ],
+            )
+            .expect("launch attention_decode");
+        backend
+            .synchronize(backend.default_stream())
+            .expect("synchronize");
+        let mut o_raw = vec![0u8; q.len() * 2];
+        backend.copy_d2h(o_ptr, &mut o_raw).expect("d2h");
+        let actual = bytes_to_bf16_vec(&o_raw);
+        for i in 0..expected.len() {
+            let e = expected[i];
+            let a = actual[i].to_f32();
+            let tol = (e.abs() * 1e-2).max(3e-3);
+            assert!(
+                (e - a).abs() <= tol,
+                "block {block}, out[{i}]: expected {e}, got {a}"
+            );
+        }
+    }
+}
