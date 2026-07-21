@@ -50,13 +50,38 @@ impl MtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<usize> {
+        self.drafter_rows_impl(prompt_tokens, hiddens, 0, 1, state, ctx, stream)
+    }
+
+    /// Row/position generalization of the drafter prefill: appends drafter
+    /// rows at KV slots `row_base ..` with RoPE positions `pos_base ..`
+    /// (row r = pair `(embed(prompt_tokens[r+1]), hiddens row r)`, RoPE
+    /// `pos_base + r` = its sequence pair key + 1). Slots and positions are
+    /// decoupled because without drafter prefill the row space is COMPACTED
+    /// (slots dense, RoPE sequence-space with gaps — matching `forward_one`).
+    /// `row_base = 0, pos_base = 1` is the classic whole-prompt prefill;
+    /// the catch-up feed (ATLAS_MTP_CATCHUP) appends at `row_base = seq_len`
+    /// with the fed pairs' true sequence positions.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn drafter_rows_impl(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        row_base: usize,
+        pos_base: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
         let mtp_state = match state.as_any_mut().downcast_mut::<MtpProposerState>() {
             Some(s) => s,
             None => return Ok(0),
         };
-        // Only a fresh drafter (nothing proposed yet) can be prefilled; a
-        // non-zero seq_len means decode already started (or prefill ran).
-        if mtp_state.seq_len != 0 || prompt_tokens.len() < 2 {
+        // Rows must append exactly at the drafter's current length: for the
+        // classic prefill that means a fresh drafter (seq_len == 0); for the
+        // catch-up feed, row_base == seq_len. Anything else would leave a
+        // hole or overwrite live rows.
+        if mtp_state.seq_len != row_base || prompt_tokens.len() < 2 {
             return Ok(0);
         }
         let scratch = match self.prefill_scratch.as_ref() {
@@ -96,7 +121,7 @@ impl MtpHead {
         // Grow the drafter block table to cover all prefill slots up front.
         let mut kv_cache = self.kv_cache.lock();
         let bs = kv_cache.block_size();
-        let blocks_needed = (rows_total - 1) / bs + 1;
+        let blocks_needed = (row_base + rows_total - 1) / bs + 1;
         while mtp_state.block_table.len() < blocks_needed {
             mtp_state.block_table.push(kv_cache.alloc_block()?);
         }
@@ -209,14 +234,15 @@ impl MtpHead {
                 )?;
             }
 
-            // 6. RoPE positions i+1 and KV slots i, uploaded per chunk.
-            let positions: Vec<u32> = (0..c).map(|r| (done + r + 1) as u32).collect();
+            // 6. RoPE positions pos_base+r and KV slots row_base+r, uploaded
+            //    per chunk (decoupled — see fn docs).
+            let positions: Vec<u32> = (0..c).map(|r| (pos_base + done + r) as u32).collect();
             let pos_bytes =
                 unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, c * 4) };
             ctx.gpu.copy_h2d_async(pos_bytes, scratch.pos_dev, stream)?;
             let slots: Vec<i64> = (0..c)
                 .map(|r| {
-                    let i = done + r;
+                    let i = row_base + done + r;
                     (mtp_state.block_table[i / bs] as i64) * (bs as i64) + (i % bs) as i64
                 })
                 .collect();
@@ -266,7 +292,9 @@ impl MtpHead {
             done += c;
         }
 
-        mtp_state.seq_len = rows_total;
+        mtp_state.seq_len = row_base + rows_total;
+        // Last fed row has RoPE pos_base + rows_total - 1 = pair key + 1.
+        mtp_state.last_pair_key = Some(pos_base + rows_total - 2);
         tracing::info!(
             "MTP drafter prefill: {} positions ({} prompt tokens) in {:.1} ms",
             rows_total,

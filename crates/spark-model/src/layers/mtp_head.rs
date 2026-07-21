@@ -103,6 +103,12 @@ pub struct MtpProposerState {
     /// Number of drafts produced in the last propose() call.
     /// Used by after_verify to know how many entries to trim.
     pub last_num_drafted: usize,
+    /// Sequence-space pair key of the newest drafter row (a `forward_one`
+    /// call with RoPE position `p` writes pair key `p - 1`). `seq_len` alone
+    /// cannot locate the drafter in the sequence — without drafter prefill
+    /// the row space is compacted (accepted pairs only) and drifts from the
+    /// sequence position. `None` until the first row is written.
+    pub last_pair_key: Option<usize>,
 }
 
 impl ProposerState for MtpProposerState {
@@ -185,6 +191,10 @@ pub struct MtpHead {
     embed_from_argmax_k: KernelHandle,
     /// Fixed device buffer (4 bytes) for deferred draft token ID readback.
     draft_token_id_dev: DevicePtr,
+    /// Chain confidence of the last propose (f32 bits; min top-1 softmax
+    /// prob across drafts). Written by `forward_one` when
+    /// `draft_conf_tau() > 0`; reset to 1.0 at each propose start.
+    pub(super) last_conf_bits: std::sync::atomic::AtomicU32,
     // BF16/FP8 kernel handles (None if NVFP4 mode)
     dense_gemv_k: Option<KernelHandle>,
     dense_gemv_fp8w_k: Option<KernelHandle>,
@@ -291,6 +301,7 @@ impl DraftProposer for MtpHead {
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
+            last_pair_key: None,
         }))
     }
 
@@ -312,6 +323,9 @@ impl DraftProposer for MtpHead {
             .downcast_mut::<MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid MTP proposer state"))?;
 
+        // Reset chain confidence for this propose (forward_one mins into it).
+        self.last_conf_bits
+            .store(1.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
         let mut current_hidden = target_hidden;
@@ -372,8 +386,46 @@ impl DraftProposer for MtpHead {
         self.prefill_drafter_impl(prompt_tokens, hiddens, state, ctx, stream)
     }
 
+    fn drafter_rows(&self, state: &mut dyn ProposerState) -> usize {
+        state
+            .as_any_mut()
+            .downcast_mut::<MtpProposerState>()
+            .map(|s| s.seq_len)
+            .unwrap_or(0)
+    }
+
+    fn last_pair_key(&self, state: &mut dyn ProposerState) -> Option<usize> {
+        state
+            .as_any_mut()
+            .downcast_mut::<MtpProposerState>()
+            .and_then(|s| s.last_pair_key)
+    }
+
+    fn catchup_drafter(
+        &self,
+        tokens: &[u32],
+        hiddens: DevicePtr,
+        row_base: usize,
+        pos_base: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        self.drafter_rows_impl(tokens, hiddens, row_base, pos_base, state, ctx, stream)
+    }
+
     fn read_deferred_draft_token(&self, gpu: &dyn GpuBackend) -> Result<u32> {
         self.read_deferred_draft_token(gpu)
+    }
+
+    fn last_confidence(&self) -> Option<f32> {
+        if crate::speculative::draft_conf_tau() <= 0.0 {
+            return None;
+        }
+        Some(f32::from_bits(
+            self.last_conf_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     fn after_verify(
@@ -397,6 +449,11 @@ impl DraftProposer for MtpHead {
         let old_sl = mtp_state.seq_len;
         if num_to_trim > 0 {
             mtp_state.seq_len = mtp_state.seq_len.saturating_sub(num_to_trim);
+            // Trimmed rows have consecutive pair keys; the newest surviving
+            // key moves back by the same count.
+            if let Some(k) = mtp_state.last_pair_key {
+                mtp_state.last_pair_key = Some(k.saturating_sub(num_to_trim));
+            }
         }
         tracing::debug!(
             "MTP after_verify: accepted={num_accepted} drafted={num_drafted} trim={num_to_trim} mtp_seq_len: {old_sl} → {}",
@@ -429,6 +486,7 @@ mod tests {
             block_table: vec![0, 1, 2],
             seq_len: 42,
             last_num_drafted: 0,
+            last_pair_key: None,
         });
         let mtp = state.as_any().downcast_ref::<MtpProposerState>().unwrap();
         assert_eq!(mtp.seq_len, 42);
