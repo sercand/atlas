@@ -517,8 +517,20 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                     // rather than aliasing the store — was missed, so
                                     // the leak only ever fired on the checkpoints whose
                                     // attention ships FP8.
-                                    if dense_bf16.weight != store.get(&format!("{prefix}.weight"))?.ptr
-                                    {
+                                    let key = format!("{prefix}.weight");
+                                    // Retire BEFORE the free so the alias check
+                                    // compares a LIVE pointer: once freed,
+                                    // `dense_bf16.weight` is a dangling value
+                                    // that would compare unequal to the store
+                                    // and wave through the very case the check
+                                    // exists to catch.
+                                    //
+                                    // With the BF16 gone and the NVFP4 built,
+                                    // the store's FP8 original has no reader —
+                                    // q/k/v/o across the attention layers, which
+                                    // the store otherwise holds until teardown.
+                                    store.retire(&key, &[dense_bf16.weight]);
+                                    if dense_bf16.weight != store.get(&key)?.ptr {
                                         gpu.free(dense_bf16.weight)?;
                                     }
                                     q

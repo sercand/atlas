@@ -211,6 +211,18 @@ skill. It is mandatory in this repo and encodes a real incident.
 7. **Thinking gates speculation OFF** (`!inside_thinking`). Any measurement
    without `reasoning_effort:"none"` measures a blend of the serial floor and the
    engine. `decode-floor` sets it for you.
+8. **Stop the server by PORT OWNER, not by process name — `stop.sh` beside this
+   file does it.** This bit once, and the failure is silent in the worst way:
+   `pkill -x spark` does not match the baseline binary copied to
+   `spark-baseline-…`, so the old server kept the port, the new one died in
+   preflight on "inference buffers alone need 6.96 GB but only 3.94 GB is free",
+   and `decode-floor` cheerfully measured the OLD binary while being recorded as
+   the new one. It was caught only because the two "different" builds produced
+   suspiciously identical numbers and the serve log was re-read. Two habits make
+   it non-silent: confirm the `pre-KV footprint` line in the NEW server's log
+   before benchmarking against it, and wait for the GPU memory to actually come
+   back — the listener closes well before teardown finishes sweeping ~1500
+   allocations.
 
 ---
 
@@ -233,10 +245,17 @@ Measured composition at 48.71 GiB (item 6 attribution, §3.2 profile, ledger):
 
 ### Item 6 — allocation labels + dump-at-end-of-load — **DONE, see §7**
 
-### Item 3 — per-tensor `WeightStore` release — **PARTIALLY DONE (−3.75 GiB)**
+### Item 3 — per-tensor `WeightStore` release — **DONE (−8.49 GiB)**
 
 Landed: `WeightStore::retire(name, copies)` + `free_retired(gpu)`, and retirement
-of the SSM `in_proj_qkv` / `in_proj_z` FP8 originals (96 tensors, 3.75 GiB).
+of 185 store tensors totalling 8.49 GiB:
+
+| tensors | GiB | what | retired at |
+|---:|---:|---|---|
+| 96 | 3.75 | SSM `in_proj_qkv` + `in_proj_z` FP8 | `qwen35_dense.rs`, after both consumers copy |
+| 64 | ~1.56 | attn q/k/v/o FP8 | the `CompressedTensors` `load_nvfp4` closure |
+| 24 | ~1.99 | MLP L56–63 FP8 tail | `quantized_from_fp8` |
+| 1 | 1.18 | `lm_head` FP8 | `loaders_b::load_lm_head` |
 
 Two corrections to the original plan:
 
@@ -250,12 +269,20 @@ Two corrections to the original plan:
   `[10240, 5120]` FP8 = 50 MiB; `in_proj_z` is `[6144, 5120]` = 30 MiB; together
   80 MiB/layer, matching the concat output size exactly.
 
-Still open here — the FP8/BF16 originals the plan also named, none yet traced to
-a proven-dead state: MLP L56–63 FP8 (1.99 GiB, `24 × 85 MiB`), `lm_head` FP8
-(1.18 GiB, `1 × 1212.5 MiB`), attn FP8 (~1.56 GiB), and the 2.37 GiB
-`weights.lm_head / dequant_fp8_blockscaled_to_bf16` BF16 dequant. Each needs the
-same treatment: find every consumer, prove it copied, retire, then run the poison
-probe below before trusting it.
+Deliberately NOT retired:
+
+* **SSM `out_proj` FP8** — `load_fp8_per_row` aliases it and, unlike the
+  `in_proj` pair, there is no concat to copy it away, so the alias stays live for
+  prefill for the model's lifetime.
+* **The 2.37 GiB `weights.lm_head / dequant_fp8_blockscaled_to_bf16` BF16
+  buffer** — that is the live head the logits GEMM reads, not a leftover. It is
+  a fair target for a *different* change (serve the head from NVFP4 and drop the
+  BF16), not for retirement.
+* **`quantized_any`'s `Bf16Raw` arm**, which frees a store pointer eagerly
+  (`nvfp4_detect.rs`). Converting it to `retire` would be tidier and would end a
+  latent double-free with `release`, but its eager free is load-bearing for PEAK
+  memory: the comment records a 35B BF16 MoE hitting ~109 GB pre-KV without it,
+  and deferred retirement would restore exactly that peak. Leave it.
 
 **Method — use the poison probe, it is the point.** `ATLAS_POISON_RETIRED_WEIGHTS=1`
 overwrites retired buffers with `0xA5` and does not free them. A use-after-free
@@ -310,8 +337,20 @@ cuBLASLt FP8 row-wise is dead on sm_121 (heuristic status 15).
 |---|---|---|---|---|---|---|
 | baseline (`cc165115`) | n/a — free-delta read 50.0 | 31.1 (31.2/31.1/31.0) | 604 | 400 | `run-1787001820494991508` | reference |
 | 6 — labels + report + tripwire | 48.71 | 31.1 (30.8/31.2/31.1) | 604 | 400 | `run-1787001983979160734` | **KEEP** — no memory change expected or seen; throughput unchanged |
-| 3 — retire SSM `in_proj` FP8 originals | **44.96** (−3.75) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002925279178569` | **KEEP** — −3.75 GiB, throughput unchanged, ratio 2.16x → 1.99x |
-| 3 — poison probe (control) | 48.71 (poisoned, not freed) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002817059208139` | safety gate: retired bytes overwritten with `0xA5` and output stayed correct ⇒ nothing reads them |
+| 3a — retire SSM `in_proj` FP8 originals | 44.96 (−3.75) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002925279178569` | superseded by 3b |
+| 3a — poison probe (control) | 48.71 (poisoned, not freed) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002817059208139` | safety gate passed |
+| 3b — + attn q/k/v/o, MLP tail, `lm_head` | **40.22** (−8.49) | **31.1** (median of 6) | 604 | 400 | `run-1787004106534527817`, `run-1787004166429407764` | **KEEP** — 185 tensors, −8.49 GiB, ratio 2.16x → 1.77x |
+| 3b — poison probe (control) | 48.71 (poisoned, not freed) | 31.3 (31.3/31.2/31.3) | 604 | 400 | `run-1787003363972615199` | safety gate passed |
+
+Item 3b A/B, both on a co-tenant-free box, `decode-floor` server tok/s:
+
+| | n | median | mean | sd |
+|---|---:|---:|---:|---:|
+| baseline (`cc165115`) | 12 | 31.10 | 30.98 | 0.27 |
+| item 3b | 6 | 31.10 | 31.12 | 0.04 |
+
+Identical medians; item 3b's mean is marginally higher and its spread smaller.
+No regression. 604 output tokens and 400 accepted drafts on every single run.
 
 Superseded: the pre-campaign `43.4 GiB / 31.3 tok/s` reference
 (`run-1787000030318474839`). Throughput reproduces (31.1 vs 31.3, within σ≈0.15×2).

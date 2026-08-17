@@ -325,6 +325,16 @@ pub(crate) fn quantized_from_fp8(
 ) -> Result<QuantizedWeight> {
     let bf16 = dequant_fp8_blockscaled_to_bf16(store, prefix, gpu)?;
     let result = quantize_to_nvfp4(&bf16, n, k, gpu, absmax_k, quantize_k, stream)?;
+    // The on-disk FP8 has now been copied twice over — dequantised to `bf16`,
+    // then requantised into `result` — and neither derivative points back at
+    // it, so the store's original has no reader. On the mixed-precision
+    // checkpoints that land here (an NVFP4 net with a tail of FP8 layers) that
+    // is the whole FP8 tail held resident until teardown for nothing.
+    //
+    // Retirement is DEFERRED, which is what makes this safe to put inside a
+    // helper: a second call for the same prefix during load still finds the
+    // tensor present, because nothing is freed until every loader has finished.
+    store.retire(&format!("{prefix}.weight"), &[bf16.weight, result.weight]);
     // Free the BF16 intermediate — only the NVFP4 result is needed.
     gpu.free(bf16.weight)?;
     Ok(result)
