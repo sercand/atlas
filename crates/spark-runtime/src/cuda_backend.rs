@@ -124,6 +124,11 @@ pub struct AtlasCudaBackend {
     /// `cuMemAlloc_v2` directly rather than through this allocator, so freeing
     /// the ledger cannot invalidate a static that outlives the model.
     live_allocs: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    /// DIAGNOSTIC ONLY (`ATLAS_ALLOC_HISTO=1`): ptr -> requested bytes, so the
+    /// live set can be reported as a size histogram. Empty and untouched unless
+    /// the env var is set, so the default path pays one bool check per alloc.
+    alloc_sizes: parking_lot::Mutex<std::collections::HashMap<u64, usize>>,
+    alloc_histo: bool,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -160,6 +165,8 @@ impl AtlasCudaBackend {
 
         Ok(Self {
             live_allocs: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            alloc_sizes: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            alloc_histo: std::env::var("ATLAS_ALLOC_HISTO").as_deref() == Ok("1"),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -176,6 +183,48 @@ impl AtlasCudaBackend {
 
     pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) {
         self.live_allocs.lock().remove(&ptr.0);
+        if self.alloc_histo {
+            self.alloc_sizes.lock().remove(&ptr.0);
+        }
+    }
+
+    /// DIAGNOSTIC (`ATLAS_ALLOC_HISTO=1`): note the requested size of `ptr`.
+    pub(crate) fn record_alloc_size(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
+        if self.alloc_histo {
+            self.alloc_sizes.lock().insert(ptr.0, bytes);
+        }
+    }
+
+    /// DIAGNOSTIC (`ATLAS_ALLOC_HISTO=1`): report the LIVE allocation set as a
+    /// histogram bucketed by exact request size, largest total first. Each
+    /// bucket names one tensor shape, so `count` reads as "how many layers×
+    /// copies of this tensor are resident" — which is the question a footprint
+    /// that exceeds the checkpoint by 2-3x actually poses.
+    pub fn dump_alloc_histo(&self, label: &str) {
+        if !self.alloc_histo {
+            return;
+        }
+        let sizes = self.alloc_sizes.lock();
+        let mut by_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for bytes in sizes.values() {
+            *by_size.entry(*bytes).or_insert(0) += 1;
+        }
+        let mut rows: Vec<(usize, usize)> = by_size.into_iter().collect();
+        rows.sort_by_key(|(bytes, count)| std::cmp::Reverse(bytes * count));
+        let total: usize = rows.iter().map(|(b, c)| b * c).sum();
+        tracing::warn!(
+            "ALLOC HISTO [{label}]: {} live allocations, {:.2} GiB total",
+            sizes.len(),
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        for (bytes, count) in rows.iter().take(30) {
+            tracing::warn!(
+                "  {:>8.2} GiB = {:>4} x {:>10.2} MiB",
+                (bytes * count) as f64 / (1024.0 * 1024.0 * 1024.0),
+                count,
+                *bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
     }
 
     /// Free every allocation this backend made and nobody released.
@@ -191,6 +240,7 @@ impl AtlasCudaBackend {
     /// ever sees what those missed — and each `free` here has already been
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
+        self.dump_alloc_histo("live set at sweep");
         let outstanding: Vec<u64> = self.live_allocs.lock().drain().collect();
         let count = outstanding.len();
         for raw in outstanding {

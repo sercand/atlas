@@ -119,6 +119,7 @@ impl GpuBackend for AtlasCudaBackend {
             );
         }
         self.record_alloc(DevicePtr(dptr));
+        self.record_alloc_size(DevicePtr(dptr), bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -133,6 +134,7 @@ impl GpuBackend for AtlasCudaBackend {
             );
         }
         self.record_alloc(DevicePtr(dptr));
+        self.record_alloc_size(DevicePtr(dptr), bytes);
         Ok(DevicePtr(dptr))
     }
 

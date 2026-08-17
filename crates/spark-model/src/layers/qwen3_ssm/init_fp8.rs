@@ -75,17 +75,35 @@ impl Qwen3SsmLayer {
     /// already in FP8 range) suitable for `fp8_gemm_n128`. Decode falls back to
     /// the NVFP4/BF16 paths via the existing `qkvz_nvfp4*` fields. PCND:
     /// caller decides whether to install — never set implicitly.
+    ///
+    /// Takes `gpu` to FREE whatever it displaces. `predequant_for_prefill` runs
+    /// FIRST and installs its own freshly-allocated `out_proj_fp8` (NVFP4 →
+    /// FP8); this setter then overwrote that pointer, and the buffer it dropped
+    /// on the floor was owned by nothing and freed by nothing until backend
+    /// teardown swept it. At Qwen3.8-27B that is [5120, 6144] = 30 MiB × 48 SSM
+    /// layers = 1.4 GiB stranded on every single load, with no flag needed to
+    /// trigger it.
     pub fn set_fp8_prefill_only_weights(
         &mut self,
         qkvz_fp8: Option<DevicePtr>,
         out_proj_fp8: Option<DevicePtr>,
-    ) {
-        if qkvz_fp8.is_some() {
-            self.qkvz_fp8 = qkvz_fp8;
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        // Guard on pointer inequality: installing the SAME buffer that is
+        // already in the field must not free the thing it is installing.
+        for (new, cur) in [
+            (qkvz_fp8, &mut self.qkvz_fp8),
+            (out_proj_fp8, &mut self.out_proj_fp8),
+        ] {
+            let Some(new) = new else { continue };
+            if let Some(old) = cur.replace(new)
+                && old != new
+                && !old.is_null()
+            {
+                gpu.free(old)?;
+            }
         }
-        if out_proj_fp8.is_some() {
-            self.out_proj_fp8 = out_proj_fp8;
-        }
+        Ok(())
     }
 
     /// Pre-dequant NVFP4 → FP8 for QKVZ and out_proj transposed weights.

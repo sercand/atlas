@@ -496,7 +496,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                 } else {
                                     let dense_bf16 =
                                         dense_auto(store, &format!("{prefix}.weight"), gpu)?;
-                                    quantize_to_nvfp4(
+                                    let q = quantize_to_nvfp4(
                                         &dense_bf16,
                                         full_n,
                                         full_k,
@@ -504,7 +504,24 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                         absmax_k,
                                         quantize_k,
                                         stream,
-                                    )?
+                                    )?;
+                                    // The BF16 dequant is ONLY the quantize input:
+                                    // prefill and decode both dispatch the NVFP4
+                                    // weight built above. Free it rather than retain a
+                                    // full BF16 copy of every q/k/v/o for the model's
+                                    // lifetime (Atlas issue #A1). The sibling
+                                    // `Standard | Fp8Dequanted` arm below has always
+                                    // done this; this arm — the one mixed-precision
+                                    // compressed-tensors checkpoints take, where
+                                    // `dense_auto` DEQUANTS FP8 into a fresh buffer
+                                    // rather than aliasing the store — was missed, so
+                                    // the leak only ever fired on the checkpoints whose
+                                    // attention ships FP8.
+                                    if dense_bf16.weight != store.get(&format!("{prefix}.weight"))?.ptr
+                                    {
+                                        gpu.free(dense_bf16.weight)?;
+                                    }
+                                    q
                                 };
                                 if tp_size == 1 {
                                     return Ok(src);
@@ -1334,18 +1351,37 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // `fp8_gemm_n128` kernel interprets the FP8 bytes as
                     // values directly (mirrors how `predequant_nvfp4_to_fp8`
                     // bakes `scale2` into the FP8 stream). PCND: gated.
+                    // Skip the QKVZ copy when the row-wise arm will shadow it on
+                    // every path that reads it — it is 80 MiB × 48 SSM layers =
+                    // 3.75 GiB of buffer that no kernel ever touches:
+                    //   * prefill  — `trait_prefill_proj.rs` tests
+                    //     `qkvz_fp8w_rowwise` (:74) BEFORE `qkvz_fp8` (:309)
+                    //   * batched decode — `trait_decode_batched.rs` takes the
+                    //     NVFP4 `_t` arm above `:444` unless
+                    //     ATLAS_NO_QKVZ_NVFP4_DECODE is set, so honour that
+                    //     kill-switch here or the fallback it re-enables is gone.
+                    // out_proj gets NO such skip: `trait_decode_batched.rs:1087`
+                    // reads `out_proj_fp8` for real, so dropping it would change
+                    // batched-verify numerics rather than just free memory.
+                    let qkvz_fp8_dead = qkvz_rowwise.is_some()
+                        && std::env::var_os("ATLAS_NO_QKVZ_NVFP4_DECODE").is_none();
                     let (qkvz_fp8_prefill, out_proj_fp8_prefill) =
                         if let Some(b2f_k) = bf16_to_fp8_k {
-                            let qkvz_total = (qkvz_size * h) as u32;
-                            let qkvz_fp8 = gpu.alloc(qkvz_size * h)?;
-                            crate::layers::ops::bf16_to_fp8(
-                                gpu,
-                                b2f_k,
-                                qkvz_dense.weight,
-                                qkvz_fp8,
-                                qkvz_total,
-                                stream,
-                            )?;
+                            let qkvz_fp8 = if qkvz_fp8_dead {
+                                None
+                            } else {
+                                let qkvz_total = (qkvz_size * h) as u32;
+                                let qkvz_fp8 = gpu.alloc(qkvz_size * h)?;
+                                crate::layers::ops::bf16_to_fp8(
+                                    gpu,
+                                    b2f_k,
+                                    qkvz_dense.weight,
+                                    qkvz_fp8,
+                                    qkvz_total,
+                                    stream,
+                                )?;
+                                Some(qkvz_fp8)
+                            };
                             let out_total = (h * value_dim) as u32;
                             let out_fp8 = gpu.alloc(h * value_dim)?;
                             crate::layers::ops::bf16_to_fp8(
@@ -1357,7 +1393,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                 stream,
                             )?;
                             gpu.synchronize(stream)?;
-                            (Some(qkvz_fp8), Some(out_fp8))
+                            (qkvz_fp8, Some(out_fp8))
                         } else {
                             (None, None)
                         };
@@ -1400,7 +1436,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // `w4a16_gemm_t`. Decode batch paths keep their NVFP4
                     // fallback (the `qkvz_nvfp4*` fields above).
                     if qkvz_fp8_prefill.is_some() || out_proj_fp8_prefill.is_some() {
-                        layer.set_fp8_prefill_only_weights(qkvz_fp8_prefill, out_proj_fp8_prefill);
+                        layer.set_fp8_prefill_only_weights(
+                            qkvz_fp8_prefill,
+                            out_proj_fp8_prefill,
+                            gpu,
+                        )?;
                     }
                     // …and LAST, so it wins over both of the prefill installs
                     // above: the checkpoint's own per-row FP8, which reaches
