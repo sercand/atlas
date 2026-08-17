@@ -233,15 +233,36 @@ Measured composition at 48.71 GiB (item 6 attribution, §3.2 profile, ledger):
 
 ### Item 6 — allocation labels + dump-at-end-of-load — **DONE, see §7**
 
-### Item 3 — per-tensor `WeightStore` release *(~4.7 GiB)*
-Add `store.take(name)` (transfers ownership, caller frees) vs `store.alias(name)`
-(store keeps it). Free each FP8 original as its NVFP4 derivative is built. Dead
-immediately on this checkpoint: MLP L56–63 FP8 (1.99), `lm_head` FP8 (1.18), attn
-FP8 (1.56). **Careful:** under `ATLAS_FP8_ROWWISE=1` the SSM
-`in_proj_qkv`/`_z`/`out_proj` FP8 bytes ARE read at prefill for the model's
-lifetime — those must stay aliased. Getting this wrong is a use-after-free, not a
-wrong number. Item 6's attribution now names the 2.37 GiB `lm_head` BF16 dequant
-as a first-class target here too.
+### Item 3 — per-tensor `WeightStore` release — **PARTIALLY DONE (−3.75 GiB)**
+
+Landed: `WeightStore::retire(name, copies)` + `free_retired(gpu)`, and retirement
+of the SSM `in_proj_qkv` / `in_proj_z` FP8 originals (96 tensors, 3.75 GiB).
+
+Two corrections to the original plan:
+
+* **Trap 6 was over-broad.** It said the `ATLAS_FP8_ROWWISE` SSM
+  `in_proj_qkv`/`_z`/`out_proj` FP8 bytes are all read for the model's lifetime.
+  Only `out_proj` is: `load_fp8_per_row` aliases the store, but
+  `concat_fp8_per_row` `copy_d2d`s `in_proj_qkv` + `in_proj_z` into one fresh
+  `[Q|K|V|Z]` buffer and only that is kept. `out_proj` has no concat, so its
+  alias stays live and it must NOT be retired.
+* **The "unattributed 48 × 50 MiB = 2.34 GiB" bucket was `in_proj_qkv`.**
+  `[10240, 5120]` FP8 = 50 MiB; `in_proj_z` is `[6144, 5120]` = 30 MiB; together
+  80 MiB/layer, matching the concat output size exactly.
+
+Still open here — the FP8/BF16 originals the plan also named, none yet traced to
+a proven-dead state: MLP L56–63 FP8 (1.99 GiB, `24 × 85 MiB`), `lm_head` FP8
+(1.18 GiB, `1 × 1212.5 MiB`), attn FP8 (~1.56 GiB), and the 2.37 GiB
+`weights.lm_head / dequant_fp8_blockscaled_to_bf16` BF16 dequant. Each needs the
+same treatment: find every consumer, prove it copied, retire, then run the poison
+probe below before trusting it.
+
+**Method — use the poison probe, it is the point.** `ATLAS_POISON_RETIRED_WEIGHTS=1`
+overwrites retired buffers with `0xA5` and does not free them. A use-after-free
+otherwise reads bytes that merely happen to still be intact, so it passes every
+test and corrupts later; a stale reader of poison is wrong immediately. Retire,
+run the probe, check generation is coherent AND decode-floor still reports
+604/400, and only then trust the free.
 
 ### Item 4 — `out_proj` copy set *(~2.8 GiB)*
 192 × 30 MiB = 4 copies per SSM layer. Enumerate which are live — predequant FP8,
@@ -289,6 +310,8 @@ cuBLASLt FP8 row-wise is dead on sm_121 (heuristic status 15).
 |---|---|---|---|---|---|---|
 | baseline (`cc165115`) | n/a — free-delta read 50.0 | 31.1 (31.2/31.1/31.0) | 604 | 400 | `run-1787001820494991508` | reference |
 | 6 — labels + report + tripwire | 48.71 | 31.1 (30.8/31.2/31.1) | 604 | 400 | `run-1787001983979160734` | **KEEP** — no memory change expected or seen; throughput unchanged |
+| 3 — retire SSM `in_proj` FP8 originals | **44.96** (−3.75) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002925279178569` | **KEEP** — −3.75 GiB, throughput unchanged, ratio 2.16x → 1.99x |
+| 3 — poison probe (control) | 48.71 (poisoned, not freed) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002817059208139` | safety gate: retired bytes overwritten with `0xA5` and output stayed correct ⇒ nothing reads them |
 
 Superseded: the pre-campaign `43.4 GiB / 31.3 tok/s` reference
 (`run-1787000030318474839`). Throughput reproduces (31.1 vs 31.3, within σ≈0.15×2).

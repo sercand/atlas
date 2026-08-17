@@ -29,7 +29,9 @@ pub fn build_model(
     // weight pointer, and it used to be a local in `startup()` that was dropped
     // once the layers had copied pointers out of it: the memory stayed live
     // with nothing able to free it. The model owns it now, so `teardown` can.
-    store: WeightStore,
+    // `mut` so `free_retired` can release the tensors the loaders declared
+    // dead once every loader has run.
+    mut store: WeightStore,
     gpu: Box<dyn GpuBackend>,
     max_batch_tokens: usize,
     kv_block_size: usize,
@@ -352,12 +354,23 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
+    // Free the store tensors the loaders declared dead. Deliberately HERE and
+    // not inside the loaders: nothing is released while any loader could still
+    // read the store, so "retired then read" cannot happen. See
+    // `WeightStore::retire`.
+    //
+    // `checkpoint_bytes` is captured BEFORE this: it is the denominator of the
+    // footprint ratio and must keep meaning "what the checkpoint contains", not
+    // "what is left of it".
+    let checkpoint_bytes = store.total_bytes();
+    store.free_retired(gpu.as_ref())?;
+
     // Every allocation the model itself makes is done by this point and the KV
     // cache has not been sized yet, so this is the "pre-KV" footprint the
     // memory campaign tracks. Report it and check it against the checkpoint
     // BEFORE the KV budget arithmetic below consumes it — a leak here shows up
     // only as a smaller KV cache, which is why three of them shipped unnoticed.
-    mem_report::report_and_check(gpu.as_ref(), store.total_bytes())?;
+    mem_report::report_and_check(gpu.as_ref(), checkpoint_bytes)?;
 
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;

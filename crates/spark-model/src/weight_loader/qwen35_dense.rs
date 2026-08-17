@@ -1166,6 +1166,37 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     let out_proj_dense =
                         load_ssm_proj(&format!("{la}.out_proj"), h, dims.full_value_dim())?;
 
+                    // Both consumers of the on-disk in_proj_qkv / in_proj_z have
+                    // now COPIED out of them, so the store's originals are dead:
+                    //
+                    //   1. the row-wise prefill arm above — `load_fp8_per_row`
+                    //      aliases the store, but `concat_fp8_per_row` copy_d2d's
+                    //      both into one fresh [Q|K|V|Z] buffer and only that
+                    //      buffer is kept;
+                    //   2. `load_ssm_proj` here — for this checkpoint's per-row
+                    //      FP8 that is `dense_auto` -> `dequant_fp8_blockscaled_to_bf16`,
+                    //      a fresh BF16 allocation.
+                    //
+                    // At Qwen3.8-27B that is [10240,5120] + [6144,5120] FP8 =
+                    // 50 + 30 MiB per layer x 48 SSM layers = 3.75 GiB that
+                    // stayed resident for the model's lifetime with no reader.
+                    //
+                    // `out_proj` is deliberately NOT retired: `out_r` above is a
+                    // live ALIAS of the store tensor, held for prefill for the
+                    // model's lifetime. Retiring it would be a use-after-free.
+                    //
+                    // The pointer argument is the safety net rather than
+                    // decoration, and it guards consumer 2 specifically: whether
+                    // `dense_auto` copied or aliased is a property of the
+                    // checkpoint's dtype, not of this code. On a BF16 checkpoint
+                    // it returns the store pointer unchanged and `retire`
+                    // refuses. (That case also means the `gpu.free(qkv_dense)`
+                    // below is already freeing store memory — a separate
+                    // pre-existing hazard on BF16 GDN checkpoints, which this
+                    // check at least declines to compound.)
+                    store.retire(&format!("{la}.in_proj_qkv.weight"), &[qkv_dense.weight]);
+                    store.retire(&format!("{la}.in_proj_z.weight"), &[z_dense.weight]);
+
                     let qkvz_dense =
                         gpu_concat_rows(&qkv_dense, qkv_rows, &z_dense, z_rows, h, gpu)?;
                     // qkv/z BF16 are only inputs to the concat above; free them now
