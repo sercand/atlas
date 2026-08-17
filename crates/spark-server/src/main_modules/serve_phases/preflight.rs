@@ -297,6 +297,12 @@ pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
 ) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+    // BEFORE the backend exists: allocations made during its construction are
+    // in the ledger from the first one, and a flag set afterwards would silently
+    // miss them.
+    if args.mem_report {
+        spark_runtime::alloc_label::set_mem_report(true);
+    }
     let backend =
         spark_runtime::cuda_backend::AtlasCudaBackend::new(args.gpu_ordinal, &ptx_set.modules)
             .context("Failed to initialize CUDA backend")?;

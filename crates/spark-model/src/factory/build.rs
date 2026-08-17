@@ -20,6 +20,7 @@ use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
 mod kv_summary;
+mod mem_report;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -153,11 +154,33 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
-    let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
-    let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
-    let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
-    let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
-    let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
+    // `weights.*` scopes: every allocation made underneath one is attributed to
+    // it in `--mem-report`, and their sum is what the load-time
+    // weights-vs-checkpoint tripwire measures (`mem_report::report_and_check`).
+    // The prefix matters — the tripwire matches on `weights`, so a new loader
+    // entry point that forgets its scope silently shrinks the measured side of
+    // the ratio rather than tripping it. Keep them on the loader calls, where
+    // adding one is unavoidable when adding a call.
+    let mut layers = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.layers");
+        loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?
+    };
+    let embed = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.embedding");
+        loader.load_embedding(&store, &config, gpu.as_ref())?
+    };
+    let final_norm = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.final_norm");
+        loader.load_final_norm(&store, &config, gpu.as_ref())?
+    };
+    let lm_head = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.lm_head");
+        loader.load_lm_head(&store, &config, gpu.as_ref())?
+    };
+    let mtp_weights = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.mtp");
+        loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?
+    };
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
     // the Qwen-shaped `MtpWeights`. Load it via the V4-specific path and keep it
@@ -206,7 +229,14 @@ pub fn build_model(
              or use a checkpoint that ships an MTP head (e.g. `mtp.safetensors`)."
         );
     }
-    let vision_encoder = loader.load_vision_encoder(&store, &config, gpu.as_ref())?;
+    // NOT under `weights.*`: the ViT's dominant allocation is quadratic
+    // attention scratch sized from `--vision-max-pixels`, which is a function of
+    // the serve profile rather than of the checkpoint. Folding it into the
+    // weights ratio would make that ratio move when a flag moves.
+    let vision_encoder = {
+        let _s = spark_runtime::alloc_label::alloc_scope("vision_encoder");
+        loader.load_vision_encoder(&store, &config, gpu.as_ref())?
+    };
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
@@ -267,14 +297,17 @@ pub fn build_model(
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
     // ── Step 4: Create buffer arena ──
-    let buffers = BufferArena::new(
-        &config,
-        max_batch_tokens,
-        max_seq_len,
-        kv_block_size,
-        max_batch_size,
-        gpu.as_ref(),
-    )?;
+    let buffers = {
+        let _s = spark_runtime::alloc_label::alloc_scope("buffer_arena");
+        BufferArena::new(
+            &config,
+            max_batch_tokens,
+            max_seq_len,
+            kv_block_size,
+            max_batch_size,
+            gpu.as_ref(),
+        )?
+    };
 
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
@@ -319,6 +352,13 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
+    // Every allocation the model itself makes is done by this point and the KV
+    // cache has not been sized yet, so this is the "pre-KV" footprint the
+    // memory campaign tracks. Report it and check it against the checkpoint
+    // BEFORE the KV budget arithmetic below consumes it — a leak here shows up
+    // only as a smaller KV cache, which is why three of them shipped unnoticed.
+    mem_report::report_and_check(gpu.as_ref(), store.total_bytes())?;
+
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);

@@ -95,6 +95,18 @@ unsafe extern "C" {
 /// singleton reached through `AtlasRegistry::get()`; it is now loaded per model
 /// and propagated from here, so a swapped-in model cannot run the previous
 /// model's kernels. Dropping the last backend unloads them.
+/// One row of the live-allocation ledger.
+pub struct AllocInfo {
+    /// Bytes as REQUESTED, not as the driver rounded them. The histogram
+    /// buckets on this, and a bucket is only readable as "N copies of one
+    /// tensor" if the number is the tensor's own size.
+    pub bytes: usize,
+    /// Innermost `alloc_scope` active at request time. `Cow` so a static scope
+    /// label costs nothing to carry and only a backtrace-inferred name (which
+    /// `--mem-report` alone produces) allocates.
+    pub label: std::borrow::Cow<'static, str>,
+}
+
 pub struct AtlasCudaBackend {
     /// This model's kernel modules. `Arc` because the backend is cloned into
     /// the layers that launch kernels.
@@ -123,12 +135,15 @@ pub struct AtlasCudaBackend {
     /// (`cutlass.rs:246`) and FlashInfer (`flashinfer.rs:145`) call
     /// `cuMemAlloc_v2` directly rather than through this allocator, so freeing
     /// the ledger cannot invalidate a static that outlives the model.
-    live_allocs: parking_lot::Mutex<std::collections::HashSet<u64>>,
-    /// DIAGNOSTIC ONLY (`ATLAS_ALLOC_HISTO=1`): ptr -> requested bytes, so the
-    /// live set can be reported as a size histogram. Empty and untouched unless
-    /// the env var is set, so the default path pays one bool check per alloc.
-    alloc_sizes: parking_lot::Mutex<std::collections::HashMap<u64, usize>>,
-    alloc_histo: bool,
+    /// The ledger carries each allocation's SIZE and OWNER, not just its
+    /// pointer, and does so unconditionally. That is what makes "pre-KV is
+    /// 2.4x the checkpoint" a number the process can check against itself at
+    /// load time instead of a number a human has to go measure — three leaks
+    /// shipped because nothing watched that ratio. Cost is one `Cow` beside a
+    /// hash entry that already existed; the previous design hashed the pointer
+    /// twice (set + histogram map) whenever reporting was on, so this is
+    /// strictly cheaper there and equal when off.
+    live_allocs: parking_lot::Mutex<std::collections::HashMap<u64, AllocInfo>>,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -147,6 +162,13 @@ impl AtlasCudaBackend {
         // clean — upstream of the first kernel lookup, so the kernel audit
         // records only this model's modules. See `crate::run_metrics`.
         crate::run_metrics::reset_for_new_run();
+        // `--mem-report` sets the switch before we get here; the legacy env var
+        // is honoured too, so runs recorded against `ATLAS_ALLOC_HISTO=1` stay
+        // reproducible. Never turn it OFF here: that would let backend
+        // construction silently undo the flag.
+        if crate::alloc_label::mem_report_from_env() {
+            crate::alloc_label::set_mem_report(true);
+        }
         let registry = AtlasRegistry::load(ordinal, ptx_modules)
             .map_err(|e| anyhow::anyhow!("AtlasRegistry load failed: {e}"))?;
         let default_stream = registry.raw_stream();
@@ -164,9 +186,7 @@ impl AtlasCudaBackend {
         );
 
         Ok(Self {
-            live_allocs: parking_lot::Mutex::new(std::collections::HashSet::new()),
-            alloc_sizes: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            alloc_histo: std::env::var("ATLAS_ALLOC_HISTO").as_deref() == Ok("1"),
+            live_allocs: parking_lot::Mutex::new(std::collections::HashMap::new()),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -175,52 +195,98 @@ impl AtlasCudaBackend {
         })
     }
 
-    /// This model's kernel modules, for the paths that need the registry
-    /// directly rather than through `GpuBackend`.
-    pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr) {
-        self.live_allocs.lock().insert(ptr.0);
+    /// Enter `ptr` in the live ledger with its size and owning scope.
+    ///
+    /// Resolves the label BEFORE taking the lock: under `--mem-report` an
+    /// unlabelled large allocation costs a ~100 µs backtrace, and loaders
+    /// allocate from several threads.
+    pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
+        let label = crate::alloc_label::label_for(bytes);
+        self.live_allocs
+            .lock()
+            .insert(ptr.0, AllocInfo { bytes, label });
     }
 
     pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) {
         self.live_allocs.lock().remove(&ptr.0);
-        if self.alloc_histo {
-            self.alloc_sizes.lock().remove(&ptr.0);
-        }
     }
 
-    /// DIAGNOSTIC (`ATLAS_ALLOC_HISTO=1`): note the requested size of `ptr`.
-    pub(crate) fn record_alloc_size(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
-        if self.alloc_histo {
-            self.alloc_sizes.lock().insert(ptr.0, bytes);
-        }
+    /// Total bytes this backend has allocated and not freed.
+    ///
+    /// Always available — the ledger is unconditional. This is Atlas's OWN
+    /// footprint by construction, which is why it can be compared to the
+    /// checkpoint size without the co-tenant arithmetic that
+    /// `free_memory()`-based measures need.
+    pub fn live_alloc_bytes(&self) -> Option<usize> {
+        Some(self.live_allocs.lock().values().map(|a| a.bytes).sum())
     }
 
-    /// DIAGNOSTIC (`ATLAS_ALLOC_HISTO=1`): report the LIVE allocation set as a
-    /// histogram bucketed by exact request size, largest total first. Each
-    /// bucket names one tensor shape, so `count` reads as "how many layers×
-    /// copies of this tensor are resident" — which is the question a footprint
-    /// that exceeds the checkpoint by 2-3x actually poses.
-    pub fn dump_alloc_histo(&self, label: &str) {
-        if !self.alloc_histo {
+    /// Bytes held by allocations whose owning scope starts with `prefix`.
+    ///
+    /// The scale-free half of the load-time tripwire: weight-derived bytes are
+    /// a function of the checkpoint alone, whereas total pre-KV also contains
+    /// arenas and state pools that scale with batch size and would make a
+    /// whole-footprint ratio fire on legitimately large configs.
+    pub fn live_alloc_bytes_under(&self, prefix: &str) -> usize {
+        self.live_allocs
+            .lock()
+            .values()
+            .filter(|a| a.label.starts_with(prefix))
+            .map(|a| a.bytes)
+            .sum()
+    }
+
+    /// DIAGNOSTIC (`--mem-report`): report the LIVE allocation set two ways.
+    ///
+    /// By owner first — that is the actionable view, because a label names code
+    /// you can go delete. Then by exact request size, because a size bucket
+    /// names one tensor shape and its `count` reads as "how many copies of this
+    /// tensor are resident", which is the question a footprint that exceeds the
+    /// checkpoint by 2-3x actually poses. Neither view subsumes the other: the
+    /// owner view finds the leaking function, the size view proves how many
+    /// duplicates it made.
+    pub fn dump_alloc_histo(&self, tag: &str) {
+        if !crate::alloc_label::mem_report_enabled() {
             return;
         }
-        let sizes = self.alloc_sizes.lock();
+        let ledger = self.live_allocs.lock();
+        let total: usize = ledger.values().map(|a| a.bytes).sum();
+        let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        tracing::warn!(
+            "ALLOC HISTO [{tag}]: {} live allocations, {:.2} GiB total",
+            ledger.len(),
+            gib(total),
+        );
+
+        // ── by owner ──
+        let mut by_label: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for info in ledger.values() {
+            let e = by_label.entry(info.label.as_ref()).or_insert((0, 0));
+            e.0 += info.bytes;
+            e.1 += 1;
+        }
+        let mut label_rows: Vec<(&str, usize, usize)> =
+            by_label.into_iter().map(|(l, (b, c))| (l, b, c)).collect();
+        label_rows.sort_by_key(|(_, b, _)| std::cmp::Reverse(*b));
+        tracing::warn!("  -- by owner --");
+        for (label, bytes, count) in label_rows.iter().take(30) {
+            tracing::warn!("  {:>8.2} GiB = {:>4} allocs  {}", gib(*bytes), count, label);
+        }
+
+        // ── by exact request size ──
         let mut by_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-        for bytes in sizes.values() {
-            *by_size.entry(*bytes).or_insert(0) += 1;
+        for info in ledger.values() {
+            *by_size.entry(info.bytes).or_insert(0) += 1;
         }
         let mut rows: Vec<(usize, usize)> = by_size.into_iter().collect();
         rows.sort_by_key(|(bytes, count)| std::cmp::Reverse(bytes * count));
-        let total: usize = rows.iter().map(|(b, c)| b * c).sum();
-        tracing::warn!(
-            "ALLOC HISTO [{label}]: {} live allocations, {:.2} GiB total",
-            sizes.len(),
-            total as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
+        tracing::warn!("  -- by tensor size --");
         for (bytes, count) in rows.iter().take(30) {
             tracing::warn!(
                 "  {:>8.2} GiB = {:>4} x {:>10.2} MiB",
-                (bytes * count) as f64 / (1024.0 * 1024.0 * 1024.0),
+                gib(bytes * count),
                 count,
                 *bytes as f64 / (1024.0 * 1024.0),
             );
@@ -231,19 +297,26 @@ impl AtlasCudaBackend {
     ///
     /// The backstop for allocations no `ModelResource` covers — chiefly the
     /// loaders' fused weights, which are owned by layer structs rather than by
-    /// any pool. Returns how many were reclaimed and their total bytes is not
-    /// tracked (the driver does not report per-pointer size), so the count is
-    /// the diagnostic: a non-zero count after a clean teardown names how many
-    /// allocations have no owner.
+    /// any pool. Returns how many were reclaimed; the ledger now carries each
+    /// one's requested size, so the bytes are logged alongside the count — a
+    /// count alone cannot distinguish 160 stranded 30 MiB weights from 160
+    /// stranded scalars, and that distinction was the whole question.
     ///
     /// Runs LAST in teardown, after every `ModelResource::release`, so it only
     /// ever sees what those missed — and each `free` here has already been
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
         self.dump_alloc_histo("live set at sweep");
-        let outstanding: Vec<u64> = self.live_allocs.lock().drain().collect();
+        let outstanding: Vec<(u64, AllocInfo)> = self.live_allocs.lock().drain().collect();
         let count = outstanding.len();
-        for raw in outstanding {
+        let bytes: usize = outstanding.iter().map(|(_, a)| a.bytes).sum();
+        if count > 0 {
+            tracing::warn!(
+                "sweep: {count} unreleased allocations, {:.2} GiB",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+        for (raw, _) in outstanding {
             // Bypass `free`: the ledger is already drained, and a failure here
             // must not abort the rest of the sweep.
             let status = unsafe { cuMemFree_v2(raw) };
