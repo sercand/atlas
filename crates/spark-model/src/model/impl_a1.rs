@@ -36,7 +36,14 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 /// `padded_n <= 4` is untouched and stays byte-identical, so C=1 is unaffected.
 /// The twin costs ~681 MB and leaves the KV pool at 4759 blocks vs 4757 without
 /// it — no measurable KV impact.
+///
+/// `--low-memory` also declines it: 681 MB for a win that only appears at high
+/// concurrency is the wrong trade when the goal is fitting the model on the
+/// card at all, and `padded_n <= 4` is byte-identical either way.
 fn lmhead_tgemm_enabled() -> bool {
+    if spark_runtime::alloc_label::low_memory() {
+        return false;
+    }
     std::env::var("ATLAS_NO_LMHEAD_TGEMM").ok().as_deref() != Some("1")
 }
 
