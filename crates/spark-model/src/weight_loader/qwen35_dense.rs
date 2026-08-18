@@ -1372,7 +1372,20 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         stream,
                     )?;
 
-                    let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
+                    // `--low-memory`: these transposed twins are a SECOND
+                    // resident layout of the same weights, kept only so prefill
+                    // gets coalesced N-dim reads. Both SSM prefill dispatchers
+                    // already fall through to the non-transposed `w4a16_gemm`
+                    // over the packed bytes when the twin is absent
+                    // (`trait_prefill_proj.rs` for qkvz,
+                    // `trait_prefill_helper.rs` for out_proj), so dropping them
+                    // is a space-for-bandwidth trade, not a numerics change.
+                    let lowmem = spark_runtime::alloc_label::low_memory();
+                    let qkvz_nvfp4_t = if lowmem {
+                        None
+                    } else {
+                        Some(qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?)
+                    };
 
                     let out_proj_nvfp4 = quantize_to_nvfp4(
                         &out_proj_dense,
@@ -1384,7 +1397,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         stream,
                     )?;
 
-                    let out_proj_nvfp4_t = out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
+                    let out_proj_nvfp4_t = if lowmem {
+                        None
+                    } else {
+                        Some(out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?)
+                    };
 
                     // Native FP8 SSM prefill GEMM: build a single-scale FP8
                     // copy of `qkvz_dense` [qkvz_size, h] and `out_proj_dense`
@@ -1466,8 +1483,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         post_attn_norm,
                         ffn,
                         Some(qkvz_nvfp4),
-                        Some(qkvz_nvfp4_t),
-                        Some(out_proj_nvfp4_t),
+                        qkvz_nvfp4_t,
+                        out_proj_nvfp4_t,
                         config,
                         gpu,
                     )?;

@@ -303,3 +303,20 @@ mod tests {
         ));
     }
 }
+
+/// `--low-memory` / `ATLAS_LOW_MEMORY=1`: trade prefill bandwidth for resident
+/// footprint.
+///
+/// Atlas keeps most projections resident in TWO layouts — the packed `[N,K]`
+/// form decode reads, plus a transpose or MMQ repack whose only purpose is
+/// coalesced N-dim reads during prefill (`kernels/gb10/common/w4a16_gemm.cu`
+/// documents the pair as identical math). On `unsloth/Qwen3.8-27B-NVFP4` the
+/// FFN's second layout alone is 8.96 GiB on top of a 21.81 GiB checkpoint,
+/// which is the difference between fitting a 24 GB card and not.
+///
+/// When set, the second layout is never built and prefill dispatches the
+/// non-transposed kernel over the same bytes decode uses.
+pub fn low_memory() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_LOW_MEMORY").as_deref() == Ok("1"))
+}

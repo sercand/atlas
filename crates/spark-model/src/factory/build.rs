@@ -441,11 +441,57 @@ pub fn build_model(
             );
         }
     }
+    // ── OOM SAFETY ──
+    //
+    // On GB10 the "GPU" pool IS system RAM: `total_memory()` reports 121.6 GB of
+    // LPDDR5X shared with the OS, the page cache, and the safetensors mmap the
+    // loader just touched. The old clamp let the KV pool take every free byte
+    // (`actual_free - inference_reserve`), and the failure mode of getting that
+    // wrong on unified memory is not a clean CUDA OOM — it is a box that has to
+    // be power-cycled.
+    //
+    // Two corrections:
+    //
+    //  1. Atlas's own footprint is the LARGER of the free-memory delta and the
+    //     allocation ledger. The delta alone is unreliable on a shared box (same
+    //     binary and profile, two runs: it read 48.5 then 52.1 GiB while the
+    //     ledger read 40.22 both times); the ledger alone misses process-lifetime
+    //     workspaces that call `cuMemAlloc` directly (CUTLASS, FlashInfer). Each
+    //     covers the other's blind spot, and `max` is the conservative choice —
+    //     over-stating our own footprint only shrinks the KV pool.
+    //
+    //  2. A HOST RESERVE that is never handed out, so the kernel and page cache
+    //     keep a floor. It also absorbs a co-tenant that grows AFTER we size the
+    //     pool, which is not hypothetical: the vLLM sharing this box moved
+    //     21 -> 37 GiB inside a single session.
+    if let Some(ledger) = gpu.live_alloc_bytes()
+        && ledger > used_so_far
+    {
+        tracing::info!(
+            "KV budget: allocation ledger reports {:.1} GB vs free-delta {:.1} GB              for Atlas's own footprint — using the ledger (larger is the safe side)",
+            gib(ledger),
+            gib(used_so_far),
+        );
+        used_so_far = ledger;
+    }
+    let host_reserve = std::env::var("ATLAS_HOST_RESERVE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|gb| *gb >= 0.0)
+        .map(|gb| (gb * 1024.0 * 1024.0 * 1024.0) as usize)
+        .unwrap_or_else(|| std::cmp::max(12 * 1024 * 1024 * 1024, total_mem / 8));
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
+    let safe_free = actual_free.saturating_sub(host_reserve);
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
         .saturating_sub(inference_reserve)
-        .min(actual_free.saturating_sub(inference_reserve));
+        .min(safe_free.saturating_sub(inference_reserve));
+    tracing::info!(
+        "KV budget safety: {:.1} GB free now, holding back {:.1} GB host reserve          (ATLAS_HOST_RESERVE_GB) → at most {:.1} GB allocatable",
+        gib(actual_free),
+        gib(host_reserve),
+        gib(safe_free),
+    );
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -502,7 +548,41 @@ pub fn build_model(
                     (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let budget_blocks = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            // ── Cap the pool to what this configuration can actually USE ──
+            //
+            // `compute_num_blocks` divides the whole remaining budget by the
+            // block size, so the pool always swells to fill whatever is left.
+            // That is how freeing weight memory made things WORSE rather than
+            // better: every GiB reclaimed from the weights went straight into a
+            // bigger KV pool, and on unified memory the pool is bounded only by
+            // a free-memory reading that is itself unreliable.
+            //
+            // A configuration cannot use more than
+            // `max_batch_size × ceil(max_seq_len / block_size)` blocks to hold
+            // its declared concurrency at full context. Prefix caching DOES
+            // benefit from extra blocks (they retain reusable prefixes rather
+            // than being recycled), so allow a multiple of that working set —
+            // but a multiple, not the whole machine. At
+            // `--max-seq-len 2048 --max-batch-size 2` the working set is 256
+            // blocks and the old sizing handed out 102773.
+            let working_set = max_batch_size * max_seq_len.div_ceil(kv_block_size);
+            let reuse_factor = std::env::var("ATLAS_KV_REUSE_FACTOR")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|f| *f >= 1)
+                .unwrap_or(4);
+            // +1 dummy slot for OOB-safe paged-kernel reads.
+            let useful_blocks = working_set.saturating_mul(reuse_factor).saturating_add(1);
+            let n = budget_blocks.min(useful_blocks);
+            if n < budget_blocks {
+                tracing::info!(
+                    "KV cache capped to {n} blocks ({} seq × {} blocks/seq × {reuse_factor}x                      prefix-cache reuse + 1); the budget would have allowed {budget_blocks}                      ({:.1} GB), which this config can never use. Raise                      ATLAS_KV_REUSE_FACTOR for a larger prefix cache.",
+                    max_batch_size,
+                    max_seq_len.div_ceil(kv_block_size),
+                    kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
             let max_kv_tokens = n * kv_block_size;
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
@@ -692,5 +772,18 @@ pub fn build_model(
     // to happen — orphaned the memory: live, referenced by the layers, with
     // nothing owning the ability to release it.
     model.adopt_weight_store(store);
+
+    // The REAL resident footprint. `pre-KV` above is measured before the KV
+    // cache, the lm_head transposed twin, the SSM/Marconi pools, the MTP head
+    // and the GDN prefill buffers exist, so quoting it as "what the model
+    // costs" understates the process by several GiB. This is the number to
+    // compare against a card's capacity.
+    model.gpu_backend().dump_alloc_histo("post-load (everything resident)");
+    if let Some(total) = model.gpu_backend().live_alloc_bytes() {
+        tracing::info!(
+            "post-load footprint: {:.2} GiB resident in total",
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
     Ok(Box::new(model))
 }

@@ -245,9 +245,9 @@ pub(crate) fn load_dense_ffn(
                 gate_proj: gate,
                 up_proj: up,
                 down_proj: down,
-                gate_proj_t: Some(gate.transpose_for_gemm(gpu, inter, h)?),
-                up_proj_t: Some(up.transpose_for_gemm(gpu, inter, h)?),
-                down_proj_t: Some(down.transpose_for_gemm(gpu, h, inter)?),
+                gate_proj_t: t_or_none(&gate, gpu, inter, h)?,
+                up_proj_t: t_or_none(&up, gpu, inter, h)?,
+                down_proj_t: t_or_none(&down, gpu, h, inter)?,
             })
         }
         Nvfp4Variant::Bf16Raw => {
@@ -298,9 +298,9 @@ pub(crate) fn load_dense_ffn(
                 gate_proj: gate,
                 up_proj: up,
                 down_proj: down,
-                gate_proj_t: Some(gate.transpose_for_gemm(gpu, inter, h)?),
-                up_proj_t: Some(up.transpose_for_gemm(gpu, inter, h)?),
-                down_proj_t: Some(down.transpose_for_gemm(gpu, h, inter)?),
+                gate_proj_t: t_or_none(&gate, gpu, inter, h)?,
+                up_proj_t: t_or_none(&up, gpu, inter, h)?,
+                down_proj_t: t_or_none(&down, gpu, h, inter)?,
             })
         }
         _ => {
@@ -360,9 +360,9 @@ pub(crate) fn load_dense_ffn(
                 gate_proj: gate,
                 up_proj: up,
                 down_proj: down,
-                gate_proj_t: Some(gate.transpose_for_gemm(gpu, inter, h)?),
-                up_proj_t: Some(up.transpose_for_gemm(gpu, inter, h)?),
-                down_proj_t: Some(down.transpose_for_gemm(gpu, h, inter)?),
+                gate_proj_t: t_or_none(&gate, gpu, inter, h)?,
+                up_proj_t: t_or_none(&up, gpu, inter, h)?,
+                down_proj_t: t_or_none(&down, gpu, h, inter)?,
             })
         }
     }
@@ -451,4 +451,29 @@ pub(crate) fn interleave_ba(
     let buf = gpu.alloc(ba_size * row_bytes)?;
     gpu.copy_h2d(&ba_cpu, buf)?;
     Ok(DenseWeight { weight: buf })
+}
+
+/// The transposed `[K/2, N]` twin of an NVFP4 projection — or `None` under
+/// `--low-memory`.
+///
+/// The twin exists purely so prefill gets coalesced N-dim reads;
+/// `kernels/gb10/common/w4a16_gemm.cu` documents `w4a16_gemm` and
+/// `w4a16_gemm_t` as the same math over the two layouts. So dropping it is a
+/// pure space-for-bandwidth trade, not a correctness or numerics change:
+/// `DenseFfnLayer::w4a16_prefill_gemm` already falls through to the
+/// non-transposed `w4a16_gemm` over the SAME bytes decode reads whenever the
+/// twin is absent.
+///
+/// On unsloth/Qwen3.8-27B-NVFP4 the FFN twin (and the MMQ repack that replaces
+/// it) is 8.96 GiB on top of a 21.81 GiB checkpoint.
+fn t_or_none(
+    w: &QuantizedWeight,
+    gpu: &dyn GpuBackend,
+    n: usize,
+    k: usize,
+) -> Result<Option<QuantizedWeight>> {
+    if spark_runtime::alloc_label::low_memory() {
+        return Ok(None);
+    }
+    Ok(Some(w.transpose_for_gemm(gpu, n, k)?))
 }

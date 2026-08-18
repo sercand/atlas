@@ -545,6 +545,13 @@ impl DenseFfnLayer {
         if self.q2_weights.is_some() {
             return Ok(());
         }
+        // `--low-memory`: the MMQ repack is the FFN's SECOND resident layout.
+        // Skipping it leaves `w4a16_prefill_gemm` with no `wt`, so prefill falls
+        // through to the non-transposed `w4a16_gemm` over the packed bytes
+        // decode already reads — one layout instead of two.
+        if spark_runtime::alloc_label::low_memory() {
+            return Ok(());
+        }
         let active = self.nvfp4_mmq_nc_k.0 != 0
             && self.nvfp4_quant_act_k.0 != 0
             && self.nvfp4_repack_k.0 != 0
