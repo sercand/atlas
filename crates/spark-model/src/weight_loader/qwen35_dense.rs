@@ -1149,7 +1149,19 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // way; the NVFP4 build continues underneath because decode
                     // still needs it — `w8a16_gemv` cannot index a per-row
                     // scale. See weight_loader/qwen35_dense/rowwise_fp8.rs.
-                    let rowwise_gdn = rowwise_fp8::rowwise_fp8_enabled()
+                    // `--low-memory` declines the row-wise prefill arm. It is a
+                    // QUALITY feature, not a speed one: it keeps the SSM
+                    // projections at checkpoint precision through prefill instead
+                    // of dequant->requantising them to NVFP4, and
+                    // `rowwise_fp8.rs` records what the double-quant cost when it
+                    // was last measured (BFCL-ST non_live 85.4 -> 76.6). It buys
+                    // that with a full extra FP8 copy of in_proj — 80 MiB x 48
+                    // layers = 3.75 GiB. On a card where the model would not
+                    // otherwise fit, no accuracy is available at all, so the
+                    // flag trades it back; prefill then runs the NVFP4 qkvz that
+                    // decode already uses (`trait_prefill_proj.rs`).
+                    let rowwise_gdn = !spark_runtime::alloc_label::low_memory()
+                        && rowwise_fp8::rowwise_fp8_enabled()
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_qkv"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_z"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.out_proj"));
@@ -1208,6 +1220,14 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // check at least declines to compound.)
                     store.retire(&format!("{la}.in_proj_qkv.weight"), &[qkv_dense.weight]);
                     store.retire(&format!("{la}.in_proj_z.weight"), &[z_dense.weight]);
+                    // `out_proj` is retirable ONLY when the row-wise arm declined
+                    // to alias it. With that arm active (the default) the alias
+                    // is live for prefill for the model's lifetime and retiring
+                    // it would be a use-after-free — which is why this is keyed
+                    // on the same condition rather than on a guess.
+                    if qkvz_rowwise.is_none() {
+                        store.retire(&format!("{la}.out_proj.weight"), &[out_proj_dense.weight]);
+                    }
 
                     let qkvz_dense =
                         gpu_concat_rows(&qkv_dense, qkv_rows, &z_dense, z_rows, h, gpu)?;
@@ -1423,8 +1443,16 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // out_proj gets NO such skip: `trait_decode_batched.rs:1087`
                     // reads `out_proj_fp8` for real, so dropping it would change
                     // batched-verify numerics rather than just free memory.
-                    let qkvz_fp8_dead = qkvz_rowwise.is_some()
-                        && std::env::var_os("ATLAS_NO_QKVZ_NVFP4_DECODE").is_none();
+                    // Under `--low-memory` the FP8 prefill copy is dead too:
+                    // with the row-wise arm declined above, prefill falls through
+                    // to the NVFP4 qkvz rather than to this. Without this clause,
+                    // turning the row-wise arm off would simply hand the 3.75 GiB
+                    // back to a different buffer — which is exactly what
+                    // ATLAS_FP8_ROWWISE=0 does today, and why that flag saves
+                    // nothing.
+                    let qkvz_fp8_dead = spark_runtime::alloc_label::low_memory()
+                        || (qkvz_rowwise.is_some()
+                            && std::env::var_os("ATLAS_NO_QKVZ_NVFP4_DECODE").is_none());
                     let (qkvz_fp8_prefill, out_proj_fp8_prefill) =
                         if let Some(b2f_k) = bf16_to_fp8_k {
                             let qkvz_fp8 = if qkvz_fp8_dead {
