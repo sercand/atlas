@@ -341,6 +341,82 @@ cuBLASLt FP8 row-wise is dead on sm_121 (heuristic status 15).
 | 3a — poison probe (control) | 48.71 (poisoned, not freed) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002817059208139` | safety gate passed |
 | 3b — + attn q/k/v/o, MLP tail, `lm_head` | **40.22** (−8.49) | **31.1** (median of 6) | 604 | 400 | `run-1787004106534527817`, `run-1787004166429407764` | **KEEP** — 185 tensors, −8.49 GiB, ratio 2.16x → 1.77x |
 | 3b — poison probe (control) | 48.71 (poisoned, not freed) | 31.3 (31.3/31.2/31.3) | 604 | 400 | `run-1787003363972615199` | safety gate passed |
+| **OOM FIX + `--low-memory`** | **23.19** | 31.0 | 668 | 437 | `run-1787036307538411135` | **KEEP** — see below |
+
+### The number that matters is POST-LOAD, not pre-KV
+
+`pre-KV` is measured before the KV cache, the lm_head twin, the SSM/Marconi
+pools, the MTP head and the GDN prefill buffers exist, so it understates the
+process by several GiB. The `post-load footprint` line is what to compare
+against a card's capacity.
+
+| | post-load | note |
+|---|---:|---|
+| before this work | **99.72 GiB** | KV pool had expanded to fill the budget |
+| KV capped + one weight layout | 32.04 GiB | |
+| + lm_head twin declined | 31.37 GiB | |
+| + SSM prefill from NVFP4 | 26.21 GiB | `--max-seq-len 2048 --max-batch-size 2` |
+| single-user profile | **24.71 GiB** | `--max-batch-size 1 --ssm-cache-slots 2` |
+
+Weights resident are now **21.56 GiB against a 21.81 GiB checkpoint** (0.99x) —
+the FP8 half is served as NVFP4 instead of alongside it.
+
+### THE OOM (why the box needed a hard restart)
+
+`compute_num_blocks` divided the whole remaining budget by the block size, with
+no cap. At `--max-seq-len 2048 --max-batch-size 2` the working set is 256 blocks
+and it allocated 102773 (50.2 GB). That made memory work *counterproductive*:
+every GiB freed from the weights was absorbed by a bigger KV pool. Across this
+campaign's probes post-load went 71.1 -> 77.8 -> 84.0 -> 86.5 -> 99.7 GiB while
+pre-KV was falling. On unified memory the "GPU" pool is system RAM shared with
+the kernel and page cache, so the failure mode is a box that must be
+power-cycled, not a clean CUDA OOM.
+
+Now: the pool is capped at
+`max_batch_size x blocks_per_seq x ATLAS_KV_REUSE_FACTOR` (default 4) + 1, and
+`ATLAS_HOST_RESERVE_GB` (default max(12 GiB, total/8)) is never allocated.
+Atlas's own footprint for the budget is `max(free-delta, ledger)` — each covers
+the other's blind spot.
+
+**When testing serve configs, run `watch_mem.sh` (beside this file) first.** It
+kills the server if MemAvailable falls below a floor, so a mis-sized pool
+degrades to a dead server instead of a dead machine.
+
+### `--low-memory` / `ATLAS_LOW_MEMORY=1`
+
+| what it declines | saves | cost |
+|---|---:|---|
+| FFN MMQ repack + `_t` twins | 8.97 GiB | none measured (TTFT 1990 vs 1996 ms at isl 1536) |
+| SSM qkvz_t + out_proj_t | 2.90 GiB | none measured; 604/400 unchanged |
+| lm_head transposed twin | 0.67 GiB | ~4% decode under speculative verify |
+| row-wise SSM prefill arm | 5.16 GiB | **quality**: BFCL-ST non_live 85.4 -> 76.6 when last measured |
+
+The first three are pure space-for-bandwidth trades:
+`kernels/gb10/common/w4a16_gemm.cu:16-19` documents `w4a16_gemm` and
+`w4a16_gemm_t` as the same math, and every prefill dispatcher already falls back
+to the non-transposed kernel when the twin is absent. The fourth is a real
+accuracy trade and the only one in this campaign.
+
+**Not taken: the attention q/k/v/o twins + fused [q|k|v] concat (0.88 GiB).**
+Prefill does fall back, but decode-floor moved from 604 tok / 400 accepted to
+1091 / 679 — the model produced different text for a fixed prompt at
+temperature 0. The transposed and packed attention paths are not bit-identical.
+0.88 GiB does not justify an unvalidated numerics change.
+
+**`ATLAS_FP8_ROWWISE=0` alone saves nothing** (40.21 vs 40.22 GiB): turning the
+row-wise arm off re-enables an equally sized `qkvz_fp8`. Both must be suppressed,
+which is what `qkvz_fp8_dead` now does.
+
+### Still on the table
+
+* 2.37 GiB BF16 lm_head — the NVFP4 head serves decode, but the BF16 has readers
+  in `impl_a3`, `decode_b2`, `lm_head_batched` and `impl_lora`'s tied-embedding
+  pointer check. Too many paths to free for 2.37 GiB without deeper analysis.
+* 1.41 GiB SSM `out_proj` FP8 predequant — batched decode reads it at
+  `trait_decode_batched.rs:1087`.
+
+Together they would put weights near 17.8 GiB, i.e. unsloth's stated 17-19 GB
+envelope.
 
 Item 3b A/B, both on a co-tenant-free box, `decode-floor` server tok/s:
 
