@@ -549,7 +549,27 @@ impl DenseFfnLayer {
         // Skipping it leaves `w4a16_prefill_gemm` with no `wt`, so prefill falls
         // through to the non-transposed `w4a16_gemm` over the packed bytes
         // decode already reads — one layout instead of two.
-        if spark_runtime::alloc_label::low_memory() {
+        //
+        // `ATLAS_LOW_MEMORY_FFN_MMQ=1` buys the repack back while keeping the
+        // rest of `--low-memory`. It exists because the two layouts
+        // `--low-memory` declines are NOT the same size or the same value:
+        //
+        // MEASURED 2026-08-18, Qwen3.8-27B-Uncensored-Q6_K (GGUF → Bf16Raw,
+        // GB10, 0.45 util, n=3 each, only the `--speculative` flags differing):
+        // with the repack skipped, speculative decode accepted 713/1024 drafts
+        // (70%) yet moved the rate not at all — 7.3–9.0 tok/s with MTP vs
+        // 7.4–9.0 without. Draft acceptance that high buying nothing means the
+        // K+1 verify step costs about what K serial steps cost, which is what a
+        // batched GEMM with no transposed/MMQ layout to read looks like. The
+        // repack is ~8.96 GiB on this model against the 31.88 GiB BF16 FFN
+        // snapshot the loader declines under the same flag — so on a box that
+        // fits one but not both, this is the one worth keeping.
+        //
+        // Default OFF: turning it on unconditionally would hand every existing
+        // `--low-memory` NVFP4 user 8.96 GiB of footprint they did not ask for.
+        if spark_runtime::alloc_label::low_memory()
+            && std::env::var("ATLAS_LOW_MEMORY_FFN_MMQ").as_deref() != Ok("1")
+        {
             return Ok(());
         }
         let active = self.nvfp4_mmq_nc_k.0 != 0

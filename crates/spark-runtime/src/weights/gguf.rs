@@ -294,6 +294,26 @@ impl super::WeightLoader for GgufLoader {
             );
         }
 
+        // MTP / "next-N" predictor block index. llama.cpp counts the predictor
+        // in `block_count` and puts it last, so it sits at
+        // `block_count - nextn_predict_layers` (Qwen3.8-27B: 65 - 1 = 64).
+        // `None` when the file ships no predictor, which keeps every
+        // single-stack GGUF on the exact path it took before.
+        let mtp_block = match (
+            bb_gguf.get_u64(&format!("{arch}.block_count")),
+            bb_gguf.get_u64(&format!("{arch}.nextn_predict_layers")),
+        ) {
+            (Some(blocks), Some(nextn)) if nextn > 0 && blocks > nextn => {
+                let first = (blocks - nextn) as usize;
+                tracing::info!(
+                    "GGUF carries {nextn} MTP predictor block(s) at blk.{first}; \
+                     mapping to the mtp.* namespace for speculative decode"
+                );
+                Some(first)
+            }
+            _ => None,
+        };
+
         // ── Optional mmproj vision-tower sidecar ──
         // Open it (if present) up front so the pre-flight OOM check covers both
         // files. mmaps are virtual, so holding two at once costs no RAM.
@@ -312,9 +332,10 @@ impl super::WeightLoader for GgufLoader {
         });
 
         // Pre-flight: combined BF16 footprint of both files.
-        let mut est = sidecar::est_bf16(&bb_gguf, &arch);
+        let mut est = sidecar::est_bf16(&bb_gguf, &arch, mtp_block);
         if let (Some((_, _, mm_gguf)), Some(mm_arch)) = (mmproj.as_ref(), mmproj_arch.as_ref()) {
-            est += sidecar::est_bf16(mm_gguf, mm_arch);
+            // The clip tower never carries a predictor block.
+            est += sidecar::est_bf16(mm_gguf, mm_arch, None);
         }
         preflight_oom(gpu, est, oom_reserve_bytes, self.peak_memory_multiplier)?;
 
@@ -329,6 +350,7 @@ impl super::WeightLoader for GgufLoader {
             &bb_mmap,
             &arch,
             gdn,
+            mtp_block,
             force_cpu,
             native_q2,
             q2_group,
@@ -353,6 +375,7 @@ impl super::WeightLoader for GgufLoader {
                 &mm_gguf,
                 &mm_mmap,
                 &mm_arch,
+                None,
                 None,
                 force_cpu,
                 false,

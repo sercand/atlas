@@ -311,7 +311,37 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             // Keep-packed projections are 2-bit blocks, not BF16 — there is
             // nothing to snapshot (dense_auto has no PackedQ2_0 arm and would
             // abort the load), and the ffn_q2 arm below owns their compute.
-            let ffn_bf16_snapshot = if !ffn_q2 && matches!(variant, Nvfp4Variant::Bf16Raw) {
+            // `--low-memory` declines the snapshot. It is the FFN's SECOND full
+            // resident layout — BF16 gate/up/down on top of the NVFP4 copies
+            // `load_dense_ffn` builds — and it buys PREFILL SPEED only: with it
+            // absent, `forward_prefill` falls through the BF16 arm to the
+            // w4a16 arm over the very NVFP4 weights decode already reads (the
+            // Bf16Raw arm of `quantized_any` runtime-quantizes for real, so
+            // those weights are present, not the NULL placeholders a
+            // BF16-native layer carries). Same trade, same reasoning as
+            // `DenseFfnLayer::finalize_nvfp4_mmq_load`'s low-memory bail.
+            //
+            // MEASURED 2026-08-18 on Qwen3.8-27B-Uncensored-Q6_K (GGUF →
+            // Bf16Raw, 64 dense-FFN layers at intermediate_size 17408): the
+            // snapshot is 192 × 170 MiB = 31.88 GiB of the 61.58 GiB pre-KV
+            // footprint — by far the largest single owner, and enough on its own
+            // to leave a 121.6 GiB GB10 with no room for a KV cache.
+            //
+            // Flag OFF is byte-identical to the previous behaviour, so the
+            // Holo/Ornith Bf16Raw checkpoints this snapshot was written for keep
+            // their fast BF16 tensor-core prefill unchanged.
+            let low_memory = spark_runtime::alloc_label::low_memory();
+            if low_memory && !ffn_q2 && matches!(variant, Nvfp4Variant::Bf16Raw) && i == 0 {
+                tracing::info!(
+                    "--low-memory: declining the dense-FFN BF16 prefill snapshot \
+                     (Bf16Raw). Prefill runs w4a16 over the NVFP4 weights decode \
+                     reads — one FFN layout instead of two."
+                );
+            }
+            let ffn_bf16_snapshot = if !low_memory
+                && !ffn_q2
+                && matches!(variant, Nvfp4Variant::Bf16Raw)
+            {
                 let inter = if config.intermediate_size > 0 {
                     config.intermediate_size
                 } else {

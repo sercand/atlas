@@ -18,8 +18,10 @@
 //! 1. **RMSNorm +1 offset.** llama.cpp stores the raw norm weight; Atlas
 //!    computes `x*(1+w)`, so it needs `w_hf = w_gguf - 1`. Applied to
 //!    `input_layernorm`, `post_attention_layernorm`, `self_attn.q_norm`,
-//!    `self_attn.k_norm` and the final `model.norm`. NOT the GDN `linear_attn.
-//!    norm` (that one matches the reference untouched).
+//!    `self_attn.k_norm`, the final `model.norm`, and the MTP head's own
+//!    `mtp.norm` / `mtp.pre_fc_norm_embedding` / `mtp.pre_fc_norm_hidden`.
+//!    NOT the GDN `linear_attn.norm` (that one matches the reference
+//!    untouched).
 //!
 //! 2. **SSM A recovery.** llama.cpp stores `ssm_a = -exp(A_log)`; Atlas's GDN
 //!    wants the raw `A_log`, so `A_log = ln(-ssm_a)` (element-wise; `ssm_a` is
@@ -124,6 +126,19 @@ enum Op {
 /// Classify a mapped HF tensor name into its transform, or `None` if untouched.
 fn classify(hf: &str) -> Option<Op> {
     if hf == "model.norm.weight"
+        // The MTP head's three own norms. The four it shares stems with
+        // (`mtp.layers.0.{input_layernorm, post_attention_layernorm,
+        // self_attn.q_norm, self_attn.k_norm}`) already match the suffix rules
+        // below; these three have no `.`-qualified analog in the main stack, so
+        // they need naming outright. All seven are the SAME +1 encoding —
+        // MEASURED 2026-08-18, GGUF minus `unsloth/Qwen3.8-27B-NVFP4` per-tensor
+        // means: enorm 0.5394-(-0.4606), hnorm 0.8428-(-0.1572),
+        // shared_head_norm 2.2520-1.2520, blk.64 attn_norm 1.0361-0.0361,
+        // post_attention_norm 1.2063-0.2063, attn_q_norm 1.7906-0.7906,
+        // attn_k_norm 1.7795-0.7795 — every one exactly +1.0000.
+        || hf == "mtp.norm.weight"
+        || hf == "mtp.pre_fc_norm_embedding.weight"
+        || hf == "mtp.pre_fc_norm_hidden.weight"
         || hf.ends_with(".input_layernorm.weight")
         || hf.ends_with(".post_attention_layernorm.weight")
         || hf.ends_with(".self_attn.q_norm.weight")
