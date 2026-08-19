@@ -166,6 +166,10 @@ impl GpuBackend for AtlasCudaBackend {
         AtlasCudaBackend::dump_alloc_histo(self, tag)
     }
 
+    fn dump_alloc_histo_forced(&self, tag: &str) {
+        AtlasCudaBackend::dump_alloc_histo_forced(self, tag)
+    }
+
     fn live_alloc_bytes(&self) -> Option<usize> {
         AtlasCudaBackend::live_alloc_bytes(self)
     }

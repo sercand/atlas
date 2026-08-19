@@ -249,6 +249,14 @@ impl AtlasCudaBackend {
         if !crate::alloc_label::mem_report_enabled() {
             return;
         }
+        self.dump_alloc_histo_forced(tag)
+    }
+
+    /// [`Self::dump_alloc_histo`] without the `--mem-report` gate, for
+    /// one-shot diagnostics that must work on a production serve (e.g. the
+    /// post-first-request footprint dump). Reads the ledger only — no
+    /// backtrace capture is enabled by calling this.
+    pub fn dump_alloc_histo_forced(&self, tag: &str) {
         let ledger = self.live_allocs.lock();
         let total: usize = ledger.values().map(|a| a.bytes).sum();
         let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);

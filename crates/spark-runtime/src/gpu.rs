@@ -116,6 +116,10 @@ pub trait GpuBackend: Send + Sync {
     /// and silence is the honest answer for the mock and for Metal.
     fn dump_alloc_histo(&self, _tag: &str) {}
 
+    /// [`Self::dump_alloc_histo`] without the `--mem-report` gate — for
+    /// one-shot diagnostics on a production serve. Same default silence.
+    fn dump_alloc_histo_forced(&self, _tag: &str) {}
+
     /// Total bytes in the live allocation ledger, or `None` if this backend
     /// does not keep one (zero would read as "nothing allocated", which is a
     /// different and false claim).

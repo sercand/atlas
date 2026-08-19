@@ -320,3 +320,20 @@ pub fn low_memory() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_LOW_MEMORY").as_deref() == Ok("1"))
 }
+
+/// `--low-memory` declines the dense-FFN MMQ repack (the FFN's SECOND
+/// resident layout — 192 copies, 8.96 GiB on the 27B) unless
+/// `ATLAS_LOW_MEMORY_FFN_MMQ=1` buys it back. SSOT for THREE call sites that
+/// must agree: `dense_ffn::finalize_nvfp4_mmq_load` (the eager build),
+/// `dense_ffn`'s `fp4mmq_prefill` runtime dispatch (whose lazy
+/// `ensure_nvfp4_mmq_weight` silently rebuilt everything the eager gate
+/// declined — the 2026-08-19 +9 GiB first-request incident), and
+/// `buffers::BufferSizes` (which sizes the single cycled repack scratch only
+/// when the resident copies were declined). Latched: env-stable for the
+/// process lifetime, and the hot prefill path must not re-read env.
+pub fn low_memory_ffn_mmq_declined() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        low_memory() && std::env::var("ATLAS_LOW_MEMORY_FFN_MMQ").as_deref() != Ok("1")
+    })
+}

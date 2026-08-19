@@ -515,3 +515,49 @@ claim is "no collapse", not "faster".
 Boot sensitivity that remains: free-at-boot must be ≥ ~54.5 GB for the
 free-term (`free − 12 host − 5.1 reserve ≥ 15.63`); observed 55.4–56.7 over a
 day. A fat-vllm boot self-heals via Restart=always + OVERCOMMIT=0.
+
+---
+
+## 10. 2026-08-19 — the first-request +9 GiB: the lazy MMQ rebuild, and a RETRACTION
+
+**Incident.** With §9 deployed, nvidia-smi showed the serve at 54.3 GiB against a
+43.8 GiB post-load ledger. Traced with a boot-time sampler + request-class probes:
+the process grew 46.6 → 55.8 GiB on the FIRST request of any kind, flat afterwards,
+and MemAvailable fell below the 12 GiB host floor. The new one-shot
+`post-first-request` footprint dump (ships unconditionally now; see
+`scheduler/lifecycle.rs` → `Model::log_runtime_footprint`) attributed it:
+**192 × 47.81 MiB = 8.96 GiB — the dense-FFN MMQ repack** `--low-memory` declines
+at load, **rebuilt lazily by `ensure_nvfp4_mmq_weight` on the first prefill**
+(plus ~1.5 GiB of that arm's first-use scratch). The eager gate was in
+`finalize_nvfp4_mmq_load`; the runtime dispatch (`fp4mmq_prefill`) never looked.
+
+**RETRACTION.** The §"--low-memory" trade table's row "FFN MMQ repack + `_t`
+twins: saves 8.97 GiB, cost none measured (TTFT 1990 vs 1996 ms)" was wrong on
+both sides for the MMQ half: the memory was NOT saved at steady state (rebuilt on
+request #1), and the TTFT A/B measured nothing (both arms had lazily rebuilt the
+repack, so both ran the MMQ prefill). Mechanism named per the two-harness rule:
+the broken field was the load-time footprint standing in for the steady-state one.
+The REAL cost of running prefill without the repack, measured same-box same-serve
+one-variable (11,017-token prompt, n=3 each): **TTFT 27.1 s with repack → ~89 s
+without (3.3×)** — w4a16-over-packed-bytes is not a free fallback for the FFN.
+
+**Fix (both sides).** `alloc_label::low_memory_ffn_mmq_declined()` is now the
+SSOT for three call sites (eager build, runtime dispatch, arena sizing). Under
+`--low-memory` the MMQ arm stays ACTIVE but repacks each projection into ONE
+arena-owned cycled scratch (`BufferSizes::ffn_mmq_scratch`, ~50 MiB, campaign
+item 2(b)) right before its GEMM — same bytes, same kernels, zero numerics, one
+resident copy instead of 192. Batched/co-dispatched prefill runs layers serially
+in one forward, so the single buffer is race-free (same argument as `ffn_act_q8`).
+
+| | steady process (nvidia-smi) | TTFT @ 11k (n=3) |
+|---|---:|---:|
+| lazy rebuild (incident) | 55.8 GiB | 27.1 s |
+| decline, no scratch | 46.7 GiB | ~89 s (3.3×) |
+| **cycled scratch (landed)** | **45.7 GiB** | **28.9 s (+6.5%)** |
+
+Steady total now equals ledger (45.45) + ~0.2 non-ledger, sits under the
+0.38 × 121.6 = 46.2 GiB budget, and the util-term is a REAL ceiling: this boot's
+pool filled the remaining budget (39,038 blocks) and the process stopped exactly
+at it. `ATLAS_LOW_MEMORY_FFN_MMQ=1` still buys the resident repack back;
+`ATLAS_KV_REUSE_FACTOR=1` pins the pool at the 32,001-block working set for a
+~42 GiB deterministic total if more margin is wanted over prefix-cache retention.
