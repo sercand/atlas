@@ -1101,7 +1101,41 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             Nvfp4Variant::Standard,
                         )?;
                         let qkvz_nvfp4 = qkv_qw.concat_rows(&z_qw, qkv_rows, z_rows, h, gpu)?;
-                        let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
+                        // `concat_rows` copies both inputs into a fresh
+                        // [Q|K|V|Z] buffer and `quantized_auto`'s Standard arm
+                        // ALIASES the store, so after the concat the store's
+                        // in_proj_qkv / in_proj_z tensors have no live reader
+                        // in this arm (`ssm.in_proj_qkvz` is NULL below; every
+                        // dispatcher reads the concat or a twin of it). Retire
+                        // them — ~45 MiB × 48 SSM layers = 2.1 GiB on the 27B.
+                        // The free happens at ONE point in `build_model` after
+                        // all loaders ran; validate any change here with
+                        // ATLAS_POISON_RETIRED_WEIGHTS=1. out_proj gets NO such
+                        // retirement: its QuantizedWeight aliases the store for
+                        // the model's lifetime.
+                        let kept = [qkvz_nvfp4.weight, qkvz_nvfp4.weight_scale];
+                        for pfx in [format!("{la}.in_proj_qkv"), format!("{la}.in_proj_z")] {
+                            for suffix in [".weight", ".weight_scale", ".weight_scale_2", ".input_scale"] {
+                                let name = format!("{pfx}{suffix}");
+                                if store.contains(&name) {
+                                    store.retire(&name, &kept);
+                                }
+                            }
+                        }
+                        // `--low-memory`: the transposed twins are a SECOND
+                        // resident layout of the same NVFP4 weights, kept only
+                        // for coalesced N-dim prefill reads. Every dispatcher
+                        // (trait_prefill_proj / trait_prefill_helper /
+                        // trait_decode_batched) falls through to the
+                        // non-transposed `w4a16_gemm` over the packed bytes
+                        // when the twin is absent — same space-for-bandwidth
+                        // trade the dequant/requant arm below already takes.
+                        let lowmem = spark_runtime::alloc_label::low_memory();
+                        let qkvz_nvfp4_t = if lowmem {
+                            None
+                        } else {
+                            Some(qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?)
+                        };
 
                         let out_proj_nvfp4 = quantized_auto(
                             store,
@@ -1109,8 +1143,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             gpu,
                             Nvfp4Variant::Standard,
                         )?;
-                        let out_proj_nvfp4_t =
-                            out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
+                        let out_proj_nvfp4_t = if lowmem {
+                            None
+                        } else {
+                            Some(out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?)
+                        };
 
                         let ssm = SsmWeights {
                             in_proj_qkvz: DenseWeight {
@@ -1129,15 +1166,28 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             post_attn_norm,
                             ffn,
                             Some(qkvz_nvfp4),
-                            Some(qkvz_nvfp4_t),
-                            Some(out_proj_nvfp4_t),
+                            qkvz_nvfp4_t,
+                            out_proj_nvfp4_t,
                             config,
                             gpu,
                         )?;
-                        layer.predequant_for_prefill(gpu, config, stream)?;
+                        // The FP8 out_proj predequant is a PREFILL-bandwidth
+                        // copy derived FROM the NVFP4 bytes — on a pre-quantized
+                        // checkpoint it adds no precision (30 MiB × 48 layers =
+                        // 1.4 GiB). It is keyed off `out_proj_nvfp4_t` inside
+                        // `predequant_for_prefill`, so under `--low-memory`
+                        // (twin absent) it is skipped with the twins.
+                        if !lowmem {
+                            layer.predequant_for_prefill(gpu, config, stream)?;
+                        }
                         tracing::info!(
                             "SSM[{lp}] native NVFP4 GDN: qkvz+out_proj loaded pre-quantized \
-                             (U8-packed on disk; no BF16 dequant/requant roundtrip)"
+                             (U8-packed on disk; no BF16 dequant/requant roundtrip){}",
+                            if lowmem {
+                                " — --low-memory: transposed twins + FP8 out_proj predequant declined"
+                            } else {
+                                ""
+                            }
                         );
                         layers.push(Box::new(layer));
                         continue;

@@ -450,3 +450,68 @@ acceptance is worth more than every memory item combined. Its `K4 summary` showe
 23 of 100 steps rejecting every draft at `k_drafts=3`. Treat as a separate
 campaign; do not fold it into this one, and do not let it contaminate the
 memory A/Bs.
+
+---
+
+## 9. 2026-08-19 — the joshebbs/modelopt checkpoint + the 128k × 4 @ util 0.38 target
+
+Goal (user): serve `joshebbs/qwen3.8-27b-uncensored-nvfp4-modelopt` (19.18 GiB
+on disk, pure Standard-NVFP4, GDN projections U8-prequantized) at
+`--max-seq-len 128000 --max-batch-size 4 --gpu-memory-utilization 0.38` with
+`ATLAS_KV_OVERCOMMIT=0`, beside the vllm co-tenant. Needs a 32,000-block main
+KV pool (15.63 GiB fp8).
+
+The `--low-memory` work of §2/§6 did NOT cover the **native-NVFP4 GDN arm**
+this checkpoint takes (`qwen35_dense.rs`, the `native_nvfp4` branch): it built
+the transposed twins and the FP8 out_proj predequant unconditionally, and left
+the concat'd `in_proj_qkv`/`in_proj_z` store originals resident. Measured by
+ledger at the serve profile, weights were 27.13 GiB against 19.18 (1.41x).
+
+Landed (same trades the other arms already take; all dispatchers fall back):
+
+| change | saves (ledger) |
+|---|---:|
+| native-NVFP4 arm honours `--low-memory`: no qkvz/out_proj `_t` twins, no FP8 out_proj predequant | 2.82 + 1.41 GiB |
+| retire `in_proj_qkv`/`in_proj_z` store originals after `concat_rows` (unconditional — the concat is a copy, `quantized()` aliases) | 2.11 GiB |
+| `--low-memory` retires the BF16 lm_head once a quantized head exists (every logits dispatch prefers NVFP4/FP8; BF16 arms are None-fallbacks; gated on untied + no dflash + not deepseek_v4; the model's `DenseWeight` is NULLed so a stray reader faults loudly) | 2.37 GiB |
+
+**pre-KV 29.63 → 21.34 GiB; weights 27.13 → 18.35 GiB (ratio 1.41x → 0.96x).**
+
+Two new env knobs, paired by design (revert together):
+
+* `ATLAS_MTP_KV_DTYPE=fp8` — the drafter KV pool tracks the main pool's block
+  count, so at 128k×4 the BF16 default is ~2.0 GiB; fp8 halves it. Risk is
+  acceptance only (drafts are target-verified). A/B below: bit-identical.
+* `ATLAS_CUDA_HEADROOM_MB=3072` — hands the freed GiB back to the KV budget.
+  The flat 4 GiB was NOT padding at 128k (drafter KV 2.0 + prompt-hidden
+  capture 1.22 + GDN 0.17); it becomes padding only after the fp8 pairing.
+
+Serve profile deltas vs the old unit: `--ssm-cache-slots 4` (was 8, −0.6 GiB
+Marconi), `--max-seq-len 128000 --max-batch-size 4`. Updated unit:
+`scripts/qwen38-spark.service`.
+
+Result at the target profile (boot log 2026-08-19 06:34, OVERCOMMIT=0):
+
+```
+KV cache: 46.2 GB budget; 22.3 pre-KV + 5.1 reserve → 16.3 GB for KV
+→ 33,460 blocks × 16 tok = 535,360 max KV tokens  (≥ 4 × 128,000 ✓)
+post-load footprint: 42.51 GiB resident in total   (budget 46.2 ✓)
+```
+
+decode-floor on THIS checkpoint (fixture stop differs from unsloth's 604/400 —
+different model, do not cross-compare), one variable (`ATLAS_MTP_KV_DTYPE`):
+
+| drafter KV | out tok | accepted | accept_len mean | decode tok/s (median) | run record |
+|---|---|---|---|---|---|
+| fp8 | 816 / 816 / 816 | 509 ×3 | 2.66 | 28.1 | `run-1787121412932106666` |
+| bf16 (control) | 789 / 946 / 946 | 413 / 613 / 613 | 2.59 | 28.6 | `run-1787121760196788039` |
+
+fp8 does NOT collapse acceptance (the Qwen3.6-A3B failure mode this KV was
+BF16'd to avoid): accept_len 2.66 vs 2.59, decode within the bf16 control's
+own run-to-run spread. Note the bf16 control is not run-deterministic on this
+checkpoint (789→946), so the 0.5 tok/s delta is below the noise floor; the
+claim is "no collapse", not "faster".
+
+Boot sensitivity that remains: free-at-boot must be ≥ ~54.5 GB for the
+free-term (`free − 12 host − 5.1 reserve ≥ 15.63`); observed 55.4–56.7 over a
+day. A fat-vllm boot self-heals via Restart=always + OVERCOMMIT=0.

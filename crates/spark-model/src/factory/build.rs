@@ -175,7 +175,7 @@ pub fn build_model(
         let _s = spark_runtime::alloc_label::alloc_scope("weights.final_norm");
         loader.load_final_norm(&store, &config, gpu.as_ref())?
     };
-    let lm_head = {
+    let mut lm_head = {
         let _s = spark_runtime::alloc_label::alloc_scope("weights.lm_head");
         loader.load_lm_head(&store, &config, gpu.as_ref())?
     };
@@ -276,6 +276,49 @@ pub fn build_model(
         use_speculative,
         !mtp_weights.is_empty(),
     )?;
+
+    // ── Step 3c: `--low-memory` retires the BF16 lm_head original ──
+    //
+    // With a quantized head present (NVFP4 or FP8), every logits dispatch —
+    // impl_a3 `lm_head`/`lm_head_batched`, `decode_b2`, trait_impl
+    // `lm_head_batched` — reads the quantized copy; the BF16 dense arms are
+    // reachable only when the quantized head is `None`. The BF16 tensor's
+    // remaining uses are a pointer comparison (impl_lora's tie check, safe on
+    // a freed pointer) and the DFlash / DeepSeek-V4 proposers, both gated out
+    // here. On a 248k-vocab 27B this is a 2.4 GiB tensor. The `DenseWeight`
+    // handed to the model is NULLed so any future stray reader faults
+    // immediately instead of silently reading freed bytes. The draft NVFP4
+    // head (`setup_lm_heads` above) was already quantized OUT of these bytes,
+    // so drafting is unaffected. Validate changes here with
+    // ATLAS_POISON_RETIRED_WEIGHTS=1.
+    if spark_runtime::alloc_label::low_memory()
+        && (lm_head_nvfp4.is_some() || lm_head_fp8.is_some())
+        && lm_head.weight != embed.weight
+        && dflash_args.is_none()
+        && config.model_type != "deepseek_v4"
+    {
+        let retired = [
+            "lm_head.weight",
+            "language_model.lm_head.weight",
+            "model.lm_head.weight",
+        ]
+        .into_iter()
+        .find(|k| {
+            store
+                .get(k)
+                .is_ok_and(|t| t.ptr == lm_head.weight && !t.ptr.is_null())
+        })
+        .is_some_and(|k| store.retire(k, &[]));
+        if retired {
+            tracing::info!(
+                "--low-memory: BF16 lm_head original retired (~2.4 GiB at 248k vocab); \
+                 logits serve from the quantized head"
+            );
+            lm_head = crate::weight_map::DenseWeight {
+                weight: spark_runtime::gpu::DevicePtr::NULL,
+            };
+        }
+    }
 
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
