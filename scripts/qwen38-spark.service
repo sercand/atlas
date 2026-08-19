@@ -8,14 +8,22 @@
 # ─── MEMORY BUDGET (measured 2026-08-19, allocation ledger + boot log) ───────
 #   total unified                                            121.6 GB
 #   vllm.service (util 0.38-0.40) + python pipeline + OS      ~65.8 GB
-#   Atlas pre-KV (weights 18.35 + arena 1.83 + vision 0.49)    21.3 GB
-#   main KV pool: 33,460 blocks x 16 tok = 535k tokens         16.3 GB
-#     (>= 4 x 128,000 -> boots with ATLAS_KV_OVERCOMMIT=0)
-#   MTP drafter KV (fp8, ATLAS_MTP_KV_DTYPE)                    1.0 GB
+#   Atlas pre-KV (weights 18.35 + arena 1.9 + vision 0.49)     21.4 GB
+#   main KV pool: fills the remaining budget, floor 32,001
+#     blocks (= 4 x 128,000 tok, else ATLAS_KV_OVERCOMMIT=0
+#     refuses); measured boots landed 33,460-39,038 blocks    16.3-19.1 GB
+#   MTP drafter KV (fp8, ATLAS_MTP_KV_DTYPE)                    1.0-1.2 GB
 #   SSM pools + Marconi + drafter capture + GDN buffers         ~3.8 GB
 #   ATLAS_HOST_RESERVE_GB (never handed out)                   12.0 GB
 #   ────────────────────────────────────────────────────────────────
-#   post-load footprint 42.5 GiB, inside the 0.38 x 121.6 = 46.2 GB budget.
+#   STEADY process (nvidia-smi, after request #1): 45.7 GiB — at, and
+#   bounded by, the 0.38 x 121.6 = 46.2 GB budget. Judge footprint by the
+#   one-shot `post-first-request footprint` log line, NOT the load-time
+#   `post-load` line: the first request used to grow the process +9 GiB
+#   via the lazy FFN MMQ rebuild (fixed 2026-08-19, commit 55796191 —
+#   the MMQ arm now cycles one ~50 MiB arena scratch; STATE.md §10).
+#   Want a ~4 GB deterministic margin instead of max prefix-cache
+#   retention? Set ATLAS_KV_REUSE_FACTOR=1 (pool pins at 32,001 blocks).
 #
 # What made 128k x 4 fit (branch test/ladder-stack, 2026-08-19):
 #   * weights 27.13 -> 18.35 GiB (ratio 1.41x -> 0.96x of the 19.18 GiB
