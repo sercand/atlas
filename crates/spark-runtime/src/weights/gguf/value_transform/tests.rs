@@ -386,3 +386,57 @@ fn packed_reorder_rows_classifier() {
         None
     );
 }
+
+/// All seven MTP-head norms take the same RMSNorm `-1` offset as the main
+/// stack. The four `mtp.layers.0.*` ones are covered by the shared suffix
+/// rules; the three MTP-only ones (`mtp.norm`, `mtp.pre_fc_norm_embedding`,
+/// `mtp.pre_fc_norm_hidden`) have no main-stack analog and are named outright.
+///
+/// MEASURED 2026-08-18 — per-tensor means of the GGUF F32 values in
+/// `orcarouter/Qwen3.8-27B-Uncensored-GGUF` minus the BF16 values in
+/// `unsloth/Qwen3.8-27B-NVFP4`'s `model_mtp.safetensors`, which is exactly
+/// +1.0000 for every one of the seven:
+///
+/// | tensor                     | GGUF    | HF stored | diff    |
+/// |----------------------------|---------|-----------|---------|
+/// | `nextn.enorm`              | +0.5394 | −0.4606   | +1.0000 |
+/// | `nextn.hnorm`              | +0.8428 | −0.1572   | +1.0000 |
+/// | `nextn.shared_head_norm`   | +2.2520 | +1.2520   | +1.0000 |
+/// | `blk.64.attn_norm`         | +1.0361 | +0.0361   | +1.0000 |
+/// | `blk.64.post_attention_norm` | +1.2063 | +0.2063 | +1.0000 |
+/// | `blk.64.attn_q_norm`       | +1.7906 | +0.7906   | +1.0000 |
+/// | `blk.64.attn_k_norm`       | +1.7795 | +0.7795   | +1.0000 |
+#[test]
+fn mtp_head_norms_take_the_offset() {
+    for name in [
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+    ] {
+        assert!(needs(name), "{name} must be offset");
+        let mut buf = vec![2.2520f32, 0.5394];
+        apply(name, &mut buf, &[2], &dims()).unwrap();
+        assert!((buf[0] - 1.2520).abs() < 1e-4, "{name}: {}", buf[0]);
+        assert!((buf[1] - -0.4606).abs() < 1e-4, "{name}: {}", buf[1]);
+    }
+}
+
+/// The MTP projections are plain weights — no offset, no head reorder. The
+/// predictor's attention is standard full attention (not GDN), so none of the
+/// value-head permutations apply to it.
+#[test]
+fn mtp_projections_are_untransformed() {
+    for name in [
+        "mtp.fc.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    ] {
+        assert!(!needs(name), "{name} must be untransformed");
+    }
+}

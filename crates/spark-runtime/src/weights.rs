@@ -165,6 +165,23 @@ impl WeightTensor {
 /// All model weights loaded onto the GPU, keyed by HuggingFace name.
 pub struct WeightStore {
     weights: HashMap<String, WeightTensor>,
+    /// Tensors a loader has declared dead — every consumer copied out of them,
+    /// so nothing will read them again. Freed by [`WeightStore::free_retired`]
+    /// once ALL loaders have finished, never at the moment of retirement.
+    ///
+    /// Deferring the free to a single point after loading is the whole safety
+    /// argument. A loader that frees as it goes has to be right about every
+    /// later reader in a 1500-line function with a dozen checkpoint-shaped
+    /// branches; deferring makes "I retired it and then something read it"
+    /// impossible by construction, because nothing is freed while any loader
+    /// can still run. The cost is that peak-during-load is unchanged — only
+    /// the resident footprint after load drops, which is what the KV budget
+    /// is computed from anyway.
+    ///
+    /// Interior mutability because every loader entry point takes `&WeightStore`;
+    /// threading `&mut` through all of them would be a far larger change than
+    /// the saving justifies.
+    retired: std::sync::Mutex<Vec<String>>,
 }
 
 impl WeightStore {
@@ -172,6 +189,7 @@ impl WeightStore {
     pub fn empty() -> Self {
         Self {
             weights: HashMap::new(),
+            retired: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -179,7 +197,10 @@ impl WeightStore {
     /// `fast_weights::FastSafetensorsLoader`, and the RDMA weight loader in
     /// `spark-storage`, which lives in a different crate and so needs this pub).
     pub fn from_map(weights: HashMap<String, WeightTensor>) -> Self {
-        Self { weights }
+        Self {
+            weights,
+            retired: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// Get a weight tensor by name. Fails fast if not found.
@@ -192,6 +213,90 @@ impl WeightStore {
     /// Check if a weight exists.
     pub fn contains(&self, name: &str) -> bool {
         self.weights.contains_key(name)
+    }
+
+    /// Declare `name` dead: every consumer has copied out of it, so nothing
+    /// will read it again. It is freed later by [`WeightStore::free_retired`],
+    /// not here.
+    ///
+    /// `copies` are the derived buffers built from this tensor. If the store's
+    /// own pointer is among them, some consumer ALIASED rather than copied —
+    /// freeing would be a use-after-free — so the retirement is refused and
+    /// logged. This is the load-bearing safety check: `dense_auto` returns the
+    /// store pointer unchanged for BF16 tensors and a fresh buffer for FP8, so
+    /// whether a call site copied is a property of the CHECKPOINT, not of the
+    /// code, and cannot be settled by reading the loader.
+    ///
+    /// Returns whether the tensor was retired.
+    pub fn retire(&self, name: &str, copies: &[DevicePtr]) -> bool {
+        let Ok(t) = self.get(name) else {
+            return false;
+        };
+        if copies.contains(&t.ptr) {
+            tracing::warn!(
+                "refusing to retire weight {name}: a consumer aliased the store \
+                 pointer rather than copying it, so freeing it would be a \
+                 use-after-free"
+            );
+            return false;
+        }
+        self.retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(name.to_string());
+        true
+    }
+
+    /// Free every retired tensor. Returns `(count, bytes)`.
+    ///
+    /// Call once, after ALL loaders have run. Idempotent: the retire list is
+    /// drained and each entry removed from the map, so a second call is a no-op
+    /// and `release` at teardown cannot double-free what this freed.
+    ///
+    /// `ATLAS_POISON_RETIRED_WEIGHTS=1` overwrites each buffer with a poison
+    /// byte and KEEPS it instead of freeing. Use it to prove a retirement is
+    /// safe: a use-after-free normally reads bytes that merely happen to still
+    /// be intact, so it can pass every test and corrupt later, whereas a stale
+    /// reader of poison produces visibly wrong output immediately. Saves no
+    /// memory — it is a correctness probe, not a mode to run in.
+    pub fn free_retired(&mut self, gpu: &dyn GpuBackend) -> Result<(usize, usize)> {
+        let names: Vec<String> = std::mem::take(
+            &mut *self
+                .retired
+                .lock()
+                .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner()),
+        );
+        let poison = std::env::var("ATLAS_POISON_RETIRED_WEIGHTS").as_deref() == Ok("1");
+        let (mut count, mut bytes) = (0usize, 0usize);
+        for name in names {
+            // `remove`, not `get`: the map must not keep a pointer to freed
+            // memory, and this is what makes `release` unable to double-free.
+            let Some(t) = self.weights.remove(&name) else {
+                continue;
+            };
+            let size = t.byte_size();
+            if poison {
+                let junk = vec![0xA5u8; size];
+                gpu.copy_h2d(&junk, t.ptr)?;
+                // Deliberately NOT freed, and deliberately NOT re-inserted:
+                // dropped from the map so teardown's sweep reclaims it.
+                count += 1;
+                bytes += size;
+                continue;
+            }
+            gpu.free(t.ptr)?;
+            count += 1;
+            bytes += size;
+        }
+        if count > 0 {
+            tracing::info!(
+                "weight store: {} retired tensor(s) {}, {:.2} GiB",
+                count,
+                if poison { "POISONED (not freed)" } else { "freed" },
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+        Ok((count, bytes))
     }
 
     /// Number of loaded weights.

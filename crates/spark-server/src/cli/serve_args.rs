@@ -416,6 +416,21 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f64,
 
+    /// Report the GPU footprint at the end of model load, attributed by
+    /// owning code and by tensor size.
+    ///
+    /// Answers "why is this model resident at 2x its checkpoint size" — each
+    /// row names the scope AND call site that allocated it, or a tensor shape
+    /// whose count says how many copies of it are live.
+    ///
+    /// DIAGNOSTIC ONLY: it costs a backtrace per allocation over 4 MiB, for the
+    /// life of the process and not just during load. Do not leave it on in
+    /// production and do not measure throughput with it set.
+    ///
+    /// Supersedes ATLAS_ALLOC_HISTO=1, which still works.
+    #[arg(long, default_value_t = false)]
+    pub mem_report: bool,
+
     /// Maximum concurrent sequences.
     #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,

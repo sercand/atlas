@@ -134,6 +134,20 @@ pub(super) fn derive_finish_reason(
 /// 0 = unlimited) — needed so the `"length"` decision reuses the exact
 /// stop predicate from `emit_step`/`decode_logits_step`.
 pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize) {
+    // ONE-SHOT footprint dump after the very first completed request. The
+    // load-time reports (`pre-KV` / `post-load`) miss everything the first
+    // forward pass allocates lazily — measured 2026-08-19 on the 27B at 128k:
+    // the process grew 46.5 → 55.7 GiB (nvidia-smi) on request #1 and was
+    // flat afterwards, blowing through the host reserve with no log line.
+    // This dump attributes that growth by owner (ledger side) and reports the
+    // free-memory readings so driver-side growth (context/local/workspaces)
+    // shows up as the ledger-vs-free gap. Cost: ~60 log lines, once.
+    {
+        static FIRST_FINISH: std::sync::Once = std::sync::Once::new();
+        FIRST_FINISH.call_once(|| {
+            model.log_runtime_footprint("post-first-request");
+        });
+    }
     let reason = derive_finish_reason(
         a.guard_stop,
         a.output_tokens.last().copied(),

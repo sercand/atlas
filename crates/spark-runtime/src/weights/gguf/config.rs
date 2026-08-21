@@ -29,6 +29,14 @@ impl GgufMeta for GgufFile {
     fn get_arr_len(&self, key: &str) -> Option<usize> {
         GgufFile::arr_len(self, key)
     }
+    fn get_arr_u64(&self, key: &str) -> Option<Vec<u64>> {
+        Some(
+            GgufFile::get_u32_array(self, key)?
+                .into_iter()
+                .map(u64::from)
+                .collect(),
+        )
+    }
 }
 
 /// Build a [`ModelConfig`] from the `.gguf` in `model_dir`, with no `config.json`.

@@ -165,9 +165,7 @@ impl WeightLoader for SafetensorsLoader {
             weight_map.extend(extra_weights);
         }
 
-        Ok(WeightStore {
-            weights: weight_map,
-        })
+        Ok(WeightStore::from_map(weight_map))
     }
 }
 

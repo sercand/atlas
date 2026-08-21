@@ -34,6 +34,12 @@ pub(crate) fn load_weight_store(
     oom_reserve_bytes: usize,
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
+    // The store IS the checkpoint on device — the 1.0x denominator of the
+    // load-time weights ratio. Scoped here rather than inside each loader arm
+    // so every path (GGUF, fast, buffered) is covered by construction. Safe as
+    // a thread-local: the fast loader's spawned thread only reads files; the
+    // `gpu.alloc` + `copy_h2d` loop runs on this thread.
+    let _s = spark_runtime::alloc_label::alloc_scope("weights.store");
     let mult = quant_multiplier(config);
 
     // GGUF checkpoints are dequantized to BF16 by a dedicated loader; take that

@@ -70,6 +70,17 @@ pub struct BufferSizes {
     pub ffn_act_q8: usize,
     pub ffn_act_a: usize,
     pub ffn_act_scale: usize,
+    /// ONE cycled block_nvfp4 repack scratch for the `--low-memory` dense-FFN
+    /// MMQ prefill path: instead of 192 resident per-projection repacks
+    /// (8.96 GiB on the 27B), each projection is repacked into this buffer
+    /// right before its GEMM (raw bit shuffle, zero numerics; stream-ordered,
+    /// and batched/co-dispatched prefill runs layers serially in ONE forward,
+    /// so one buffer suffices — same sharing argument as `ffn_act_q8`).
+    /// Sized `max(n·⌈k/64⌉·36)` over gate/up `[inter, h]` and down
+    /// `[h, inter]` (SSOT: `ops::nvfp4_mmq_weight_bytes`, mirrored here
+    /// because spark-runtime cannot depend on spark-model). 0 — and the MMQ
+    /// prefill arm disabled — unless `low_memory_ffn_mmq_declined()`.
+    pub ffn_mmq_scratch: usize,
     /// FP8 block-scaled activation scratch for prefill projections (qkv / o /
     /// ssm-qkvz). Persistent so the W8A8+FP32-epilogue path stops doing a
     /// per-projection cuMemAlloc + cuStreamSynchronize + cuMemFree. 1 byte/elem.
@@ -358,6 +369,17 @@ impl BufferSizes {
             (0, 0, 0)
         };
 
+        // Cycled `--low-memory` MMQ repack scratch (see the field doc). The
+        // predicate is the alloc_label SSOT so preflight sizing, the arena,
+        // and dense_ffn's dispatch cannot drift apart.
+        let ffn_mmq_scratch =
+            if config.num_experts == 0 && crate::alloc_label::low_memory_ffn_mmq_declined() {
+                let inter = config.intermediate_size;
+                (inter * h.div_ceil(64) * 36).max(h * inter.div_ceil(64) * 36)
+            } else {
+                0
+            };
+
         Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
@@ -471,6 +493,7 @@ impl BufferSizes {
             ffn_act_q8,
             ffn_act_a,
             ffn_act_scale,
+            ffn_mmq_scratch,
             fp8_act,
             fp8_act_scale,
             lora_xa,
@@ -513,6 +536,7 @@ impl BufferSizes {
             + self.ffn_act_q8
             + self.ffn_act_a
             + self.ffn_act_scale
+            + self.ffn_mmq_scratch
             + self.fp8_act
             + self.fp8_act_scale
             + self.lora_xa

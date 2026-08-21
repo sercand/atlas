@@ -92,6 +92,12 @@ impl BufferArena {
         self.gdn_fla_scratch
     }
     /// Shared dense-FFN q8_1 activation scratch (Q4_K MMQ gate/up). NULL for MoE.
+    /// Cycled `--low-memory` MMQ repack scratch — NULL unless
+    /// `low_memory_ffn_mmq_declined()` sized it (dense-FFN models only).
+    pub fn ffn_mmq_scratch(&self) -> DevicePtr {
+        self.ffn_mmq_scratch
+    }
+
     pub fn ffn_act_q8(&self) -> DevicePtr {
         self.ffn_act_q8
     }

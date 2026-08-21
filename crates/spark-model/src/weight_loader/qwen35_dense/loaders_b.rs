@@ -55,7 +55,17 @@ pub(super) fn load_lm_head(
             .map(|w| w.dtype == WeightDtype::FP8E4M3)
             .unwrap_or(false);
         return if is_fp8 {
-            dense_auto_fp8_or_bf16(store, prefix, gpu)
+            let head = dense_auto_fp8_or_bf16(store, prefix, gpu)?;
+            // The FP8 head was dequantised into `head`, and on this path it has
+            // exactly one consumer — this function. `lm_head` is the largest
+            // single tensor in the model ([248320, 5120] = 1.18 GiB of 1-byte
+            // elements on the 27B), and the store holds it until teardown.
+            //
+            // Retirement is deferred and pointer-checked, so the non-FP8 arm
+            // below — which ALIASES the store rather than copying — is
+            // unaffected even if it ever reached here.
+            store.retire(&key, &[head.weight]);
+            Ok(head)
         } else {
             dense(store, &key)
         };

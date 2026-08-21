@@ -20,6 +20,7 @@ use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
 mod kv_summary;
+mod mem_report;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -28,7 +29,9 @@ pub fn build_model(
     // weight pointer, and it used to be a local in `startup()` that was dropped
     // once the layers had copied pointers out of it: the memory stayed live
     // with nothing able to free it. The model owns it now, so `teardown` can.
-    store: WeightStore,
+    // `mut` so `free_retired` can release the tensors the loaders declared
+    // dead once every loader has run.
+    mut store: WeightStore,
     gpu: Box<dyn GpuBackend>,
     max_batch_tokens: usize,
     kv_block_size: usize,
@@ -153,11 +156,33 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
-    let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
-    let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
-    let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
-    let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
-    let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
+    // `weights.*` scopes: every allocation made underneath one is attributed to
+    // it in `--mem-report`, and their sum is what the load-time
+    // weights-vs-checkpoint tripwire measures (`mem_report::report_and_check`).
+    // The prefix matters — the tripwire matches on `weights`, so a new loader
+    // entry point that forgets its scope silently shrinks the measured side of
+    // the ratio rather than tripping it. Keep them on the loader calls, where
+    // adding one is unavoidable when adding a call.
+    let mut layers = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.layers");
+        loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?
+    };
+    let embed = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.embedding");
+        loader.load_embedding(&store, &config, gpu.as_ref())?
+    };
+    let final_norm = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.final_norm");
+        loader.load_final_norm(&store, &config, gpu.as_ref())?
+    };
+    let mut lm_head = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.lm_head");
+        loader.load_lm_head(&store, &config, gpu.as_ref())?
+    };
+    let mtp_weights = {
+        let _s = spark_runtime::alloc_label::alloc_scope("weights.mtp");
+        loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?
+    };
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
     // the Qwen-shaped `MtpWeights`. Load it via the V4-specific path and keep it
@@ -206,7 +231,14 @@ pub fn build_model(
              or use a checkpoint that ships an MTP head (e.g. `mtp.safetensors`)."
         );
     }
-    let vision_encoder = loader.load_vision_encoder(&store, &config, gpu.as_ref())?;
+    // NOT under `weights.*`: the ViT's dominant allocation is quadratic
+    // attention scratch sized from `--vision-max-pixels`, which is a function of
+    // the serve profile rather than of the checkpoint. Folding it into the
+    // weights ratio would make that ratio move when a flag moves.
+    let vision_encoder = {
+        let _s = spark_runtime::alloc_label::alloc_scope("vision_encoder");
+        loader.load_vision_encoder(&store, &config, gpu.as_ref())?
+    };
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
@@ -245,6 +277,49 @@ pub fn build_model(
         !mtp_weights.is_empty(),
     )?;
 
+    // ── Step 3c: `--low-memory` retires the BF16 lm_head original ──
+    //
+    // With a quantized head present (NVFP4 or FP8), every logits dispatch —
+    // impl_a3 `lm_head`/`lm_head_batched`, `decode_b2`, trait_impl
+    // `lm_head_batched` — reads the quantized copy; the BF16 dense arms are
+    // reachable only when the quantized head is `None`. The BF16 tensor's
+    // remaining uses are a pointer comparison (impl_lora's tie check, safe on
+    // a freed pointer) and the DFlash / DeepSeek-V4 proposers, both gated out
+    // here. On a 248k-vocab 27B this is a 2.4 GiB tensor. The `DenseWeight`
+    // handed to the model is NULLed so any future stray reader faults
+    // immediately instead of silently reading freed bytes. The draft NVFP4
+    // head (`setup_lm_heads` above) was already quantized OUT of these bytes,
+    // so drafting is unaffected. Validate changes here with
+    // ATLAS_POISON_RETIRED_WEIGHTS=1.
+    if spark_runtime::alloc_label::low_memory()
+        && (lm_head_nvfp4.is_some() || lm_head_fp8.is_some())
+        && lm_head.weight != embed.weight
+        && dflash_args.is_none()
+        && config.model_type != "deepseek_v4"
+    {
+        let retired = [
+            "lm_head.weight",
+            "language_model.lm_head.weight",
+            "model.lm_head.weight",
+        ]
+        .into_iter()
+        .find(|k| {
+            store
+                .get(k)
+                .is_ok_and(|t| t.ptr == lm_head.weight && !t.ptr.is_null())
+        })
+        .is_some_and(|k| store.retire(k, &[]));
+        if retired {
+            tracing::info!(
+                "--low-memory: BF16 lm_head original retired (~2.4 GiB at 248k vocab); \
+                 logits serve from the quantized head"
+            );
+            lm_head = crate::weight_map::DenseWeight {
+                weight: spark_runtime::gpu::DevicePtr::NULL,
+            };
+        }
+    }
+
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
     // moved into `TransformerModel::new`. All are `Copy` (DenseWeight /
@@ -267,14 +342,17 @@ pub fn build_model(
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
     // ── Step 4: Create buffer arena ──
-    let buffers = BufferArena::new(
-        &config,
-        max_batch_tokens,
-        max_seq_len,
-        kv_block_size,
-        max_batch_size,
-        gpu.as_ref(),
-    )?;
+    let buffers = {
+        let _s = spark_runtime::alloc_label::alloc_scope("buffer_arena");
+        BufferArena::new(
+            &config,
+            max_batch_tokens,
+            max_seq_len,
+            kv_block_size,
+            max_batch_size,
+            gpu.as_ref(),
+        )?
+    };
 
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
@@ -319,6 +397,24 @@ pub fn build_model(
     // clamp ensures we never exceed what the device can physically provide
     // right now (handles external memory pressure on shared-memory /
     // unified-memory systems like GB10).
+    // Free the store tensors the loaders declared dead. Deliberately HERE and
+    // not inside the loaders: nothing is released while any loader could still
+    // read the store, so "retired then read" cannot happen. See
+    // `WeightStore::retire`.
+    //
+    // `checkpoint_bytes` is captured BEFORE this: it is the denominator of the
+    // footprint ratio and must keep meaning "what the checkpoint contains", not
+    // "what is left of it".
+    let checkpoint_bytes = store.total_bytes();
+    store.free_retired(gpu.as_ref())?;
+
+    // Every allocation the model itself makes is done by this point and the KV
+    // cache has not been sized yet, so this is the "pre-KV" footprint the
+    // memory campaign tracks. Report it and check it against the checkpoint
+    // BEFORE the KV budget arithmetic below consumes it — a leak here shows up
+    // only as a smaller KV cache, which is why three of them shipped unnoticed.
+    mem_report::report_and_check(gpu.as_ref(), checkpoint_bytes)?;
+
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
     let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -388,11 +484,57 @@ pub fn build_model(
             );
         }
     }
+    // ── OOM SAFETY ──
+    //
+    // On GB10 the "GPU" pool IS system RAM: `total_memory()` reports 121.6 GB of
+    // LPDDR5X shared with the OS, the page cache, and the safetensors mmap the
+    // loader just touched. The old clamp let the KV pool take every free byte
+    // (`actual_free - inference_reserve`), and the failure mode of getting that
+    // wrong on unified memory is not a clean CUDA OOM — it is a box that has to
+    // be power-cycled.
+    //
+    // Two corrections:
+    //
+    //  1. Atlas's own footprint is the LARGER of the free-memory delta and the
+    //     allocation ledger. The delta alone is unreliable on a shared box (same
+    //     binary and profile, two runs: it read 48.5 then 52.1 GiB while the
+    //     ledger read 40.22 both times); the ledger alone misses process-lifetime
+    //     workspaces that call `cuMemAlloc` directly (CUTLASS, FlashInfer). Each
+    //     covers the other's blind spot, and `max` is the conservative choice —
+    //     over-stating our own footprint only shrinks the KV pool.
+    //
+    //  2. A HOST RESERVE that is never handed out, so the kernel and page cache
+    //     keep a floor. It also absorbs a co-tenant that grows AFTER we size the
+    //     pool, which is not hypothetical: the vLLM sharing this box moved
+    //     21 -> 37 GiB inside a single session.
+    if let Some(ledger) = gpu.live_alloc_bytes()
+        && ledger > used_so_far
+    {
+        tracing::info!(
+            "KV budget: allocation ledger reports {:.1} GB vs free-delta {:.1} GB              for Atlas's own footprint — using the ledger (larger is the safe side)",
+            gib(ledger),
+            gib(used_so_far),
+        );
+        used_so_far = ledger;
+    }
+    let host_reserve = std::env::var("ATLAS_HOST_RESERVE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|gb| *gb >= 0.0)
+        .map(|gb| (gb * 1024.0 * 1024.0 * 1024.0) as usize)
+        .unwrap_or_else(|| std::cmp::max(12 * 1024 * 1024 * 1024, total_mem / 8));
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
+    let safe_free = actual_free.saturating_sub(host_reserve);
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
         .saturating_sub(inference_reserve)
-        .min(actual_free.saturating_sub(inference_reserve));
+        .min(safe_free.saturating_sub(inference_reserve));
+    tracing::info!(
+        "KV budget safety: {:.1} GB free now, holding back {:.1} GB host reserve          (ATLAS_HOST_RESERVE_GB) → at most {:.1} GB allocatable",
+        gib(actual_free),
+        gib(host_reserve),
+        gib(safe_free),
+    );
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -449,7 +591,41 @@ pub fn build_model(
                     (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let budget_blocks = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            // ── Cap the pool to what this configuration can actually USE ──
+            //
+            // `compute_num_blocks` divides the whole remaining budget by the
+            // block size, so the pool always swells to fill whatever is left.
+            // That is how freeing weight memory made things WORSE rather than
+            // better: every GiB reclaimed from the weights went straight into a
+            // bigger KV pool, and on unified memory the pool is bounded only by
+            // a free-memory reading that is itself unreliable.
+            //
+            // A configuration cannot use more than
+            // `max_batch_size × ceil(max_seq_len / block_size)` blocks to hold
+            // its declared concurrency at full context. Prefix caching DOES
+            // benefit from extra blocks (they retain reusable prefixes rather
+            // than being recycled), so allow a multiple of that working set —
+            // but a multiple, not the whole machine. At
+            // `--max-seq-len 2048 --max-batch-size 2` the working set is 256
+            // blocks and the old sizing handed out 102773.
+            let working_set = max_batch_size * max_seq_len.div_ceil(kv_block_size);
+            let reuse_factor = std::env::var("ATLAS_KV_REUSE_FACTOR")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|f| *f >= 1)
+                .unwrap_or(4);
+            // +1 dummy slot for OOB-safe paged-kernel reads.
+            let useful_blocks = working_set.saturating_mul(reuse_factor).saturating_add(1);
+            let n = budget_blocks.min(useful_blocks);
+            if n < budget_blocks {
+                tracing::info!(
+                    "KV cache capped to {n} blocks ({} seq × {} blocks/seq × {reuse_factor}x                      prefix-cache reuse + 1); the budget would have allowed {budget_blocks}                      ({:.1} GB), which this config can never use. Raise                      ATLAS_KV_REUSE_FACTOR for a larger prefix cache.",
+                    max_batch_size,
+                    max_seq_len.div_ceil(kv_block_size),
+                    kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
             let max_kv_tokens = n * kv_block_size;
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
@@ -639,5 +815,18 @@ pub fn build_model(
     // to happen — orphaned the memory: live, referenced by the layers, with
     // nothing owning the ability to release it.
     model.adopt_weight_store(store);
+
+    // The REAL resident footprint. `pre-KV` above is measured before the KV
+    // cache, the lm_head transposed twin, the SSM/Marconi pools, the MTP head
+    // and the GDN prefill buffers exist, so quoting it as "what the model
+    // costs" understates the process by several GiB. This is the number to
+    // compare against a card's capacity.
+    model.gpu_backend().dump_alloc_histo("post-load (everything resident)");
+    if let Some(total) = model.gpu_backend().live_alloc_bytes() {
+        tracing::info!(
+            "post-load footprint: {:.2} GiB resident in total",
+            total as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
     Ok(Box::new(model))
 }

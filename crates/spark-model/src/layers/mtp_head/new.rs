@@ -219,7 +219,17 @@ impl MtpHead {
         // and fp8 MTP heads — the MTP KV is one tiny layer, so BF16 cost is
         // negligible. NVFP4 MTP keeps FP8 KV (measured-good acceptance;
         // FP8-path changes must stay additive for NVFP4).
-        let kv_bf16 = matches!(quant, MtpQuantization::Bf16 | MtpQuantization::Fp8);
+        // ATLAS_MTP_KV_DTYPE overrides the default ("bf16" | "fp8"). "Tiny"
+        // stopped being true at long context: the drafter pool tracks the main
+        // pool's block count, and at --max-seq-len 128000 x bs=4 the BF16 pool
+        // is ~2 GiB where fp8 is ~1 GiB. fp8 here risks ACCEPTANCE only, never
+        // correctness (every draft is verified by the target); gate any change
+        // with decode-floor's accepted-drafts count, which directly probes it.
+        let kv_bf16 = match std::env::var("ATLAS_MTP_KV_DTYPE").as_deref() {
+            Ok("fp8") => false,
+            Ok("bf16") => true,
+            _ => matches!(quant, MtpQuantization::Bf16 | MtpQuantization::Fp8),
+        };
         let kv_config = KvCacheConfig {
             block_size: 16,
             num_kv_heads: nkv,

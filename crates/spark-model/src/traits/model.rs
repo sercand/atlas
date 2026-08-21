@@ -424,6 +424,14 @@ pub trait Model: Send + Sync {
     /// Must be called from any thread other than the one that created the model.
     fn bind_gpu_to_thread(&self) -> Result<()>;
 
+    /// ONE-SHOT runtime footprint report: log the live allocation ledger
+    /// (total + by-owner histo) and the current free-memory reading under
+    /// `tag`. Ungated — callers decide when it is cheap enough to emit (the
+    /// scheduler calls it once, after the first completed request, because
+    /// the load-time reports miss everything the first forward pass allocates
+    /// lazily). Default no-op for backends with no ledger (mock, Metal).
+    fn log_runtime_footprint(&self, _tag: &str) {}
+
     /// Allocate a new SequenceState with SSM states.
     fn alloc_sequence(&self) -> Result<SequenceState>;
 
