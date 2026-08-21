@@ -66,14 +66,14 @@ pub fn open_gguf(path: &Path) -> Result<(std::fs::File, memmap2::Mmap, container
 /// Sum the BF16 footprint of every tensor a pass will actually keep (i.e. that
 /// `names::translate` maps to a stored tensor, plus the clip patch-embed frames
 /// that are fused rather than name-mapped), for the pre-flight OOM estimate.
-pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
+pub fn est_bf16(gguf: &container::GgufFile, arch: &str, mtp_block: Option<usize>) -> usize {
     let is_clip = value_transform::is_clip(arch);
     gguf.tensors
         .iter()
         .filter(|t| {
             (is_clip && value_transform::vision_patch_frame(&t.name).is_some())
                 || !matches!(
-                    names::translate(&t.name, arch),
+                    names::translate(&t.name, arch, mtp_block),
                     None | Some(names::GgufName::Drop)
                 )
         })
@@ -84,8 +84,10 @@ pub fn est_bf16(gguf: &container::GgufFile, arch: &str) -> usize {
 /// Load every recognized tensor from one already-parsed GGUF into `weights`,
 /// dequantizing to BF16 on the way in. `arch` selects the name translation;
 /// `gdn` (Some only for the qwen35 backbone) drives the GDN/RMSNorm value
-/// fixups. Shared by the backbone pass and the `clip` mmproj sidecar pass so
-/// both land tensors into the same [`WeightStore`] identically.
+/// fixups; `mtp_block` (Some only when the backbone carries a `nextn` predictor)
+/// diverts that block's tensors to the `mtp.*` namespace. Shared by the backbone
+/// pass and the `clip` mmproj sidecar pass so both land tensors into the same
+/// [`WeightStore`] identically.
 ///
 /// For a clip pass, `gdn` is `None` (its `arch` can never be qwen35-family) and
 /// the file carries no `ExpertStack` names, so every tensor takes the plain
@@ -100,6 +102,7 @@ pub fn load_pass(
     mmap: &[u8],
     arch: &str,
     gdn: Option<value_transform::GdnDims>,
+    mtp_block: Option<usize>,
     force_cpu: bool,
     native_q2: bool,
     q2_group: usize,
@@ -144,7 +147,7 @@ pub fn load_pass(
             continue;
         }
 
-        let target = match names::translate(&tensor.name, arch) {
+        let target = match names::translate(&tensor.name, arch, mtp_block) {
             Some(names::GgufName::Drop) | None => continue,
             Some(t) => t,
         };

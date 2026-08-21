@@ -1,0 +1,563 @@
+# Atlas memory-reduction campaign — GB10, 2026-08
+
+**Goal.** Reduce pre-KV GPU footprint on `unsloth/Qwen3.8-27B-NVFP4` from ~48.7 GiB
+toward ~30 GiB without regressing decode throughput.
+
+Work items in §6 are taken strictly in order, one at a time. After every item:
+re-measure per §4, append a row to §7, commit only if the item both saved memory
+and held throughput. An item that regresses throughput is reverted, with the
+measurement written down.
+
+---
+
+## 1. Environment
+
+- Repo `/home/otsimo/work/atlas-ir`, branch `test/ladder-stack`.
+- Host **`gx10-ecdf`** (GB10, 121.6 GB unified memory, sm_121). Verify with `hostname`.
+- **`BENCH.toml`'s committed gates were calibrated on `dgx1`, a different box.**
+  Absolute gate floors do not transfer. Only same-box before/after A/B is valid.
+  Commit `9ce07fea` retracts a regression that turned out to be dgx1-vs-dgx2
+  confusion; do not repeat it.
+- **A vLLM co-tenant shares this GPU and is not stable.** Observed within one
+  hour on 2026-08-17: 28.8 → 33.1 → 33.9 GiB, then a restart down to 21.3 GiB.
+  Anything measured by differencing free memory inherits that movement — see §3.
+
+Every cargo and serve invocation needs the NCCL shim on both paths, **including
+the `spark benchmark` client** (it exits with a bare `libnccl.so.2` loader error
+otherwise, which is easy to mistake for an empty result):
+
+```bash
+export LIBRARY_PATH=$HOME/nccl-shim LD_LIBRARY_PATH=$HOME/nccl-shim
+```
+
+Type-check (~30 s; `cuda` is a default feature, so this does check CUDA paths):
+
+```bash
+ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 \
+LIBRARY_PATH=$HOME/nccl-shim LD_LIBRARY_PATH=$HOME/nccl-shim \
+cargo check -p spark-model --message-format short
+```
+
+Release build (~35 s incremental; `ATLAS_SKIP_BUILD` would produce a binary with
+zero PTX modules that cannot serve):
+
+```bash
+ATLAS_TARGET_MODEL=qwen3.8-27b CUDARC_CUDA_VERSION=13000 \
+LIBRARY_PATH=$HOME/nccl-shim LD_LIBRARY_PATH=$HOME/nccl-shim \
+cargo build --release -p spark-server --bin spark
+```
+
+**`/usr/local/bin/spark` is root-owned, so the build canNOT hardlink into it.**
+The fresh binary is `target/release/spark`; `/usr/local/bin/spark` silently stays
+whatever was installed last. Always confirm which binary you are measuring:
+
+```bash
+ls -la target/release/spark /usr/local/bin/spark
+strings <binary> | grep -c "mem-report"   # non-zero => has the §2 instrumentation
+```
+
+---
+
+## 2. Landed work
+
+### `cc165115` — three load-time leak fixes + `ATLAS_ALLOC_HISTO`
+
+Cut 8.28 GiB and 160 allocations. See the commit message for the full argument.
+
+1. **1.99 GiB** — `qwen35_dense.rs` `CompressedTensors` `load_nvfp4` dequantised
+   FP8→BF16, requantised to NVFP4, and never freed the BF16. The sibling
+   `Standard | Fp8Dequanted` arm always did, citing Atlas issue #A1; this arm —
+   the one mixed-precision checkpoints take — was missed.
+2. **1.4 GiB** — `set_fp8_prefill_only_weights` overwrote the `out_proj_fp8`
+   pointer `predequant_for_prefill` had just allocated, without freeing it.
+   30 MiB × 48 SSM layers, every load, no flag needed.
+3. **3.75 GiB** — the QKVZ FP8 copy is dead under `ATLAS_FP8_ROWWISE`; skipped.
+
+### Item 6 (this campaign's first item) — see §7
+
+---
+
+## 3. THE INSTRUMENT — read before quoting any number
+
+### 3.1 Memory: use the allocation ledger, NOT the free-memory delta
+
+The `Atlas-own` line in the serve log is computed as
+`free-at-context-init − free-now`. On a box with a moving co-tenant that is a
+**noisy instrument**, and the campaign's original 43.4 GiB baseline came from it.
+
+Controlled demonstration, 2026-08-17, same host, same serve profile:
+
+| binary | `Atlas-own` (free-delta) | ledger `pre-KV footprint` |
+|---|---|---|
+| baseline (`cc165115`) | 50.0 GiB | *(not implemented)* |
+| item 6 | 48.5 GiB | **48.71 GiB** |
+| item 6, repeat | 52.1 GiB | **48.71 GiB** |
+
+Same binary, same profile, two runs: the free-delta moved **3.6 GiB**; the ledger
+was **bit-identical**. The ledger sums each allocation's requested size and is
+co-tenant-immune by construction. In the one run where the co-tenant happened to
+hold still, the two agreed to 0.4% (48.71 vs 48.5), which is the cross-check that
+the ledger is measuring the right thing.
+
+**The recorded 43.4 GiB baseline does not reproduce** — the same baseline binary
+reads 50.0 GiB today. Treat 43.4 as unfingerprintable and superseded. The
+campaign's memory reference is now **48.71 GiB (ledger)**.
+
+Read it from the serve log without any flag:
+
+```
+INFO ... mem_report: pre-KV footprint: 48.71 GiB resident, of which 47.07 GiB is weights (checkpoint on disk: 21.81 GiB)
+```
+
+### 3.2 Throughput: `decode-floor`, and it is stable
+
+Fingerprint: host `gx10-ecdf` · checkpoint `unsloth/Qwen3.8-27B-NVFP4` rev
+`16b6615af3548b88e2d8e382457bc705b00479cf` · serve profile below verbatim ·
+2026-08-17.
+
+```bash
+env LIBRARY_PATH=$HOME/nccl-shim LD_LIBRARY_PATH=$HOME/nccl-shim \
+ATLAS_MTP_ACCEPT_DEBUG=1 \
+ATLAS_PREFILL_CODISPATCH=1 ATLAS_FP8_ROWWISE=1 ATLAS_MTP_DCUT_RATIO=1.0 \
+ATLAS_MTP_K_LADDER=1:3,2:1,4:2,8:2,16:1 \
+<binary> serve unsloth/Qwen3.8-27B-NVFP4 \
+  --host 127.0.0.1 --port 36200 --model-name Qwen3.8-27B \
+  --max-seq-len 2048 --max-batch-size 2 --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 --enable-prefix-caching true \
+  --ssm-cache-slots 8 --ssm-checkpoint-interval 32 \
+  --vision-max-pixels 16384 \
+  --speculative --num-drafts 3 --mtp-quantization bf16 \
+  --scheduling-policy fifo --tool-call-parser qwen3_coder --disable-tool-grammar true \
+  --request-timeout 0 --vision-allow-remote-images \
+  --ssm-h-dtype f16-pool --gdn-fused-norm --ssm-batched-recurrent \
+  --ssm-tail-midchunk false --mtp-gate force --prefill-varlen-batch --no-tui
+```
+
+Kept verbatim as `serve-profile.sh` beside this file — take the profile from
+there rather than retyping it, so the one-variable rule is mechanical:
+
+```bash
+docs/campaigns/gb10-memory-2026-08/serve-profile.sh target/release/spark [extra flags]
+```
+
+**Never measure throughput with `--mem-report` set**: it captures a backtrace per
+allocation over 4 MiB for the life of the process, not just during load.
+
+| Metric | Reference | Notes |
+|---|---|---|
+| **decode-floor median server tok/s** | **31.1** | 31.2/31.1/31.0, baseline binary, 2026-08-17 |
+| decode-floor output tokens | 604 every run | Deterministic. A different value means the instrument moved. |
+| decode-floor accepted drafts | 400 every run | `tok_step = 604/204 = 2.96`, near the k=3 ceiling. Proves MTP engaged. |
+
+Regression rule: median must stay **≥ 30.8**, AND out-tok must be 604 AND
+accepted must be 400. If either of the latter two moves, the instrument changed
+and the tok/s is not comparable.
+
+---
+
+## 4. How to measure (after every item)
+
+```bash
+# 1. build (§1) — confirm you are running target/release/spark, not /usr/local/bin
+# 2. start the §3.2 profile, wait for /v1/models
+# 3. memory: read the "pre-KV footprint" line from the serve log (no flag needed)
+# 4. throughput — 59 s, WITHOUT --mem-report:
+export LIBRARY_PATH=$HOME/nccl-shim LD_LIBRARY_PATH=$HOME/nccl-shim
+spark benchmark run decode-floor --url http://127.0.0.1:36200 --model Qwen3.8-27B --yes
+# 5. attribution, only when deciding what to cut next — separate run, WITH --mem-report
+```
+
+Records land in `~/.atlas/runs/<benchmark>/run-*.json` — cite those IDs, not prose.
+
+**Expect `decode-floor` to report `INCONCLUSIVE`.** That is correct, not a
+failure: it requires ≥750 output tokens and this box's natural stop is 604. The
+floor was calibrated to dgx1's 915-token stop. Read the median tok/s out of the
+table and ignore the verdict. Do **not** "fix" this by changing the fixture —
+that would destroy comparability.
+
+Before writing any perf number anywhere, invoke the `measurement-discipline`
+skill. It is mandatory in this repo and encodes a real incident.
+
+---
+
+## 5. Traps
+
+1. **`--gpu-memory-utilization` is a fraction of TOTAL memory (121.6 GB)**, and
+   `kv_budget` is additionally clamped by `.min(actual_free − inference_reserve)`
+   (`crates/spark-model/src/factory/build.rs`). On a box with co-tenants, raising
+   util does nothing. At util 0.40 this model fails to start outright.
+2. **`--vision-max-pixels 16384` is an AREA** (128×128 px → 64 patches), not a
+   patch count.
+3. **The 4.74 GiB `2 × 2425 MiB` bucket is NOT ViT scratch.** Item 6's attribution
+   shows `vision_encoder` holding 0.00 GiB across 16 allocations under the §3.2
+   profile, while one of the two 2425 MiB buffers is
+   `weights.lm_head / quant_helpers::dequant_fp8_blockscaled_to_bf16`. A prior
+   note claiming the §3.2 profile "already avoids" this 4.74 GiB was wrong on
+   both counts: it is present, and it is lm_head, not vision. See §6 item 1.
+4. **A human-quoted table claimed C=1 23.59 / C=2 38.95 / C=4 74.21.** C=1 and
+   C=2 reproduce (22.5 / 39.1). **C=4 does not and cannot**: the §3.2 profile sets
+   `--max-batch-size 2`, so at C=4 two requests queue, TTFT p50 hits 17.6 s, and
+   aggregate flatlines at the C=2 value. That row came from a different profile.
+5. **This checkpoint is not mostly NVFP4** despite its name. 21.81 GiB on disk:
+   only ~7.0 GiB is 4-bit (MLP gate/up/down L0–55); ~10.8 GiB is FP8 E4M3
+   per-channel (attn q/k/v/o, SSM `in_proj_qkv`/`in_proj_z`/`out_proj`, `lm_head`,
+   MLP L56–63); ~3.3 GiB BF16. `config.json` has two `config_groups`. The FP8
+   tensors trigger the dequant→requant path that manufactures derived copies.
+6. **`WeightStore` is released only at model teardown**
+   (`crates/spark-model/src/model/types.rs`), never as layers consume it. Correct
+   for genuinely aliased tensors (norms, `conv1d`, and the `ATLAS_FP8_ROWWISE`
+   weights, which read store bytes directly for the model's lifetime) — which is
+   why item 3 needs a real ownership split and not a blanket free.
+7. **Thinking gates speculation OFF** (`!inside_thinking`). Any measurement
+   without `reasoning_effort:"none"` measures a blend of the serial floor and the
+   engine. `decode-floor` sets it for you.
+8. **Stop the server by PORT OWNER, not by process name — `stop.sh` beside this
+   file does it.** This bit once, and the failure is silent in the worst way:
+   `pkill -x spark` does not match the baseline binary copied to
+   `spark-baseline-…`, so the old server kept the port, the new one died in
+   preflight on "inference buffers alone need 6.96 GB but only 3.94 GB is free",
+   and `decode-floor` cheerfully measured the OLD binary while being recorded as
+   the new one. It was caught only because the two "different" builds produced
+   suspiciously identical numbers and the serve log was re-read. Two habits make
+   it non-silent: confirm the `pre-KV footprint` line in the NEW server's log
+   before benchmarking against it, and wait for the GPU memory to actually come
+   back — the listener closes well before teardown finishes sweeping ~1500
+   allocations.
+
+---
+
+## 6. Work items
+
+Measured composition at 48.71 GiB (item 6 attribution, §3.2 profile, ledger):
+
+| GiB | allocs | owner |
+|---:|---:|---|
+| 21.69 | 662 | `weights.store / fast_weights::load_shard_fast` — the checkpoint itself, 1.0x |
+| 8.96 | 192 | `weights.layers / dense_ffn::DenseFfnLayer::ensure_nvfp4_mmq_weight` |
+| 4.64 | 224 | `weights.layers / weight_map::loaders_fp8::quantize_to_nvfp4` |
+| 3.75 | 48 | `weights.layers / qwen35_dense::rowwise_fp8::concat_fp8_per_row` |
+| 3.52 | 176 | `weights.layers / quantized::QuantizedWeight::transpose_for_gemm_gs` |
+| 2.37 | 1 | `weights.lm_head / quant_helpers::dequant_fp8_blockscaled_to_bf16` |
+| 1.41 | 48 | `weights.layers / ModelWeightLoader>::load_layers` |
+| 0.97 | 18 | `buffer_arena / buffers::BufferArena::new` |
+| 0.67 | 2 | `weight_map::loaders_fp8::quantize_to_nvfp4` (outside any scope) |
+| 0.74 | 2096 | everything else, all under 0.62 GiB per owner |
+
+### Item 6 — allocation labels + dump-at-end-of-load — **DONE, see §7**
+
+### Item 3 — per-tensor `WeightStore` release — **DONE (−8.49 GiB)**
+
+Landed: `WeightStore::retire(name, copies)` + `free_retired(gpu)`, and retirement
+of 185 store tensors totalling 8.49 GiB:
+
+| tensors | GiB | what | retired at |
+|---:|---:|---|---|
+| 96 | 3.75 | SSM `in_proj_qkv` + `in_proj_z` FP8 | `qwen35_dense.rs`, after both consumers copy |
+| 64 | ~1.56 | attn q/k/v/o FP8 | the `CompressedTensors` `load_nvfp4` closure |
+| 24 | ~1.99 | MLP L56–63 FP8 tail | `quantized_from_fp8` |
+| 1 | 1.18 | `lm_head` FP8 | `loaders_b::load_lm_head` |
+
+Two corrections to the original plan:
+
+* **Trap 6 was over-broad.** It said the `ATLAS_FP8_ROWWISE` SSM
+  `in_proj_qkv`/`_z`/`out_proj` FP8 bytes are all read for the model's lifetime.
+  Only `out_proj` is: `load_fp8_per_row` aliases the store, but
+  `concat_fp8_per_row` `copy_d2d`s `in_proj_qkv` + `in_proj_z` into one fresh
+  `[Q|K|V|Z]` buffer and only that is kept. `out_proj` has no concat, so its
+  alias stays live and it must NOT be retired.
+* **The "unattributed 48 × 50 MiB = 2.34 GiB" bucket was `in_proj_qkv`.**
+  `[10240, 5120]` FP8 = 50 MiB; `in_proj_z` is `[6144, 5120]` = 30 MiB; together
+  80 MiB/layer, matching the concat output size exactly.
+
+Deliberately NOT retired:
+
+* **SSM `out_proj` FP8** — `load_fp8_per_row` aliases it and, unlike the
+  `in_proj` pair, there is no concat to copy it away, so the alias stays live for
+  prefill for the model's lifetime.
+* **The 2.37 GiB `weights.lm_head / dequant_fp8_blockscaled_to_bf16` BF16
+  buffer** — that is the live head the logits GEMM reads, not a leftover. It is
+  a fair target for a *different* change (serve the head from NVFP4 and drop the
+  BF16), not for retirement.
+* **`quantized_any`'s `Bf16Raw` arm**, which frees a store pointer eagerly
+  (`nvfp4_detect.rs`). Converting it to `retire` would be tidier and would end a
+  latent double-free with `release`, but its eager free is load-bearing for PEAK
+  memory: the comment records a 35B BF16 MoE hitting ~109 GB pre-KV without it,
+  and deferred retirement would restore exactly that peak. Leave it.
+
+**Method — use the poison probe, it is the point.** `ATLAS_POISON_RETIRED_WEIGHTS=1`
+overwrites retired buffers with `0xA5` and does not free them. A use-after-free
+otherwise reads bytes that merely happen to still be intact, so it passes every
+test and corrupts later; a stale reader of poison is wrong immediately. Retire,
+run the probe, check generation is coherent AND decode-floor still reports
+604/400, and only then trust the free.
+
+### Item 4 — `out_proj` copy set *(~2.8 GiB)*
+192 × 30 MiB = 4 copies per SSM layer. Enumerate which are live — predequant FP8,
+rowwise (store alias), NVFP4, NVFP4 `_t` — and reduce to two. `out_proj_fp8` IS
+read by batched decode at
+`crates/spark-model/src/layers/qwen3_ssm/trait_decode_batched.rs:1087`, so this
+changes verify numerics: run decode-floor **and** check accepted-drafts stays 400.
+
+### Item 2 — collapse the dual weight layout *(~9.5 GiB, HIGHEST PERF RISK)*
+Now precisely located: 8.96 GiB in `ensure_nvfp4_mmq_weight` and 3.52 GiB in
+`transpose_for_gemm_gs`. `kernels/gb10/common/w4a16_gemm.cu:16-19` documents that
+`w4a16_gemm` and `w4a16_gemm_t` are the same math — the `_t` form exists for
+"coalesced N-dim reads for better LPDDR5X bandwidth", so the duplication is a
+bandwidth optimisation, not a functional requirement. Two options:
+- (a) drop `_t`, dispatch the non-transposed kernel — simple, costs prefill bandwidth;
+- (b) keep ONE arena-owned transpose scratch reused across layers (one layer's
+  worth instead of 64) — pays a transpose per layer per prefill, which may vanish
+  under compute-bound prefill at large M.
+Prototype **behind a flag**, default off, and A/B both prefill (TTFT) and decode.
+
+### Item 7 — util semantics + error message *(no perf risk)*
+`factory/build.rs` bails with "Raise --gpu-memory-utilization", which provably
+does not help when co-tenants hold the memory. Name the co-tenant bytes and
+actual free instead.
+
+### Item 1 — lm_head/ViT quadratic scratch *(4.74 GiB — RESCOPED, do LAST)*
+Originally written as "lazy ViT scratch". Item 6 disproved the ViT attribution
+(trap 3). The 4.74 GiB is `2 × 2425 MiB`, one of which is the `lm_head` FP8→BF16
+dequant. Re-derive what the second one is from a `--mem-report` run before
+planning work here.
+
+### Item 8 — investigate unsloth-specific loading
+Does the unsloth mixed FP8/NVFP4 layout carry metadata implying a load path Atlas
+is missing that would avoid the dequant→requant derived copies entirely? Check
+`weight_scale` shapes and whether a per-channel FP8 GEMM could serve decode
+directly. Read the module doc of
+`crates/spark-model/src/weight_loader/qwen35_dense/rowwise_fp8.rs` first —
+cuBLASLt FP8 row-wise is dead on sm_121 (heuristic status 15).
+
+---
+
+## 7. Results log — append one row per item, do not edit prior rows
+
+| Item | pre-KV GiB (ledger) | decode tok/s (median of 3) | out tok | accepted | run record | verdict |
+|---|---|---|---|---|---|---|
+| baseline (`cc165115`) | n/a — free-delta read 50.0 | 31.1 (31.2/31.1/31.0) | 604 | 400 | `run-1787001820494991508` | reference |
+| 6 — labels + report + tripwire | 48.71 | 31.1 (30.8/31.2/31.1) | 604 | 400 | `run-1787001983979160734` | **KEEP** — no memory change expected or seen; throughput unchanged |
+| 3a — retire SSM `in_proj` FP8 originals | 44.96 (−3.75) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002925279178569` | superseded by 3b |
+| 3a — poison probe (control) | 48.71 (poisoned, not freed) | 31.1 (31.1/31.0/31.1) | 604 | 400 | `run-1787002817059208139` | safety gate passed |
+| 3b — + attn q/k/v/o, MLP tail, `lm_head` | **40.22** (−8.49) | **31.1** (median of 6) | 604 | 400 | `run-1787004106534527817`, `run-1787004166429407764` | **KEEP** — 185 tensors, −8.49 GiB, ratio 2.16x → 1.77x |
+| 3b — poison probe (control) | 48.71 (poisoned, not freed) | 31.3 (31.3/31.2/31.3) | 604 | 400 | `run-1787003363972615199` | safety gate passed |
+| **OOM FIX + `--low-memory`** | **23.19** | 31.0 | 668 | 437 | `run-1787036307538411135` | **KEEP** — see below |
+
+### The number that matters is POST-LOAD, not pre-KV
+
+`pre-KV` is measured before the KV cache, the lm_head twin, the SSM/Marconi
+pools, the MTP head and the GDN prefill buffers exist, so it understates the
+process by several GiB. The `post-load footprint` line is what to compare
+against a card's capacity.
+
+| | post-load | note |
+|---|---:|---|
+| before this work | **99.72 GiB** | KV pool had expanded to fill the budget |
+| KV capped + one weight layout | 32.04 GiB | |
+| + lm_head twin declined | 31.37 GiB | |
+| + SSM prefill from NVFP4 | 26.21 GiB | `--max-seq-len 2048 --max-batch-size 2` |
+| single-user profile | **24.71 GiB** | `--max-batch-size 1 --ssm-cache-slots 2` |
+
+Weights resident are now **21.56 GiB against a 21.81 GiB checkpoint** (0.99x) —
+the FP8 half is served as NVFP4 instead of alongside it.
+
+### THE OOM (why the box needed a hard restart)
+
+`compute_num_blocks` divided the whole remaining budget by the block size, with
+no cap. At `--max-seq-len 2048 --max-batch-size 2` the working set is 256 blocks
+and it allocated 102773 (50.2 GB). That made memory work *counterproductive*:
+every GiB freed from the weights was absorbed by a bigger KV pool. Across this
+campaign's probes post-load went 71.1 -> 77.8 -> 84.0 -> 86.5 -> 99.7 GiB while
+pre-KV was falling. On unified memory the "GPU" pool is system RAM shared with
+the kernel and page cache, so the failure mode is a box that must be
+power-cycled, not a clean CUDA OOM.
+
+Now: the pool is capped at
+`max_batch_size x blocks_per_seq x ATLAS_KV_REUSE_FACTOR` (default 4) + 1, and
+`ATLAS_HOST_RESERVE_GB` (default max(12 GiB, total/8)) is never allocated.
+Atlas's own footprint for the budget is `max(free-delta, ledger)` — each covers
+the other's blind spot.
+
+**When testing serve configs, run `watch_mem.sh` (beside this file) first.** It
+kills the server if MemAvailable falls below a floor, so a mis-sized pool
+degrades to a dead server instead of a dead machine.
+
+### `--low-memory` / `ATLAS_LOW_MEMORY=1`
+
+| what it declines | saves | cost |
+|---|---:|---|
+| FFN MMQ repack + `_t` twins | 8.97 GiB | none measured (TTFT 1990 vs 1996 ms at isl 1536) |
+| SSM qkvz_t + out_proj_t | 2.90 GiB | none measured; 604/400 unchanged |
+| lm_head transposed twin | 0.67 GiB | ~4% decode under speculative verify |
+| row-wise SSM prefill arm | 5.16 GiB | **quality**: BFCL-ST non_live 85.4 -> 76.6 when last measured |
+
+The first three are pure space-for-bandwidth trades:
+`kernels/gb10/common/w4a16_gemm.cu:16-19` documents `w4a16_gemm` and
+`w4a16_gemm_t` as the same math, and every prefill dispatcher already falls back
+to the non-transposed kernel when the twin is absent. The fourth is a real
+accuracy trade and the only one in this campaign.
+
+**Not taken: the attention q/k/v/o twins + fused [q|k|v] concat (0.88 GiB).**
+Prefill does fall back, but decode-floor moved from 604 tok / 400 accepted to
+1091 / 679 — the model produced different text for a fixed prompt at
+temperature 0. The transposed and packed attention paths are not bit-identical.
+0.88 GiB does not justify an unvalidated numerics change.
+
+**`ATLAS_FP8_ROWWISE=0` alone saves nothing** (40.21 vs 40.22 GiB): turning the
+row-wise arm off re-enables an equally sized `qkvz_fp8`. Both must be suppressed,
+which is what `qkvz_fp8_dead` now does.
+
+### Still on the table
+
+* 2.37 GiB BF16 lm_head — the NVFP4 head serves decode, but the BF16 has readers
+  in `impl_a3`, `decode_b2`, `lm_head_batched` and `impl_lora`'s tied-embedding
+  pointer check. Too many paths to free for 2.37 GiB without deeper analysis.
+* 1.41 GiB SSM `out_proj` FP8 predequant — batched decode reads it at
+  `trait_decode_batched.rs:1087`.
+
+Together they would put weights near 17.8 GiB, i.e. unsloth's stated 17-19 GB
+envelope.
+
+Item 3b A/B, both on a co-tenant-free box, `decode-floor` server tok/s:
+
+| | n | median | mean | sd |
+|---|---:|---:|---:|---:|
+| baseline (`cc165115`) | 12 | 31.10 | 30.98 | 0.27 |
+| item 3b | 6 | 31.10 | 31.12 | 0.04 |
+
+Identical medians; item 3b's mean is marginally higher and its spread smaller.
+No regression. 604 output tokens and 400 accepted drafts on every single run.
+
+Superseded: the pre-campaign `43.4 GiB / 31.3 tok/s` reference
+(`run-1787000030318474839`). Throughput reproduces (31.1 vs 31.3, within σ≈0.15×2).
+The 43.4 GiB memory figure does not — see §3.1 for the mechanism and the
+controlled A/B that supersedes it.
+
+---
+
+## 8. A larger prize, outside the memory scope
+
+A human-supplied log from this same engine and serve profile showed
+`mean_na=1.410, serial=0.20, 415 tokens, finish=stop, 22.8 tok/s`. The §3.2
+instrument on the same binary shows `mean_na=1.96, serial≈0, tok_step 2.96,
+31.1 tok/s`. Same engine — the entire difference is `reasoning_effort:"none"` and
+prompt class. Note `mean_na` is computed over MTP steps only
+(`crates/spark-server/src/scheduler/mtp_accept_debug.rs:212`), so that run's true
+blended rate was `0.80 × 2.410 + 0.20 × 1.0 = 2.13` tokens/step, not 2.41.
+
+If real traffic looks like that log rather than like the fixture, raising draft
+acceptance is worth more than every memory item combined. Its `K4 summary` showed
+23 of 100 steps rejecting every draft at `k_drafts=3`. Treat as a separate
+campaign; do not fold it into this one, and do not let it contaminate the
+memory A/Bs.
+
+---
+
+## 9. 2026-08-19 — the joshebbs/modelopt checkpoint + the 128k × 4 @ util 0.38 target
+
+Goal (user): serve `joshebbs/qwen3.8-27b-uncensored-nvfp4-modelopt` (19.18 GiB
+on disk, pure Standard-NVFP4, GDN projections U8-prequantized) at
+`--max-seq-len 128000 --max-batch-size 4 --gpu-memory-utilization 0.38` with
+`ATLAS_KV_OVERCOMMIT=0`, beside the vllm co-tenant. Needs a 32,000-block main
+KV pool (15.63 GiB fp8).
+
+The `--low-memory` work of §2/§6 did NOT cover the **native-NVFP4 GDN arm**
+this checkpoint takes (`qwen35_dense.rs`, the `native_nvfp4` branch): it built
+the transposed twins and the FP8 out_proj predequant unconditionally, and left
+the concat'd `in_proj_qkv`/`in_proj_z` store originals resident. Measured by
+ledger at the serve profile, weights were 27.13 GiB against 19.18 (1.41x).
+
+Landed (same trades the other arms already take; all dispatchers fall back):
+
+| change | saves (ledger) |
+|---|---:|
+| native-NVFP4 arm honours `--low-memory`: no qkvz/out_proj `_t` twins, no FP8 out_proj predequant | 2.82 + 1.41 GiB |
+| retire `in_proj_qkv`/`in_proj_z` store originals after `concat_rows` (unconditional — the concat is a copy, `quantized()` aliases) | 2.11 GiB |
+| `--low-memory` retires the BF16 lm_head once a quantized head exists (every logits dispatch prefers NVFP4/FP8; BF16 arms are None-fallbacks; gated on untied + no dflash + not deepseek_v4; the model's `DenseWeight` is NULLed so a stray reader faults loudly) | 2.37 GiB |
+
+**pre-KV 29.63 → 21.34 GiB; weights 27.13 → 18.35 GiB (ratio 1.41x → 0.96x).**
+
+Two new env knobs, paired by design (revert together):
+
+* `ATLAS_MTP_KV_DTYPE=fp8` — the drafter KV pool tracks the main pool's block
+  count, so at 128k×4 the BF16 default is ~2.0 GiB; fp8 halves it. Risk is
+  acceptance only (drafts are target-verified). A/B below: bit-identical.
+* `ATLAS_CUDA_HEADROOM_MB=3072` — hands the freed GiB back to the KV budget.
+  The flat 4 GiB was NOT padding at 128k (drafter KV 2.0 + prompt-hidden
+  capture 1.22 + GDN 0.17); it becomes padding only after the fp8 pairing.
+
+Serve profile deltas vs the old unit: `--ssm-cache-slots 4` (was 8, −0.6 GiB
+Marconi), `--max-seq-len 128000 --max-batch-size 4`. Updated unit:
+`scripts/qwen38-spark.service`.
+
+Result at the target profile (boot log 2026-08-19 06:34, OVERCOMMIT=0):
+
+```
+KV cache: 46.2 GB budget; 22.3 pre-KV + 5.1 reserve → 16.3 GB for KV
+→ 33,460 blocks × 16 tok = 535,360 max KV tokens  (≥ 4 × 128,000 ✓)
+post-load footprint: 42.51 GiB resident in total   (budget 46.2 ✓)
+```
+
+decode-floor on THIS checkpoint (fixture stop differs from unsloth's 604/400 —
+different model, do not cross-compare), one variable (`ATLAS_MTP_KV_DTYPE`):
+
+| drafter KV | out tok | accepted | accept_len mean | decode tok/s (median) | run record |
+|---|---|---|---|---|---|
+| fp8 | 816 / 816 / 816 | 509 ×3 | 2.66 | 28.1 | `run-1787121412932106666` |
+| bf16 (control) | 789 / 946 / 946 | 413 / 613 / 613 | 2.59 | 28.6 | `run-1787121760196788039` |
+
+fp8 does NOT collapse acceptance (the Qwen3.6-A3B failure mode this KV was
+BF16'd to avoid): accept_len 2.66 vs 2.59, decode within the bf16 control's
+own run-to-run spread. Note the bf16 control is not run-deterministic on this
+checkpoint (789→946), so the 0.5 tok/s delta is below the noise floor; the
+claim is "no collapse", not "faster".
+
+Boot sensitivity that remains: free-at-boot must be ≥ ~54.5 GB for the
+free-term (`free − 12 host − 5.1 reserve ≥ 15.63`); observed 55.4–56.7 over a
+day. A fat-vllm boot self-heals via Restart=always + OVERCOMMIT=0.
+
+---
+
+## 10. 2026-08-19 — the first-request +9 GiB: the lazy MMQ rebuild, and a RETRACTION
+
+**Incident.** With §9 deployed, nvidia-smi showed the serve at 54.3 GiB against a
+43.8 GiB post-load ledger. Traced with a boot-time sampler + request-class probes:
+the process grew 46.6 → 55.8 GiB on the FIRST request of any kind, flat afterwards,
+and MemAvailable fell below the 12 GiB host floor. The new one-shot
+`post-first-request` footprint dump (ships unconditionally now; see
+`scheduler/lifecycle.rs` → `Model::log_runtime_footprint`) attributed it:
+**192 × 47.81 MiB = 8.96 GiB — the dense-FFN MMQ repack** `--low-memory` declines
+at load, **rebuilt lazily by `ensure_nvfp4_mmq_weight` on the first prefill**
+(plus ~1.5 GiB of that arm's first-use scratch). The eager gate was in
+`finalize_nvfp4_mmq_load`; the runtime dispatch (`fp4mmq_prefill`) never looked.
+
+**RETRACTION.** The §"--low-memory" trade table's row "FFN MMQ repack + `_t`
+twins: saves 8.97 GiB, cost none measured (TTFT 1990 vs 1996 ms)" was wrong on
+both sides for the MMQ half: the memory was NOT saved at steady state (rebuilt on
+request #1), and the TTFT A/B measured nothing (both arms had lazily rebuilt the
+repack, so both ran the MMQ prefill). Mechanism named per the two-harness rule:
+the broken field was the load-time footprint standing in for the steady-state one.
+The REAL cost of running prefill without the repack, measured same-box same-serve
+one-variable (11,017-token prompt, n=3 each): **TTFT 27.1 s with repack → ~89 s
+without (3.3×)** — w4a16-over-packed-bytes is not a free fallback for the FFN.
+
+**Fix (both sides).** `alloc_label::low_memory_ffn_mmq_declined()` is now the
+SSOT for three call sites (eager build, runtime dispatch, arena sizing). Under
+`--low-memory` the MMQ arm stays ACTIVE but repacks each projection into ONE
+arena-owned cycled scratch (`BufferSizes::ffn_mmq_scratch`, ~50 MiB, campaign
+item 2(b)) right before its GEMM — same bytes, same kernels, zero numerics, one
+resident copy instead of 192. Batched/co-dispatched prefill runs layers serially
+in one forward, so the single buffer is race-free (same argument as `ffn_act_q8`).
+
+| | steady process (nvidia-smi) | TTFT @ 11k (n=3) |
+|---|---:|---:|
+| lazy rebuild (incident) | 55.8 GiB | 27.1 s |
+| decline, no scratch | 46.7 GiB | ~89 s (3.3×) |
+| **cycled scratch (landed)** | **45.7 GiB** | **28.9 s (+6.5%)** |
+
+Steady total now equals ledger (45.45) + ~0.2 non-ledger, sits under the
+0.38 × 121.6 = 46.2 GiB budget, and the util-term is a REAL ceiling: this boot's
+pool filled the remaining budget (39,038 blocks) and the process stopped exactly
+at it. `ATLAS_LOW_MEMORY_FFN_MMQ=1` still buys the resident repack back;
+`ATLAS_KV_REUSE_FACTOR=1` pins the pool at the 32,001-block working set for a
+~42 GiB deterministic total if more margin is wanted over prefix-cache retention.

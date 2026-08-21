@@ -102,6 +102,8 @@ pub struct BufferArena {
     /// `ffn_act_q8`: q8_1 activations for the Q4_K MMQ gate/up GEMM.
     /// `ffn_act_a` / `ffn_act_scale`: int8 (a_i8 / a_scale) — reused for NVFP4 packed/scale.
     ffn_act_q8: DevicePtr,
+    /// Cycled `--low-memory` MMQ repack scratch (see `BufferSizes::ffn_mmq_scratch`).
+    ffn_mmq_scratch: DevicePtr,
     ffn_act_a: DevicePtr,
     ffn_act_scale: DevicePtr,
     /// Persistent FP8 block-scaled activation scratch for prefill projections.
@@ -205,6 +207,11 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
+        let ffn_mmq_scratch = if sizes.ffn_mmq_scratch > 0 {
+            gpu.alloc(sizes.ffn_mmq_scratch)?
+        } else {
+            DevicePtr::NULL
+        };
         let ffn_act_a = if sizes.ffn_act_a > 0 {
             gpu.alloc(sizes.ffn_act_a)?
         } else {
@@ -291,6 +298,7 @@ impl BufferArena {
             ssd_scratch,
             token_ids,
             ffn_act_q8,
+            ffn_mmq_scratch,
             ffn_act_a,
             ffn_act_scale,
             fp8_act,
@@ -357,6 +365,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             ssd_scratch,
             token_ids,
             ffn_act_q8,
+            ffn_mmq_scratch,
             ffn_act_a,
             ffn_act_scale,
             fp8_act,
@@ -400,6 +409,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *ssd_scratch,
             *token_ids,
             *ffn_act_q8,
+            *ffn_mmq_scratch,
             *ffn_act_a,
             *ffn_act_scale,
             *fp8_act,
@@ -448,6 +458,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
         *ssd_scratch = DevicePtr::NULL;
         *token_ids = DevicePtr::NULL;
         *ffn_act_q8 = DevicePtr::NULL;
+        *ffn_mmq_scratch = DevicePtr::NULL;
         *ffn_act_a = DevicePtr::NULL;
         *ffn_act_scale = DevicePtr::NULL;
         *fp8_act = DevicePtr::NULL;

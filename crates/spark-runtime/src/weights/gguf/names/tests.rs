@@ -4,6 +4,20 @@
 
 use super::*;
 
+/// The pre-MTP two-argument spelling of [`super::translate`]. Every case below
+/// predates the `mtp_block` parameter and asserts the no-predictor behaviour, so
+/// this shim keeps them reading as the main-stack contract they are. Explicit
+/// items shadow the `use super::*` glob, so `translate(a, b)` here is this fn.
+/// The predictor cases pass `Some(_)` to `super::translate` directly.
+fn translate(gguf_name: &str, arch: &str) -> Option<GgufName> {
+    super::translate(gguf_name, arch, None)
+}
+
+/// [`super::translate`] with an explicit MTP predictor-block index.
+fn translate_mtp(gguf_name: &str, arch: &str, mtp_block: usize) -> Option<GgufName> {
+    super::translate(gguf_name, arch, Some(mtp_block))
+}
+
 fn direct(name: &str) -> Option<GgufName> {
     Some(GgufName::Direct(name.to_string()))
 }
@@ -489,4 +503,149 @@ fn keep_packed_proj_scoped_to_dense_ffn() {
     ));
     // A bias must never match (only .weight projections are packed).
     assert!(!is_keep_packed_proj("model.layers.0.mlp.gate_proj.bias"));
+}
+
+// ── MTP / `nextn` predictor block (Qwen3.5 family) ───────────────────────────
+//
+// Names and shapes pinned against `unsloth/Qwen3.8-27B-NVFP4`'s
+// `model_mtp.safetensors` (15 tensors) and the `blk.64.*` block of
+// `orcarouter/Qwen3.8-27B-Uncensored-GGUF` (Q6_K, read 2026-08-18).
+
+/// The four `nextn.*` combiner tensors are MTP-only and have no main-stack
+/// analog — before the mapping existed they fell through to `None` and were
+/// silently dropped, leaving the MTP head unloadable.
+#[test]
+fn qwen35_nextn_combiner_maps_to_mtp() {
+    assert_eq!(
+        translate_mtp("blk.64.nextn.eh_proj.weight", "qwen35", 64),
+        direct("mtp.fc.weight")
+    );
+    assert_eq!(
+        translate_mtp("blk.64.nextn.enorm.weight", "qwen35", 64),
+        direct("mtp.pre_fc_norm_embedding.weight")
+    );
+    assert_eq!(
+        translate_mtp("blk.64.nextn.hnorm.weight", "qwen35", 64),
+        direct("mtp.pre_fc_norm_hidden.weight")
+    );
+    assert_eq!(
+        translate_mtp("blk.64.nextn.shared_head_norm.weight", "qwen35", 64),
+        direct("mtp.norm.weight")
+    );
+}
+
+/// The predictor's own transformer layer carries the SAME stems as a main-stack
+/// full-attention layer. Those must land under `mtp.layers.0.*`, not
+/// `model.layers.64.*` — the wrong answer loads ~0.9 GiB nothing reads and
+/// leaves speculative decode with no head.
+#[test]
+fn qwen35_mtp_layer_maps_to_mtp_layers_0() {
+    for (gguf, hf) in [
+        ("attn_norm.weight", "mtp.layers.0.input_layernorm.weight"),
+        (
+            "post_attention_norm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+        ),
+        ("attn_q.weight", "mtp.layers.0.self_attn.q_proj.weight"),
+        ("attn_k.weight", "mtp.layers.0.self_attn.k_proj.weight"),
+        ("attn_v.weight", "mtp.layers.0.self_attn.v_proj.weight"),
+        ("attn_output.weight", "mtp.layers.0.self_attn.o_proj.weight"),
+        ("attn_q_norm.weight", "mtp.layers.0.self_attn.q_norm.weight"),
+        ("attn_k_norm.weight", "mtp.layers.0.self_attn.k_norm.weight"),
+        ("ffn_gate.weight", "mtp.layers.0.mlp.gate_proj.weight"),
+        ("ffn_up.weight", "mtp.layers.0.mlp.up_proj.weight"),
+        ("ffn_down.weight", "mtp.layers.0.mlp.down_proj.weight"),
+    ] {
+        assert_eq!(
+            translate_mtp(&format!("blk.64.{gguf}"), "qwen35", 64),
+            direct(hf),
+            "blk.64.{gguf}"
+        );
+    }
+}
+
+/// Every one of the 15 tensors Atlas's `load_mtp` reads must be produced, and
+/// the GGUF block must contribute nothing else. This is the completeness check
+/// the per-name cases above cannot make.
+#[test]
+fn qwen35_mtp_block_covers_every_tensor_load_mtp_reads() {
+    // The real blk.64 tensor list of Qwen3.8-27B-Uncensored-Q6_K.
+    let gguf_block = [
+        "attn_k.weight",
+        "attn_k_norm.weight",
+        "attn_norm.weight",
+        "attn_output.weight",
+        "attn_q.weight",
+        "attn_q_norm.weight",
+        "attn_v.weight",
+        "ffn_down.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "nextn.eh_proj.weight",
+        "nextn.enorm.weight",
+        "nextn.hnorm.weight",
+        "nextn.shared_head_norm.weight",
+        "post_attention_norm.weight",
+    ];
+    let mut produced: Vec<String> = gguf_block
+        .iter()
+        .map(|sub| {
+            match translate_mtp(&format!("blk.64.{sub}"), "qwen35", 64) {
+                Some(GgufName::Direct(hf)) => hf,
+                other => panic!("blk.64.{sub} did not map: {other:?}"),
+            }
+        })
+        .collect();
+    produced.sort();
+
+    // Exactly the 15 keys `weight_map::loaders_moe::load_mtp` looks up for a
+    // dense-FFN MTP head.
+    let mut expected = vec![
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    ];
+    expected.sort_unstable();
+    assert_eq!(produced, expected);
+}
+
+/// Main-stack blocks must be untouched by the predictor mapping, and a file
+/// with no predictor (`None`) must translate blk.64 as an ordinary layer — the
+/// exact behaviour every pre-existing GGUF still gets.
+#[test]
+fn qwen35_main_stack_blocks_are_not_diverted_to_mtp() {
+    assert_eq!(
+        translate_mtp("blk.63.attn_q.weight", "qwen35", 64),
+        direct("model.layers.63.self_attn.q_proj.weight")
+    );
+    assert_eq!(
+        translate_mtp("blk.0.attn_qkv.weight", "qwen35", 64),
+        direct("model.layers.0.linear_attn.in_proj_qkv.weight")
+    );
+    assert_eq!(
+        translate("blk.64.attn_q.weight", "qwen35"),
+        direct("model.layers.64.self_attn.q_proj.weight")
+    );
+}
+
+/// The predictor mapping is qwen35-family only: a llama GGUF that happens to
+/// pass an index must not have its blocks renamed.
+#[test]
+fn mtp_mapping_is_scoped_to_qwen35_arches() {
+    assert_eq!(
+        translate_mtp("blk.64.attn_q.weight", "llama", 64),
+        direct("model.layers.64.self_attn.q_proj.weight")
+    );
 }

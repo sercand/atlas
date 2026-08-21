@@ -311,7 +311,37 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             // Keep-packed projections are 2-bit blocks, not BF16 — there is
             // nothing to snapshot (dense_auto has no PackedQ2_0 arm and would
             // abort the load), and the ffn_q2 arm below owns their compute.
-            let ffn_bf16_snapshot = if !ffn_q2 && matches!(variant, Nvfp4Variant::Bf16Raw) {
+            // `--low-memory` declines the snapshot. It is the FFN's SECOND full
+            // resident layout — BF16 gate/up/down on top of the NVFP4 copies
+            // `load_dense_ffn` builds — and it buys PREFILL SPEED only: with it
+            // absent, `forward_prefill` falls through the BF16 arm to the
+            // w4a16 arm over the very NVFP4 weights decode already reads (the
+            // Bf16Raw arm of `quantized_any` runtime-quantizes for real, so
+            // those weights are present, not the NULL placeholders a
+            // BF16-native layer carries). Same trade, same reasoning as
+            // `DenseFfnLayer::finalize_nvfp4_mmq_load`'s low-memory bail.
+            //
+            // MEASURED 2026-08-18 on Qwen3.8-27B-Uncensored-Q6_K (GGUF →
+            // Bf16Raw, 64 dense-FFN layers at intermediate_size 17408): the
+            // snapshot is 192 × 170 MiB = 31.88 GiB of the 61.58 GiB pre-KV
+            // footprint — by far the largest single owner, and enough on its own
+            // to leave a 121.6 GiB GB10 with no room for a KV cache.
+            //
+            // Flag OFF is byte-identical to the previous behaviour, so the
+            // Holo/Ornith Bf16Raw checkpoints this snapshot was written for keep
+            // their fast BF16 tensor-core prefill unchanged.
+            let low_memory = spark_runtime::alloc_label::low_memory();
+            if low_memory && !ffn_q2 && matches!(variant, Nvfp4Variant::Bf16Raw) && i == 0 {
+                tracing::info!(
+                    "--low-memory: declining the dense-FFN BF16 prefill snapshot \
+                     (Bf16Raw). Prefill runs w4a16 over the NVFP4 weights decode \
+                     reads — one FFN layout instead of two."
+                );
+            }
+            let ffn_bf16_snapshot = if !low_memory
+                && !ffn_q2
+                && matches!(variant, Nvfp4Variant::Bf16Raw)
+            {
                 let inter = if config.intermediate_size > 0 {
                     config.intermediate_size
                 } else {
@@ -496,7 +526,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                 } else {
                                     let dense_bf16 =
                                         dense_auto(store, &format!("{prefix}.weight"), gpu)?;
-                                    quantize_to_nvfp4(
+                                    let q = quantize_to_nvfp4(
                                         &dense_bf16,
                                         full_n,
                                         full_k,
@@ -504,7 +534,36 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                         absmax_k,
                                         quantize_k,
                                         stream,
-                                    )?
+                                    )?;
+                                    // The BF16 dequant is ONLY the quantize input:
+                                    // prefill and decode both dispatch the NVFP4
+                                    // weight built above. Free it rather than retain a
+                                    // full BF16 copy of every q/k/v/o for the model's
+                                    // lifetime (Atlas issue #A1). The sibling
+                                    // `Standard | Fp8Dequanted` arm below has always
+                                    // done this; this arm — the one mixed-precision
+                                    // compressed-tensors checkpoints take, where
+                                    // `dense_auto` DEQUANTS FP8 into a fresh buffer
+                                    // rather than aliasing the store — was missed, so
+                                    // the leak only ever fired on the checkpoints whose
+                                    // attention ships FP8.
+                                    let key = format!("{prefix}.weight");
+                                    // Retire BEFORE the free so the alias check
+                                    // compares a LIVE pointer: once freed,
+                                    // `dense_bf16.weight` is a dangling value
+                                    // that would compare unequal to the store
+                                    // and wave through the very case the check
+                                    // exists to catch.
+                                    //
+                                    // With the BF16 gone and the NVFP4 built,
+                                    // the store's FP8 original has no reader —
+                                    // q/k/v/o across the attention layers, which
+                                    // the store otherwise holds until teardown.
+                                    store.retire(&key, &[dense_bf16.weight]);
+                                    if dense_bf16.weight != store.get(&key)?.ptr {
+                                        gpu.free(dense_bf16.weight)?;
+                                    }
+                                    q
                                 };
                                 if tp_size == 1 {
                                     return Ok(src);
@@ -1072,7 +1131,41 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             Nvfp4Variant::Standard,
                         )?;
                         let qkvz_nvfp4 = qkv_qw.concat_rows(&z_qw, qkv_rows, z_rows, h, gpu)?;
-                        let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
+                        // `concat_rows` copies both inputs into a fresh
+                        // [Q|K|V|Z] buffer and `quantized_auto`'s Standard arm
+                        // ALIASES the store, so after the concat the store's
+                        // in_proj_qkv / in_proj_z tensors have no live reader
+                        // in this arm (`ssm.in_proj_qkvz` is NULL below; every
+                        // dispatcher reads the concat or a twin of it). Retire
+                        // them — ~45 MiB × 48 SSM layers = 2.1 GiB on the 27B.
+                        // The free happens at ONE point in `build_model` after
+                        // all loaders ran; validate any change here with
+                        // ATLAS_POISON_RETIRED_WEIGHTS=1. out_proj gets NO such
+                        // retirement: its QuantizedWeight aliases the store for
+                        // the model's lifetime.
+                        let kept = [qkvz_nvfp4.weight, qkvz_nvfp4.weight_scale];
+                        for pfx in [format!("{la}.in_proj_qkv"), format!("{la}.in_proj_z")] {
+                            for suffix in [".weight", ".weight_scale", ".weight_scale_2", ".input_scale"] {
+                                let name = format!("{pfx}{suffix}");
+                                if store.contains(&name) {
+                                    store.retire(&name, &kept);
+                                }
+                            }
+                        }
+                        // `--low-memory`: the transposed twins are a SECOND
+                        // resident layout of the same NVFP4 weights, kept only
+                        // for coalesced N-dim prefill reads. Every dispatcher
+                        // (trait_prefill_proj / trait_prefill_helper /
+                        // trait_decode_batched) falls through to the
+                        // non-transposed `w4a16_gemm` over the packed bytes
+                        // when the twin is absent — same space-for-bandwidth
+                        // trade the dequant/requant arm below already takes.
+                        let lowmem = spark_runtime::alloc_label::low_memory();
+                        let qkvz_nvfp4_t = if lowmem {
+                            None
+                        } else {
+                            Some(qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?)
+                        };
 
                         let out_proj_nvfp4 = quantized_auto(
                             store,
@@ -1080,8 +1173,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             gpu,
                             Nvfp4Variant::Standard,
                         )?;
-                        let out_proj_nvfp4_t =
-                            out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
+                        let out_proj_nvfp4_t = if lowmem {
+                            None
+                        } else {
+                            Some(out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?)
+                        };
 
                         let ssm = SsmWeights {
                             in_proj_qkvz: DenseWeight {
@@ -1100,15 +1196,28 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             post_attn_norm,
                             ffn,
                             Some(qkvz_nvfp4),
-                            Some(qkvz_nvfp4_t),
-                            Some(out_proj_nvfp4_t),
+                            qkvz_nvfp4_t,
+                            out_proj_nvfp4_t,
                             config,
                             gpu,
                         )?;
-                        layer.predequant_for_prefill(gpu, config, stream)?;
+                        // The FP8 out_proj predequant is a PREFILL-bandwidth
+                        // copy derived FROM the NVFP4 bytes — on a pre-quantized
+                        // checkpoint it adds no precision (30 MiB × 48 layers =
+                        // 1.4 GiB). It is keyed off `out_proj_nvfp4_t` inside
+                        // `predequant_for_prefill`, so under `--low-memory`
+                        // (twin absent) it is skipped with the twins.
+                        if !lowmem {
+                            layer.predequant_for_prefill(gpu, config, stream)?;
+                        }
                         tracing::info!(
                             "SSM[{lp}] native NVFP4 GDN: qkvz+out_proj loaded pre-quantized \
-                             (U8-packed on disk; no BF16 dequant/requant roundtrip)"
+                             (U8-packed on disk; no BF16 dequant/requant roundtrip){}",
+                            if lowmem {
+                                " — --low-memory: transposed twins + FP8 out_proj predequant declined"
+                            } else {
+                                ""
+                            }
                         );
                         layers.push(Box::new(layer));
                         continue;
@@ -1120,7 +1229,19 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // way; the NVFP4 build continues underneath because decode
                     // still needs it — `w8a16_gemv` cannot index a per-row
                     // scale. See weight_loader/qwen35_dense/rowwise_fp8.rs.
-                    let rowwise_gdn = rowwise_fp8::rowwise_fp8_enabled()
+                    // `--low-memory` declines the row-wise prefill arm. It is a
+                    // QUALITY feature, not a speed one: it keeps the SSM
+                    // projections at checkpoint precision through prefill instead
+                    // of dequant->requantising them to NVFP4, and
+                    // `rowwise_fp8.rs` records what the double-quant cost when it
+                    // was last measured (BFCL-ST non_live 85.4 -> 76.6). It buys
+                    // that with a full extra FP8 copy of in_proj — 80 MiB x 48
+                    // layers = 3.75 GiB. On a card where the model would not
+                    // otherwise fit, no accuracy is available at all, so the
+                    // flag trades it back; prefill then runs the NVFP4 qkvz that
+                    // decode already uses (`trait_prefill_proj.rs`).
+                    let rowwise_gdn = !spark_runtime::alloc_label::low_memory()
+                        && rowwise_fp8::rowwise_fp8_enabled()
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_qkv"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.in_proj_z"))
                         && rowwise_fp8::proj_is_fp8_per_row(store, &format!("{la}.out_proj"));
@@ -1148,6 +1269,45 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     let z_dense = load_ssm_proj(&format!("{la}.in_proj_z"), z_rows, h)?;
                     let out_proj_dense =
                         load_ssm_proj(&format!("{la}.out_proj"), h, dims.full_value_dim())?;
+
+                    // Both consumers of the on-disk in_proj_qkv / in_proj_z have
+                    // now COPIED out of them, so the store's originals are dead:
+                    //
+                    //   1. the row-wise prefill arm above — `load_fp8_per_row`
+                    //      aliases the store, but `concat_fp8_per_row` copy_d2d's
+                    //      both into one fresh [Q|K|V|Z] buffer and only that
+                    //      buffer is kept;
+                    //   2. `load_ssm_proj` here — for this checkpoint's per-row
+                    //      FP8 that is `dense_auto` -> `dequant_fp8_blockscaled_to_bf16`,
+                    //      a fresh BF16 allocation.
+                    //
+                    // At Qwen3.8-27B that is [10240,5120] + [6144,5120] FP8 =
+                    // 50 + 30 MiB per layer x 48 SSM layers = 3.75 GiB that
+                    // stayed resident for the model's lifetime with no reader.
+                    //
+                    // `out_proj` is deliberately NOT retired: `out_r` above is a
+                    // live ALIAS of the store tensor, held for prefill for the
+                    // model's lifetime. Retiring it would be a use-after-free.
+                    //
+                    // The pointer argument is the safety net rather than
+                    // decoration, and it guards consumer 2 specifically: whether
+                    // `dense_auto` copied or aliased is a property of the
+                    // checkpoint's dtype, not of this code. On a BF16 checkpoint
+                    // it returns the store pointer unchanged and `retire`
+                    // refuses. (That case also means the `gpu.free(qkv_dense)`
+                    // below is already freeing store memory — a separate
+                    // pre-existing hazard on BF16 GDN checkpoints, which this
+                    // check at least declines to compound.)
+                    store.retire(&format!("{la}.in_proj_qkv.weight"), &[qkv_dense.weight]);
+                    store.retire(&format!("{la}.in_proj_z.weight"), &[z_dense.weight]);
+                    // `out_proj` is retirable ONLY when the row-wise arm declined
+                    // to alias it. With that arm active (the default) the alias
+                    // is live for prefill for the model's lifetime and retiring
+                    // it would be a use-after-free — which is why this is keyed
+                    // on the same condition rather than on a guess.
+                    if qkvz_rowwise.is_none() {
+                        store.retire(&format!("{la}.out_proj.weight"), &[out_proj_dense.weight]);
+                    }
 
                     let qkvz_dense =
                         gpu_concat_rows(&qkv_dense, qkv_rows, &z_dense, z_rows, h, gpu)?;
@@ -1312,7 +1472,20 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         stream,
                     )?;
 
-                    let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
+                    // `--low-memory`: these transposed twins are a SECOND
+                    // resident layout of the same weights, kept only so prefill
+                    // gets coalesced N-dim reads. Both SSM prefill dispatchers
+                    // already fall through to the non-transposed `w4a16_gemm`
+                    // over the packed bytes when the twin is absent
+                    // (`trait_prefill_proj.rs` for qkvz,
+                    // `trait_prefill_helper.rs` for out_proj), so dropping them
+                    // is a space-for-bandwidth trade, not a numerics change.
+                    let lowmem = spark_runtime::alloc_label::low_memory();
+                    let qkvz_nvfp4_t = if lowmem {
+                        None
+                    } else {
+                        Some(qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?)
+                    };
 
                     let out_proj_nvfp4 = quantize_to_nvfp4(
                         &out_proj_dense,
@@ -1324,7 +1497,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         stream,
                     )?;
 
-                    let out_proj_nvfp4_t = out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
+                    let out_proj_nvfp4_t = if lowmem {
+                        None
+                    } else {
+                        Some(out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?)
+                    };
 
                     // Native FP8 SSM prefill GEMM: build a single-scale FP8
                     // copy of `qkvz_dense` [qkvz_size, h] and `out_proj_dense`
@@ -1334,18 +1511,45 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // `fp8_gemm_n128` kernel interprets the FP8 bytes as
                     // values directly (mirrors how `predequant_nvfp4_to_fp8`
                     // bakes `scale2` into the FP8 stream). PCND: gated.
+                    // Skip the QKVZ copy when the row-wise arm will shadow it on
+                    // every path that reads it — it is 80 MiB × 48 SSM layers =
+                    // 3.75 GiB of buffer that no kernel ever touches:
+                    //   * prefill  — `trait_prefill_proj.rs` tests
+                    //     `qkvz_fp8w_rowwise` (:74) BEFORE `qkvz_fp8` (:309)
+                    //   * batched decode — `trait_decode_batched.rs` takes the
+                    //     NVFP4 `_t` arm above `:444` unless
+                    //     ATLAS_NO_QKVZ_NVFP4_DECODE is set, so honour that
+                    //     kill-switch here or the fallback it re-enables is gone.
+                    // out_proj gets NO such skip: `trait_decode_batched.rs:1087`
+                    // reads `out_proj_fp8` for real, so dropping it would change
+                    // batched-verify numerics rather than just free memory.
+                    // Under `--low-memory` the FP8 prefill copy is dead too:
+                    // with the row-wise arm declined above, prefill falls through
+                    // to the NVFP4 qkvz rather than to this. Without this clause,
+                    // turning the row-wise arm off would simply hand the 3.75 GiB
+                    // back to a different buffer — which is exactly what
+                    // ATLAS_FP8_ROWWISE=0 does today, and why that flag saves
+                    // nothing.
+                    let qkvz_fp8_dead = spark_runtime::alloc_label::low_memory()
+                        || (qkvz_rowwise.is_some()
+                            && std::env::var_os("ATLAS_NO_QKVZ_NVFP4_DECODE").is_none());
                     let (qkvz_fp8_prefill, out_proj_fp8_prefill) =
                         if let Some(b2f_k) = bf16_to_fp8_k {
-                            let qkvz_total = (qkvz_size * h) as u32;
-                            let qkvz_fp8 = gpu.alloc(qkvz_size * h)?;
-                            crate::layers::ops::bf16_to_fp8(
-                                gpu,
-                                b2f_k,
-                                qkvz_dense.weight,
-                                qkvz_fp8,
-                                qkvz_total,
-                                stream,
-                            )?;
+                            let qkvz_fp8 = if qkvz_fp8_dead {
+                                None
+                            } else {
+                                let qkvz_total = (qkvz_size * h) as u32;
+                                let qkvz_fp8 = gpu.alloc(qkvz_size * h)?;
+                                crate::layers::ops::bf16_to_fp8(
+                                    gpu,
+                                    b2f_k,
+                                    qkvz_dense.weight,
+                                    qkvz_fp8,
+                                    qkvz_total,
+                                    stream,
+                                )?;
+                                Some(qkvz_fp8)
+                            };
                             let out_total = (h * value_dim) as u32;
                             let out_fp8 = gpu.alloc(h * value_dim)?;
                             crate::layers::ops::bf16_to_fp8(
@@ -1357,7 +1561,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                 stream,
                             )?;
                             gpu.synchronize(stream)?;
-                            (Some(qkvz_fp8), Some(out_fp8))
+                            (qkvz_fp8, Some(out_fp8))
                         } else {
                             (None, None)
                         };
@@ -1387,8 +1591,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         post_attn_norm,
                         ffn,
                         Some(qkvz_nvfp4),
-                        Some(qkvz_nvfp4_t),
-                        Some(out_proj_nvfp4_t),
+                        qkvz_nvfp4_t,
+                        out_proj_nvfp4_t,
                         config,
                         gpu,
                     )?;
@@ -1400,7 +1604,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     // `w4a16_gemm_t`. Decode batch paths keep their NVFP4
                     // fallback (the `qkvz_nvfp4*` fields above).
                     if qkvz_fp8_prefill.is_some() || out_proj_fp8_prefill.is_some() {
-                        layer.set_fp8_prefill_only_weights(qkvz_fp8_prefill, out_proj_fp8_prefill);
+                        layer.set_fp8_prefill_only_weights(
+                            qkvz_fp8_prefill,
+                            out_proj_fp8_prefill,
+                            gpu,
+                        )?;
                     }
                     // …and LAST, so it wins over both of the prefill installs
                     // above: the checkpoint's own per-row FP8, which reaches

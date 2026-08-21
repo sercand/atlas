@@ -520,7 +520,7 @@ pub(super) fn build_linear_attention_nvfp4(
         // `fp8_gemm_n128` instead of `w4a16_gemm_t`. Decode batch paths
         // retain their NVFP4 fallback via the `qkvz_nvfp4*` fields above.
         if qkvz_fp8_prefill.is_some() || out_proj_fp8_prefill.is_some() {
-            layer.set_fp8_prefill_only_weights(qkvz_fp8_prefill, out_proj_fp8_prefill);
+            layer.set_fp8_prefill_only_weights(qkvz_fp8_prefill, out_proj_fp8_prefill, gpu)?;
         }
     }
     // ATLAS_GDN_BF16_WEIGHTS=1 extension: also install BF16 out_proj so

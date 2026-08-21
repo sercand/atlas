@@ -531,6 +531,19 @@ impl DenseFfnLayer {
     /// transposed `_t` copies so net FFN footprint stays at the NVFP4 baseline. Down is
     /// untouched (hybrid: it stays on the default t_m128 path for accuracy → keeps its
     /// `_t` copy). No-op unless the env + kernels are present.
+    /// `--low-memory` declines the FFN MMQ repack (the FFN's SECOND resident
+    /// layout, 8.96 GiB on the 27B) unless `ATLAS_LOW_MEMORY_FFN_MMQ=1` buys
+    /// it back. ONE predicate for BOTH the eager build (`finalize_nvfp4_mmq_load`)
+    /// and the runtime dispatch (`fp4mmq_prefill`): gating only the eager build
+    /// was the 2026-08-19 incident — the first prefill's
+    /// `ensure_nvfp4_mmq_weight` silently rebuilt all 192 repacks (+8.96 GiB,
+    /// +~1.5 GiB scratch), growing the process 46.6 → 55.8 GiB (nvidia-smi)
+    /// on request #1 and blowing through the host reserve. Latched: env-stable
+    /// for the process lifetime, and the hot prefill path must not re-read env.
+    fn ffn_mmq_declined_by_low_memory() -> bool {
+        spark_runtime::alloc_label::low_memory_ffn_mmq_declined()
+    }
+
     pub fn finalize_nvfp4_mmq_load(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -543,6 +556,31 @@ impl DenseFfnLayer {
         // present) and repacks the NVFP4 gate/up — over NULL pointers that's a
         // CUDA-700 illegal access. Packed-Q2 uses its own decode/prefill path.
         if self.q2_weights.is_some() {
+            return Ok(());
+        }
+        // `--low-memory`: the MMQ repack is the FFN's SECOND resident layout.
+        // Skipping it leaves `w4a16_prefill_gemm` with no `wt`, so prefill falls
+        // through to the non-transposed `w4a16_gemm` over the packed bytes
+        // decode already reads — one layout instead of two.
+        //
+        // `ATLAS_LOW_MEMORY_FFN_MMQ=1` buys the repack back while keeping the
+        // rest of `--low-memory`. It exists because the two layouts
+        // `--low-memory` declines are NOT the same size or the same value:
+        //
+        // MEASURED 2026-08-18, Qwen3.8-27B-Uncensored-Q6_K (GGUF → Bf16Raw,
+        // GB10, 0.45 util, n=3 each, only the `--speculative` flags differing):
+        // with the repack skipped, speculative decode accepted 713/1024 drafts
+        // (70%) yet moved the rate not at all — 7.3–9.0 tok/s with MTP vs
+        // 7.4–9.0 without. Draft acceptance that high buying nothing means the
+        // K+1 verify step costs about what K serial steps cost, which is what a
+        // batched GEMM with no transposed/MMQ layout to read looks like. The
+        // repack is ~8.96 GiB on this model against the 31.88 GiB BF16 FFN
+        // snapshot the loader declines under the same flag — so on a box that
+        // fits one but not both, this is the one worth keeping.
+        //
+        // Default OFF: turning it on unconditionally would hand every existing
+        // `--low-memory` NVFP4 user 8.96 GiB of footprint they did not ask for.
+        if Self::ffn_mmq_declined_by_low_memory() {
             return Ok(());
         }
         let active = self.nvfp4_mmq_nc_k.0 != 0
@@ -1919,7 +1957,20 @@ impl DenseFfnLayer {
             && self.nvfp4_quant_act_k.0 != 0
             && self.nvfp4_silu_scaled_k.0 != 0
             && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none()
+            // `--low-memory`: the resident per-projection repacks were
+            // declined at load, and this arm's `ensure_nvfp4_mmq_weight`
+            // would lazily rebuild all 192 of them (+8.96 GiB on the first
+            // prefill — the 2026-08-19 incident). Instead the arm repacks
+            // into the arena's single cycled scratch per projection
+            // (`ffn_mmq_scratch`, ~50 MiB) — same bytes, same kernels, zero
+            // numerics change, one resident copy instead of 192. Only when
+            // the arena actually sized that scratch (predicate drift guard):
+            // otherwise the arm goes dark and prefill falls through to
+            // w4a16 over the packed bytes decode reads (measured 3.3x slower
+            // TTFT at 11k — correct but slow, hence the scratch).
+            && (!Self::ffn_mmq_declined_by_low_memory()
+                || !ctx.buffers.ffn_mmq_scratch().is_null());
         if fp4mmq_prefill {
             // Log-once latch (see `atlas_core::scope`). It holds no model-derived
             // value — the message is rebuilt from the arguments every call — so a
@@ -2048,8 +2099,28 @@ impl DenseFfnLayer {
                     // missing ×scale2, folded downstream (scaled SiLU-mul / scale_bf16).
                     _ if $allow_fp4 => {
                         let _ = $in;
-                        let qw =
-                            self.ensure_nvfp4_mmq_weight($fp4cell, ctx.gpu, $w, $n, $k, stream)?;
+                        let qw = if Self::ffn_mmq_declined_by_low_memory() {
+                            // Cycled repack: overwrite the shared scratch with
+                            // THIS projection's block_nvfp4 form. Stream-ordered
+                            // with the GEMM that reads it and with the next
+                            // projection's repack; batched/co-dispatched prefill
+                            // runs layers serially in one forward, so no
+                            // cross-stream aliasing (same argument as ffn_act_q8).
+                            let scratch = ctx.buffers.ffn_mmq_scratch();
+                            ops::nvfp4_mmq_repack(
+                                ctx.gpu,
+                                self.nvfp4_repack_k,
+                                $w.weight,
+                                $w.weight_scale,
+                                scratch,
+                                $n,
+                                $k,
+                                stream,
+                            )?;
+                            Fp4MmqWeight { w: scratch }
+                        } else {
+                            self.ensure_nvfp4_mmq_weight($fp4cell, ctx.gpu, $w, $n, $k, stream)?
+                        };
                         // Size the M tile to the batch when the batch is small and
                         // the small-tile entries are present. m must be <= mmq_x or
                         // grid.y>1 re-streams the weights per tile.

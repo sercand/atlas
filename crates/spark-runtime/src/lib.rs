@@ -3,6 +3,7 @@
 #![deny(warnings)]
 #![deny(clippy::all)]
 
+pub mod alloc_label;
 pub mod buffers;
 #[cfg(feature = "cuda")]
 pub mod cublaslt;

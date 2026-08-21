@@ -169,12 +169,28 @@ pub(crate) fn preflight_reserve(
     let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
         * config.num_ssm_layers()
         * (h_state_bytes + conv_state_bytes);
-    let cuda_headroom: usize =
-        if args.speculative || args.self_speculative || args.ngram_speculative {
-            4 * 1024 * 1024 * 1024
-        } else {
-            512 * 1024 * 1024
-        };
+    // ATLAS_CUDA_HEADROOM_MB overrides the flat default. The 4 GiB
+    // speculative figure is not padding at long context: it absorbs the MTP
+    // drafter's KV pool (tracks the main pool's block count; ~2 GiB BF16 at
+    // 128k x bs=4, ~1 GiB fp8), the whole-prompt hidden capture
+    // ([max_seq_len, hidden] BF16, 1.22 GiB at 128k on the 27B), and runtime
+    // workspaces that bypass the allocator ledger. Lower it ONLY together
+    // with a matching real reduction (e.g. ATLAS_MTP_KV_DTYPE=fp8 halves the
+    // drafter pool, which is what the 3072 MB serve profile pairs it with) —
+    // an unmatched cut moves the shortfall from the KV budget to a runtime
+    // OOM on unified memory, which is the failure mode that needs a
+    // power-cycle, not a clean error.
+    let cuda_headroom: usize = std::env::var("ATLAS_CUDA_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(
+            if args.speculative || args.self_speculative || args.ngram_speculative {
+                4 * 1024 * 1024 * 1024
+            } else {
+                512 * 1024 * 1024
+            },
+        );
     let gdn_two_phase_bytes: usize = {
         let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -297,6 +313,12 @@ pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
 ) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+    // BEFORE the backend exists: allocations made during its construction are
+    // in the ledger from the first one, and a flag set afterwards would silently
+    // miss them.
+    if args.mem_report {
+        spark_runtime::alloc_label::set_mem_report(true);
+    }
     let backend =
         spark_runtime::cuda_backend::AtlasCudaBackend::new(args.gpu_ordinal, &ptx_set.modules)
             .context("Failed to initialize CUDA backend")?;

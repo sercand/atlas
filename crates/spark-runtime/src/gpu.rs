@@ -109,6 +109,30 @@ pub trait GpuBackend: Send + Sync {
         0
     }
 
+    /// DIAGNOSTIC (`--mem-report`): log the live allocation set, attributed by
+    /// owning scope and by tensor size. No-op when reporting is off.
+    ///
+    /// Default empty: a backend with no allocation ledger has nothing to say,
+    /// and silence is the honest answer for the mock and for Metal.
+    fn dump_alloc_histo(&self, _tag: &str) {}
+
+    /// [`Self::dump_alloc_histo`] without the `--mem-report` gate — for
+    /// one-shot diagnostics on a production serve. Same default silence.
+    fn dump_alloc_histo_forced(&self, _tag: &str) {}
+
+    /// Total bytes in the live allocation ledger, or `None` if this backend
+    /// does not keep one (zero would read as "nothing allocated", which is a
+    /// different and false claim).
+    fn live_alloc_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Bytes held by live allocations whose `alloc_scope` label starts with
+    /// `prefix`. `0` for backends without a ledger.
+    fn live_alloc_bytes_under(&self, _prefix: &str) -> usize {
+        0
+    }
+
     /// Copy from host to device.
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()>;
 

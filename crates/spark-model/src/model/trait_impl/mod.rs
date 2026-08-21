@@ -282,6 +282,17 @@ impl Model for TransformerModel {
     fn bind_gpu_to_thread(&self) -> Result<()> {
         self.bind_gpu_to_thread_dispatch()
     }
+    fn log_runtime_footprint(&self, tag: &str) {
+        let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        let ledger = self.gpu.live_alloc_bytes();
+        let free = self.gpu.free_memory().ok();
+        tracing::info!(
+            "runtime footprint [{tag}]: ledger {} resident, free {}",
+            ledger.map_or_else(|| "n/a".into(), |b| format!("{:.2} GiB", gib(b))),
+            free.map_or_else(|| "n/a".into(), |b| format!("{:.2} GiB", gib(b))),
+        );
+        self.gpu.dump_alloc_histo_forced(tag);
+    }
     fn alloc_sequence(&self) -> Result<SequenceState> {
         self.alloc_sequence_dispatch()
     }

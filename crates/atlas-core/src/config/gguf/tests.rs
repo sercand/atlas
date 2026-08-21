@@ -10,10 +10,15 @@ struct Meta {
     f: HashMap<String, f64>,
     s: HashMap<String, String>,
     arr: HashMap<String, usize>,
+    au: HashMap<String, Vec<u64>>,
 }
 impl Meta {
     fn u(mut self, k: &str, v: u64) -> Self {
         self.u.insert(k.into(), v);
+        self
+    }
+    fn au(mut self, k: &str, v: &[u64]) -> Self {
+        self.au.insert(k.into(), v.to_vec());
         self
     }
     fn f(mut self, k: &str, v: f64) -> Self {
@@ -37,6 +42,9 @@ impl GgufMeta for Meta {
     }
     fn get_arr_len(&self, k: &str) -> Option<usize> {
         self.arr.get(k).copied()
+    }
+    fn get_arr_u64(&self, k: &str) -> Option<Vec<u64>> {
+        self.au.get(k).cloned()
     }
 }
 
@@ -280,4 +288,146 @@ fn unmapped_arch_errors() {
         has_output_weight: true,
     };
     assert!(config_from_gguf(&inp).is_err());
+}
+
+/// The REAL metadata block of `orcarouter/Qwen3.8-27B-Uncensored-GGUF`
+/// (`Qwen3.8-27B-Uncensored-Q6_K.gguf`, 866 tensors, read 2026-08-18). Every
+/// value below was dumped from that file's KV block, so the assertions in
+/// `qwen35_gguf_builds_full_hybrid_config` pin the synthesized config against a
+/// checkpoint that exists rather than a plausible-looking fixture.
+fn qwen38_27b_meta() -> Meta {
+    Meta::default()
+        .s("general.architecture", "qwen35")
+        .u("qwen35.embedding_length", 5120)
+        .u("qwen35.block_count", 65)
+        .u("qwen35.feed_forward_length", 17408)
+        .u("qwen35.attention.head_count", 24)
+        .u("qwen35.attention.head_count_kv", 4)
+        .u("qwen35.attention.key_length", 256)
+        .u("qwen35.attention.value_length", 256)
+        .u("qwen35.context_length", 262144)
+        .u("qwen35.nextn_predict_layers", 1)
+        .u("qwen35.ssm.conv_kernel", 4)
+        .u("qwen35.ssm.state_size", 128)
+        .u("qwen35.ssm.group_count", 16)
+        .u("qwen35.ssm.time_step_rank", 48)
+        .u("qwen35.ssm.inner_size", 6144)
+        .u("qwen35.full_attention_interval", 4)
+        .u("qwen35.rope.dimension_count", 64)
+        .au("qwen35.rope.dimension_sections", &[11, 11, 10, 0])
+        .f("qwen35.attention.layer_norm_rms_epsilon", 1e-6)
+        .f("qwen35.rope.freq_base", 10_000_000.0)
+}
+
+/// A bare `qwen35` GGUF must synthesize the SAME hybrid geometry that
+/// `unsloth/Qwen3.8-27B-NVFP4`'s `config.json` declares — otherwise the GDN
+/// layers, the MTP head and MRoPE are all silently misconfigured.
+#[test]
+fn qwen35_gguf_builds_full_hybrid_config() {
+    use crate::config::LayerType;
+    let m = qwen38_27b_meta();
+    let inp = GgufConfigInputs {
+        meta: &m,
+        token_embd_vocab: Some(248_320),
+        has_output_weight: true,
+    };
+    let c = config_from_gguf(&inp).unwrap();
+
+    assert_eq!(c.model_type, "qwen3_5");
+    assert!(c.is_qwen35_dense());
+    // Q IS gated on this arch (attn_q emits 2·24·256 = 12288 rows).
+    assert!(c.attn_gated);
+
+    // block_count 65 counts the nextn predictor; HF's num_hidden_layers is 64.
+    assert_eq!(c.num_hidden_layers, 64);
+    assert_eq!(c.mtp_num_hidden_layers, 1);
+
+    // 48 GDN + 16 full attention, full attention at every 4th layer.
+    assert_eq!(c.layer_types.len(), 64);
+    assert_eq!(c.num_ssm_layers(), 48);
+    assert_eq!(c.num_attention_layers(), 16);
+    assert_eq!(c.layer_types[0], LayerType::LinearAttention);
+    assert_eq!(c.layer_types[3], LayerType::FullAttention);
+    assert_eq!(c.layer_types[63], LayerType::FullAttention);
+
+    // GDN head geometry. The fused projection widths are the load-bearing
+    // check: they must equal the GGUF tensor rows (attn_qkv 10240, attn_gate
+    // 6144) or the weight loader slices the wrong regions.
+    assert_eq!(c.linear_num_key_heads, 16);
+    assert_eq!(c.linear_num_value_heads, 48);
+    assert_eq!(c.linear_key_head_dim, 128);
+    assert_eq!(c.linear_value_head_dim, 128);
+    assert_eq!(c.linear_conv_kernel_dim, 4);
+    assert_eq!(c.ssm_qkv_size(), 10_240);
+    assert_eq!(c.ssm_z_size(), 6_144);
+
+    // Partial rotary: GGUF stores the width (64), HF the fraction (0.25).
+    assert_eq!(c.head_dim, 256);
+    assert!((c.partial_rotary_factor - 0.25).abs() < 1e-9);
+
+    // MRoPE: 4-wide GGUF sections [11, 11, 10, 0] → HF's 3-wide [11, 11, 10].
+    assert_eq!(c.mrope_section, [11, 11, 10]);
+    assert!(c.mrope_interleaved);
+
+    assert_eq!(c.vocab_size, 248_320);
+    assert_eq!(c.weight_prefix, "model");
+    // A bare GGUF backbone has no vision tower (it is a separate mmproj file).
+    assert!(c.vision.is_none());
+}
+
+/// A qwen35 GGUF missing the GDN metadata must fail loudly, not fall through to
+/// a 64-layer all-full-attention config whose GDN tensors do not exist.
+#[test]
+fn qwen35_gguf_without_ssm_keys_errors() {
+    let m = Meta::default()
+        .s("general.architecture", "qwen35")
+        .u("qwen35.embedding_length", 5120)
+        .u("qwen35.block_count", 65)
+        .u("qwen35.feed_forward_length", 17408)
+        .u("qwen35.attention.head_count", 24)
+        .u("qwen35.attention.key_length", 256)
+        .u("qwen35.context_length", 262144)
+        .u("qwen35.vocab_size", 248_320);
+    let inp = GgufConfigInputs {
+        meta: &m,
+        token_embd_vocab: None,
+        has_output_weight: true,
+    };
+    let err = config_from_gguf(&inp).unwrap_err().to_string();
+    assert!(
+        err.contains("ssm.group_count"),
+        "error should name the missing GDN key, got: {err}"
+    );
+}
+
+/// `nextn_predict_layers` larger than `block_count` is corrupt metadata, not a
+/// reason to underflow the layer count.
+#[test]
+fn qwen35_nextn_exceeding_block_count_errors() {
+    let m = qwen38_27b_meta().u("qwen35.nextn_predict_layers", 66);
+    let inp = GgufConfigInputs {
+        meta: &m,
+        token_embd_vocab: Some(248_320),
+        has_output_weight: true,
+    };
+    assert!(config_from_gguf(&inp).is_err());
+}
+
+/// The non-hybrid arches must be untouched by the qwen35 work: no layer_types,
+/// no SSM fields, full RoPE, scalar RoPE.
+#[test]
+fn llama_stays_homogeneous_after_qwen35_support() {
+    let m = llama_meta();
+    let inp = GgufConfigInputs {
+        meta: &m,
+        token_embd_vocab: None,
+        has_output_weight: true,
+    };
+    let c = config_from_gguf(&inp).unwrap();
+    assert!(c.layer_types.is_empty());
+    assert_eq!(c.linear_num_key_heads, 0);
+    assert_eq!(c.mtp_num_hidden_layers, 0);
+    assert!((c.partial_rotary_factor - 1.0).abs() < 1e-9);
+    assert_eq!(c.mrope_section, [0, 0, 0]);
+    assert!(!c.mrope_interleaved);
 }

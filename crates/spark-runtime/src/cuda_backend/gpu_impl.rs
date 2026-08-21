@@ -118,7 +118,7 @@ impl GpuBackend for AtlasCudaBackend {
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
-        self.record_alloc(DevicePtr(dptr));
+        self.record_alloc(DevicePtr(dptr), bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -132,7 +132,7 @@ impl GpuBackend for AtlasCudaBackend {
                  Check system swap space: swapon --show"
             );
         }
-        self.record_alloc(DevicePtr(dptr));
+        self.record_alloc(DevicePtr(dptr), bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -160,6 +160,22 @@ impl GpuBackend for AtlasCudaBackend {
 
     fn sweep_unreleased(&self) -> usize {
         AtlasCudaBackend::sweep_unreleased(self)
+    }
+
+    fn dump_alloc_histo(&self, tag: &str) {
+        AtlasCudaBackend::dump_alloc_histo(self, tag)
+    }
+
+    fn dump_alloc_histo_forced(&self, tag: &str) {
+        AtlasCudaBackend::dump_alloc_histo_forced(self, tag)
+    }
+
+    fn live_alloc_bytes(&self) -> Option<usize> {
+        AtlasCudaBackend::live_alloc_bytes(self)
+    }
+
+    fn live_alloc_bytes_under(&self, prefix: &str) -> usize {
+        AtlasCudaBackend::live_alloc_bytes_under(self, prefix)
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {

@@ -47,10 +47,16 @@ const HF_PREFIX: &str = "model";
 /// `"gemma2"`). Returns `None` for names this translator does not recognize, so
 /// the loader can surface an explicit error rather than silently mis-storing a
 /// tensor.
-pub fn translate(gguf_name: &str, arch: &str) -> Option<GgufName> {
+///
+/// `mtp_block` is the `blk.N` index of the MTP / "next-N" predictor block, when
+/// the file has one (Qwen3.8-27B: `Some(64)`, the block after the 64-layer main
+/// stack). Its tensors translate to the flat `mtp.*` namespace the MTP head
+/// loader reads instead of `model.layers.64.*`; pass `None` for a checkpoint
+/// with no predictor block. See [`translate_qwen35_mtp`].
+pub fn translate(gguf_name: &str, arch: &str, mtp_block: Option<usize>) -> Option<GgufName> {
     // Per-arch override hook. Only `default` is populated today; add arms here
     // as GGUF variants diverge (e.g. a future arch that renames `ffn_norm`).
-    if let Some(overridden) = arch_override(gguf_name, arch) {
+    if let Some(overridden) = arch_override(gguf_name, arch, mtp_block) {
         return Some(overridden);
     }
     translate_default(gguf_name)
@@ -58,7 +64,18 @@ pub fn translate(gguf_name: &str, arch: &str) -> Option<GgufName> {
 
 /// Architecture-specific overrides. Return `Some(_)` to short-circuit
 /// [`translate_default`], `None` to fall through so [`translate_default`] runs.
-fn arch_override(gguf_name: &str, arch: &str) -> Option<GgufName> {
+fn arch_override(gguf_name: &str, arch: &str, mtp_block: Option<usize>) -> Option<GgufName> {
+    // The MTP predictor block is checked FIRST: its tensors carry the same
+    // stems as a main-stack full-attention layer (`attn_q`, `ffn_gate`, …) and
+    // would otherwise translate to `model.layers.{mtp_block}.*` — silently
+    // loading ~0.9 GiB of BF16 that nothing reads while the MTP head stays
+    // empty and speculative decode disables itself.
+    if let Some(mtp) = mtp_block
+        && matches!(arch, "qwen35" | "qwen3_5" | "qwen35moe")
+        && let Some(t) = translate_qwen35_mtp(gguf_name, mtp)
+    {
+        return Some(t);
+    }
     match arch {
         // Qwen3.5/3.6 GDN-hybrid (`general.architecture = qwen35`). llama.cpp
         // emits the linear-attention (Gated DeltaNet) projections under `ssm_*`
@@ -223,6 +240,75 @@ fn translate_clip(gguf_name: &str) -> Option<GgufName> {
         _ => return None,
     };
     Some(GgufName::Direct(hf))
+}
+
+/// Translate the Qwen3.5-family MTP ("next-N" / `nextn`) predictor block at
+/// `blk.{mtp}` into the flat `mtp.*` namespace `weight_map::loaders_moe::
+/// load_mtp` reads. Returns `None` for every other block so the caller falls
+/// through to the main-stack translation.
+///
+/// llama.cpp appends the predictor as one extra block whose tensors are named
+/// like any other full-attention layer, plus four `nextn.*` combiner tensors.
+/// Atlas keys the MTP head off `mtp.*` (its head is not a main-stack layer and
+/// is loaded by a separate call), so both halves are remapped here.
+///
+/// GGUF `blk.{mtp}.*` → Atlas, verified name-and-shape against
+/// `unsloth/Qwen3.8-27B-NVFP4`'s `model_mtp.safetensors` (15 tensors, all
+/// accounted for; GGUF ggml-dims are the reverse of the HF shapes quoted):
+///
+/// | GGUF                         | Atlas                                       | shape         |
+/// |------------------------------|---------------------------------------------|---------------|
+/// | `nextn.eh_proj`              | `mtp.fc.weight`                             | [5120, 10240] |
+/// | `nextn.enorm`                | `mtp.pre_fc_norm_embedding.weight`          | [5120]        |
+/// | `nextn.hnorm`                | `mtp.pre_fc_norm_hidden.weight`             | [5120]        |
+/// | `nextn.shared_head_norm`     | `mtp.norm.weight`                           | [5120]        |
+/// | `attn_norm`                  | `mtp.layers.0.input_layernorm.weight`       | [5120]        |
+/// | `post_attention_norm`        | `mtp.layers.0.post_attention_layernorm.weight` | [5120]     |
+/// | `attn_q` / `attn_k` / `attn_v` | `mtp.layers.0.self_attn.{q,k,v}_proj.weight` | [12288/1024/1024, 5120] |
+/// | `attn_output`                | `mtp.layers.0.self_attn.o_proj.weight`      | [5120, 6144]  |
+/// | `attn_q_norm` / `attn_k_norm`| `mtp.layers.0.self_attn.{q,k}_norm.weight`  | [256]         |
+/// | `ffn_gate` / `ffn_up`        | `mtp.layers.0.mlp.{gate,up}_proj.weight`    | [17408, 5120] |
+/// | `ffn_down`                   | `mtp.layers.0.mlp.down_proj.weight`         | [5120, 17408] |
+///
+/// The MTP layer index is hard-coded to `0` because Atlas's head reads exactly
+/// `mtp.layers.0.*`; Qwen3.5-family checkpoints ship a single predictor
+/// (`nextn_predict_layers = 1`). A file with more than one predictor block
+/// would need a multi-head loader, so the extra blocks are NOT silently folded
+/// onto layer 0 — only the FIRST predictor block maps, and the caller derives
+/// `mtp` from `block_count - nextn_predict_layers`.
+///
+/// The three MTP-specific norms need the same RMSNorm `-1` offset as every
+/// other norm on this arch; that lives in `value_transform::classify`, keyed on
+/// these output names.
+fn translate_qwen35_mtp(gguf_name: &str, mtp: usize) -> Option<GgufName> {
+    let sub = gguf_name.strip_prefix(&format!("blk.{mtp}."))?;
+    let hf = match sub {
+        // ── `nextn.*` combiner (MTP-only tensors) ──
+        "nextn.eh_proj.weight" => "mtp.fc.weight",
+        "nextn.enorm.weight" => "mtp.pre_fc_norm_embedding.weight",
+        "nextn.hnorm.weight" => "mtp.pre_fc_norm_hidden.weight",
+        "nextn.shared_head_norm.weight" => "mtp.norm.weight",
+        // Some converters also emit the predictor's own copy of the LM head /
+        // embedding under the block. Atlas's MTP head shares the main model's,
+        // so these carry no weight for it.
+        "nextn.embed_tokens.weight" | "nextn.shared_head_head.weight" => {
+            return Some(GgufName::Drop);
+        }
+        // ── The predictor's transformer layer (full attention + dense FFN) ──
+        "attn_norm.weight" => "mtp.layers.0.input_layernorm.weight",
+        "post_attention_norm.weight" => "mtp.layers.0.post_attention_layernorm.weight",
+        "attn_q.weight" => "mtp.layers.0.self_attn.q_proj.weight",
+        "attn_k.weight" => "mtp.layers.0.self_attn.k_proj.weight",
+        "attn_v.weight" => "mtp.layers.0.self_attn.v_proj.weight",
+        "attn_output.weight" => "mtp.layers.0.self_attn.o_proj.weight",
+        "attn_q_norm.weight" => "mtp.layers.0.self_attn.q_norm.weight",
+        "attn_k_norm.weight" => "mtp.layers.0.self_attn.k_norm.weight",
+        "ffn_gate.weight" => "mtp.layers.0.mlp.gate_proj.weight",
+        "ffn_up.weight" => "mtp.layers.0.mlp.up_proj.weight",
+        "ffn_down.weight" => "mtp.layers.0.mlp.down_proj.weight",
+        _ => return None,
+    };
+    Some(GgufName::Direct(hf.to_string()))
 }
 
 /// Qwen3.5/3.6-specific per-layer name remaps. Returns `None` for names the
