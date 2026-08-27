@@ -52,6 +52,9 @@ pub struct QsaSeqState {
     pooled: usize,
     /// Identity block table upload done (needs block_size, known lazily).
     table_len: usize,
+    /// `ingested` at the start of the current speculative verify
+    /// (`begin_verify`); `rewind_verify` rewinds relative to it.
+    verify_base: usize,
     /// [max_tokens, hd] BF16 — this sequence's raw indexer keys.
     raw_keys: DevicePtr,
     /// [max_tokens/ratio, hd] BF16 — this sequence's pooled block keys.
@@ -175,9 +178,31 @@ impl QsaIndexer {
             ingested: 0,
             pooled: 0,
             table_len: 0,
+            verify_base: 0,
             raw_keys: gpu.alloc(self.max_tokens * hd * 2)?,
             block_keys: gpu.alloc(self.max_tokens / ratio * hd * 2)?,
         })
+    }
+
+    /// Mark the start of a K-row speculative verify: `rewind_verify` rewinds
+    /// relative to this point. Idempotent per verify (the verify forward
+    /// calls it once, before ingesting any verify row).
+    pub fn begin_verify(&self, st: &mut QsaSeqState) {
+        st.verify_base = st.ingested;
+    }
+
+    /// Rewind the indexer carry after a speculative verify that kept `kept`
+    /// of its rows. Raw keys are append-only and indexed by position, so the
+    /// rewind is a counter move; `pooled` is re-clamped to the complete
+    /// blocks of the kept prefix, and the stale block-key rows beyond it are
+    /// overwritten when those blocks complete again. Idempotent — a second
+    /// call with the same `kept` is a no-op.
+    pub fn rewind_verify(&self, st: &mut QsaSeqState, kept: usize) {
+        let target = st.verify_base + kept;
+        if st.ingested > target {
+            st.ingested = target;
+            st.pooled = st.pooled.min(target / self.ratio as usize);
+        }
     }
 
     pub fn inert_bound(&self) -> usize {

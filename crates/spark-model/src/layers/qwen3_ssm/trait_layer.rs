@@ -136,11 +136,13 @@ impl TransformerLayer for Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // v1 is C=1 only under an mHC highway: these paths keep their own
-        // residual bookkeeping, which the highway replaces. Refusing is the
-        // point — a batched GDN step running on an unmixed stream produces
-        // plausible, wrong activations. Avarok #753.
-        self.refuse_batched_under_hc("decode_batched")?;
+        if self.hc.is_some() {
+            // K sequential tokens of ONE sequence under the mHC highway
+            // (speculative verify). The highway replaces the residual
+            // bookkeeping `decode_batched_inner` folds into its norms; the
+            // hc twin brackets the same residual-free core instead.
+            return self.decode_batched_inner_hc(hidden, num_tokens, state, ctx, stream);
+        }
         self.decode_batched_inner(
             hidden,
             residual,
@@ -149,6 +151,26 @@ impl TransformerLayer for Qwen3SsmLayer {
             ctx,
             stream,
         )
+    }
+
+    fn rollback_verify_aux(
+        &self,
+        state: &mut dyn LayerState,
+        kept: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(ple) = self.ple.as_ref() else {
+            return Ok(());
+        };
+        let ssm_state = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+        let Some(st) = ssm_state.ple.as_mut() else {
+            return Ok(());
+        };
+        ple.rollback_verify(st, kept, gpu, stream)
     }
 
     fn decode_verify_multi<'a, 'b: 'a>(

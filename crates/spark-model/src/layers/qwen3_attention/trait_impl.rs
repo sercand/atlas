@@ -10,6 +10,7 @@ use crate::layer::{
 };
 use crate::layers::FfnComponent;
 
+mod decode_batched_hc;
 mod decode_inner;
 mod multi_seq;
 mod prefill_inner;
@@ -254,6 +255,59 @@ impl TransformerLayer for Qwen3AttentionLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if self.hc.is_some() {
+            // K verify rows under the mHC highway: batched highway brackets,
+            // per-row attention through the single-token path so QSA ingests
+            // into the REAL sequence state (see decode_batched_hc.rs).
+            return self.decode_batched_inner_hc(
+                hidden,
+                num_tokens,
+                state,
+                kv_cache,
+                seq_len,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+            );
+        }
+        // Non-hc: the trait default's per-token loop, inlined (the default
+        // body lives in a module private to `layer::transformer_layer`).
+        let h = ctx.config.hidden_size;
+        for t in 0..num_tokens {
+            let off = t * h * 2;
+            self.decode_inner(
+                hidden.offset(off),
+                residual.offset(off),
+                state,
+                kv_cache,
+                seq_len + t,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn decode_multi_seq<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
@@ -281,6 +335,40 @@ impl TransformerLayer for Qwen3AttentionLayer {
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         Ok(Box::new(crate::layer::AttnLayerState::default()))
+    }
+
+    fn begin_verify_aux(&self, state: &mut dyn LayerState) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let attn = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("Expected AttnLayerState"))?;
+        if let Some(st) = attn.qsa.as_mut() {
+            qsa.begin_verify(st);
+        }
+        Ok(())
+    }
+
+    fn rollback_verify_aux(
+        &self,
+        state: &mut dyn LayerState,
+        kept: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let attn = state
+            .as_any_mut()
+            .downcast_mut::<crate::layer::AttnLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("Expected AttnLayerState"))?;
+        if let Some(st) = attn.qsa.as_mut() {
+            qsa.rewind_verify(st, kept);
+        }
+        Ok(())
     }
 
     fn transpose_moe_for_prefill(

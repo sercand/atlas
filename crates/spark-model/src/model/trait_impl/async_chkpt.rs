@@ -77,12 +77,31 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Rewind layer-local aux carries (qwen4_exp: PLE conv/history, QSA
+    /// indexer keys) to `kept` verify rows, on the MAIN stream — the PLE
+    /// rewind reads layer scratch the verify forward wrote there, and the
+    /// next forward is ordered behind it on that stream. No-op on layers
+    /// without aux state, and on sequences with no verify in flight.
+    fn rollback_verify_aux_all(&self, seq: &mut SequenceState, kept: usize) -> Result<()> {
+        for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
+            self.layers[i].rollback_verify_aux(
+                layer_state.as_mut(),
+                kept,
+                self.gpu.as_ref(),
+                self.gpu.default_stream(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn start_rollback_and_checkpoint_async_dispatch(
         &self,
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
+
+        self.rollback_verify_aux_all(seq, num_accepted)?;
 
         let stream = self.secondary_stream;
         let mut ssm_layer_idx = 0usize;
@@ -280,6 +299,13 @@ impl TransformerModel {
                  checkpoint."
             );
         }
+
+        // Layer-local aux carries (qwen4_exp: PLE conv/history, QSA indexer
+        // keys) rewind through the layer hook — they are not pool-managed.
+        // Runs on the MAIN stream: the PLE rewind reads layer scratch the
+        // verify forward wrote there, and the next forward is ordered behind
+        // it on that same stream. No-op default on every other layer type.
+        self.rollback_verify_aux_all(seq, num_accepted)?;
 
         let stream = self.secondary_stream;
         let mut ssm_layer_idx = 0usize;

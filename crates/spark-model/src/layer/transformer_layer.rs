@@ -564,6 +564,29 @@ pub trait TransformerLayer: Send + Sync {
         )
     }
 
+    /// Rewind layer-local AUXILIARY sequence state after a partial-accept
+    /// speculative verify: keep `kept` of the `total` verify rows. The GDN
+    /// h/conv rewind goes through the pool intermediates
+    /// (`commit_accepted_prefix`); this hook covers the state classes that
+    /// live on the layer state itself — the PLE conv/history carry and the
+    /// QSA indexer key history on qwen4_exp. Default: no aux state.
+    fn rollback_verify_aux(
+        &self,
+        _state: &mut dyn LayerState,
+        _kept: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark the start of a speculative draft/verify run for layer-local aux
+    /// state (`rollback_verify_aux` rewinds relative to this point). Default:
+    /// no aux state.
+    fn begin_verify_aux(&self, _state: &mut dyn LayerState) -> Result<()> {
+        Ok(())
+    }
+
     /// Decode N sequences through this layer in a single batched call.
     ///
     /// Each sequence contributes 1 token. The weight matrices are loaded

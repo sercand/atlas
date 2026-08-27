@@ -35,6 +35,14 @@ pub struct PleSeqState {
     /// in `slots_dev` and history has already advanced, so re-hashing would
     /// double-count the token — re-arming is the only correct recovery.
     last_staged_va: u64,
+    /// Pre-verify snapshot for the K-row speculative verify (`verify_snapshot`
+    /// / `rollback_verify` in `aux_state.rs`): a copy of `conv`, allocated on
+    /// first use.
+    verify_conv: Option<DevicePtr>,
+    /// The token history as it stood BEFORE the verify forward advanced it.
+    verify_history: Vec<u32>,
+    /// The K verify tokens (`[last_token, draft_0, ..]`).
+    verify_tokens: Vec<u32>,
 }
 
 pub struct PleLayer {
@@ -142,6 +150,9 @@ impl PleLayer {
             history: Vec::new(),
             prestaged_va: None,
             last_staged_va: 0,
+            verify_conv: None,
+            verify_history: Vec::new(),
+            verify_tokens: Vec::new(),
         })
     }
 

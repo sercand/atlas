@@ -125,20 +125,6 @@ impl Qwen3SsmLayer {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let k = num_tokens as u32;
-        let bf16 = 2usize; // bytes per BF16
-        let fp32 = 4usize; // bytes per FP32
-
-        let nk = ctx.config.linear_num_key_heads;
-        let kd = ctx.config.linear_key_head_dim;
-        let nv = ctx.config.linear_num_value_heads;
-        let vd = ctx.config.linear_value_head_dim;
-        let vpg = nv / nk;
-        let key_dim = nk * kd; // 2048
-        let value_dim = nv * vd; // 4096
-        let conv_dim = key_dim * 2 + value_dim; // 8192
-        let qk_ch = (key_dim * 2) as u32; // Q+K channels for fused L2 norm
-        let d_conv = ctx.config.linear_conv_kernel_dim;
-        let qkvz_size = ctx.config.ssm_qkvz_size(); // 12288
 
         // ── 1. RMS norm + residual for K tokens ──
         let normed = ctx.buffers.norm_output();
@@ -156,6 +142,43 @@ impl Qwen3SsmLayer {
         )?;
 
         k4_diag_checkpoint(ctx, "1:rms_norm_residual", stream)?;
+
+        let out_proj_buf = self.batched_gdn_core(normed, num_tokens, gdn, ctx, stream)?;
+        self.decode_batched_tail(hidden, residual, num_tokens, out_proj_buf, ctx, stream)
+    }
+
+    /// Steps 2–9 of the batched K-token GDN decode — the residual-free core
+    /// (QKVZ/BA projections, conv + recurrence with per-row intermediates,
+    /// gated RMS norm, out_proj). Reads the K normed rows at `normed` and
+    /// returns the out_proj rows (`moe_output`). Extracted verbatim from
+    /// `decode_batched_inner` so the mHC twin (`trait_decode_batched_hc.rs`)
+    /// can run the same core between its hc_pre/hc_post brackets; the
+    /// residual bookkeeping stays in the callers.
+    pub(super) fn batched_gdn_core(
+        &self,
+        normed: DevicePtr,
+        num_tokens: usize,
+        gdn: GdnStates<'_, '_>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let k = num_tokens as u32;
+        let bf16 = 2usize; // bytes per BF16
+        let fp32 = 4usize; // bytes per FP32
+
+        let nk = ctx.config.linear_num_key_heads;
+        let kd = ctx.config.linear_key_head_dim;
+        let nv = ctx.config.linear_num_value_heads;
+        let vd = ctx.config.linear_value_head_dim;
+        let vpg = nv / nk;
+        let key_dim = nk * kd; // 2048
+        let value_dim = nv * vd; // 4096
+        let conv_dim = key_dim * 2 + value_dim; // 8192
+        let qk_ch = (key_dim * 2) as u32; // Q+K channels for fused L2 norm
+        let d_conv = ctx.config.linear_conv_kernel_dim;
+        let qkvz_size = ctx.config.ssm_qkvz_size(); // 12288
 
         // ── 2+3. QKVZ projection (+ deinterleave if needed) ──
         // For sequential_qkvz (Qwen3.5): write directly to deinterleaved buffer.
@@ -1167,6 +1190,23 @@ impl Qwen3SsmLayer {
         self.ssm_tp_all_reduce(out_proj_buf, num_tokens, ctx, stream)?;
 
         k4_diag_checkpoint(ctx, "9:out_proj", stream)?;
+
+        Ok(out_proj_buf)
+    }
+
+    /// Step 10 — the non-hc residual/FFN tail of `decode_batched_inner`.
+    fn decode_batched_tail(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        out_proj_buf: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let bf16 = 2usize; // bytes per BF16
 
         // ── 10. Batched residual + post-norm, then MoE + residual ──
         // residual_add_rms_norm supports multi-token (grid.x = num_tokens)

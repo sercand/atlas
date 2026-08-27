@@ -221,6 +221,10 @@ impl TransformerModel {
         let k2_diag_eager = std::env::var("ATLAS_K2_DIAG").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        // mHC-highway verify (qwen4_exp) runs EAGER: the PLE n-gram gather
+        // and the QSA host top-k are capture-illegal, and the per-row
+        // attention loop rebuilds metadata views per row.
+        let hc_verify = self.config.hc_mult > 0;
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
@@ -229,7 +233,8 @@ impl TransformerModel {
             // illegal under CUDA graph capture.
             && !hss_engaged
             && !k2_diag_eager
-            && !lora_eager;
+            && !lora_eager
+            && !hc_verify;
 
         // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by token
         // id via the static tid2eid table, so the verify forward needs the 2
@@ -255,7 +260,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: Some(self.buffers.token_ids()),
-            host_token_ids: None,
+            host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -294,7 +299,7 @@ impl TransformerModel {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
+                    if hss_engaged || hc_verify {
                         // HSS path: `decode_multi_seq` calls the production
                         // paged-decode kernel which reads K/V from HBM only
                         // (`meta.block_table`). Under HSS, HBM is capped to

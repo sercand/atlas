@@ -181,7 +181,9 @@ impl TransformerModel {
         // the K=2 path (verify_b.rs). Diagnostic only — default behavior is
         // byte-for-byte unchanged when the env is unset.
         let k4_diag = std::env::var("ATLAS_K4_DIAG").ok().as_deref() == Some("1");
-        let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag;
+        let hc_verify = self.config.hc_mult > 0;
+        let use_graphs =
+            self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !hc_verify;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -198,7 +200,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
-            host_token_ids: None,
+            host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -234,7 +236,7 @@ impl TransformerModel {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
+                    if hss_engaged || hc_verify {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
                         // history on disk. Fall back to decode_batched

@@ -58,6 +58,100 @@ impl PleLayer {
 }
 
 impl PleLayer {
+    /// Snapshot the pre-verify PLE carry (conv state + token history + the K
+    /// verify tokens) so a partial accept can rewind. The K-row verify calls
+    /// this immediately BEFORE `forward`; `rollback_verify` consumes it.
+    pub fn verify_snapshot(
+        &self,
+        st: &mut PleSeqState,
+        tokens: &[u32],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
+        let dst = match st.verify_conv {
+            Some(p) => p,
+            None => {
+                let p = gpu.alloc(conv_bytes)?;
+                st.verify_conv = Some(p);
+                p
+            }
+        };
+        // A fresh sequence resets `conv`/`history` inside `forward`; mirror
+        // that here so the snapshot matches what the forward will consume.
+        if st.history.len() != self.dims.context_len() {
+            self.reset(st, gpu, stream)?;
+        }
+        gpu.copy_d2d_async(st.conv, dst, conv_bytes, stream)?;
+        st.verify_history = st.history.clone();
+        st.verify_tokens = tokens.to_vec();
+        Ok(())
+    }
+
+    /// Rewind the PLE carry after a partial accept: keep `kept` of the
+    /// `verify_tokens.len()` rows the verify forward advanced through.
+    ///
+    /// * history — last `context_len` of (pre-verify history ++ tokens[..kept])
+    /// * conv    — last `state_len` rows of (snapshot ++ gated_normed[..kept]),
+    ///   the exact roll `ple_conv` applies, truncated at the accepted row.
+    ///   `gated_normed` still holds the verify rows: it is layer-owned scratch
+    ///   and the rewind runs before any later forward touches this layer.
+    pub fn rollback_verify(
+        &self,
+        st: &mut PleSeqState,
+        kept: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let total = st.verify_tokens.len();
+        if total == 0 {
+            // No verify forward preceded (this rollback entry point is shared
+            // with paths that never ran one), or it was already rolled back.
+            return Ok(());
+        }
+        anyhow::ensure!(
+            kept <= total,
+            "PLE rollback_verify: kept {kept} > verify rows {total}"
+        );
+        if kept == total {
+            st.verify_tokens.clear();
+            return Ok(()); // full accept: the forward's state IS the state
+        }
+        let snap = st
+            .verify_conv
+            .ok_or_else(|| anyhow::anyhow!("PLE rollback_verify without a verify_snapshot"))?;
+        let c = self.hc_mult * self.hidden;
+        let row = c * 4;
+        let sl = self.state_len;
+        if kept >= sl {
+            // New state is entirely verify rows [kept-sl, kept).
+            gpu.copy_d2d_async(
+                self.gated_normed.offset((kept - sl) * row),
+                st.conv,
+                sl * row,
+                stream,
+            )?;
+        } else {
+            let from_snap = sl - kept;
+            gpu.copy_d2d_async(snap.offset(kept * row), st.conv, from_snap * row, stream)?;
+            if kept > 0 {
+                gpu.copy_d2d_async(
+                    self.gated_normed,
+                    st.conv.offset(from_snap * row),
+                    kept * row,
+                    stream,
+                )?;
+            }
+        }
+        let mut window = st.verify_history.clone();
+        window.extend_from_slice(&st.verify_tokens[..kept]);
+        let keep = self.dims.context_len();
+        st.history = window[window.len().saturating_sub(keep)..].to_vec();
+        st.prestaged_va = None;
+        st.verify_tokens.clear();
+        Ok(())
+    }
+
     /// Fresh sequence: EOS-filled history and a zeroed conv state.
     pub(super) fn reset(
         &self,
