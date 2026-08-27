@@ -169,12 +169,22 @@ pub(crate) fn preflight_reserve(
     let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
         * config.num_ssm_layers()
         * (h_state_bytes + conv_state_bytes);
-    let cuda_headroom: usize =
-        if args.speculative || args.self_speculative || args.ngram_speculative {
-            4 * 1024 * 1024 * 1024
-        } else {
-            512 * 1024 * 1024
-        };
+    // ATLAS_CUDA_HEADROOM_MB overrides the flat headroom (same knob the
+    // gb10-memory campaign added on the sizing path): the 4 GiB speculative
+    // default is partly padding at short contexts, and on a 121.6 GB box
+    // with co-tenants it can be the difference between a config fitting or
+    // not. Deliberate lever — the operator owns the transient-OOM risk.
+    let cuda_headroom: usize = std::env::var("ATLAS_CUDA_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(
+            if args.speculative || args.self_speculative || args.ngram_speculative {
+                4 * 1024 * 1024 * 1024
+            } else {
+                512 * 1024 * 1024
+            },
+        );
     let gdn_two_phase_bytes: usize = {
         let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;

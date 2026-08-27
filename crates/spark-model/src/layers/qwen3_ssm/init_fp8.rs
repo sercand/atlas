@@ -118,4 +118,24 @@ impl Qwen3SsmLayer {
         }
         Ok(())
     }
+
+    /// Retire the BF16 QKVZ concat once both NVFP4 copies exist — decode
+    /// reads `qkvz_nvfp4`, batched verify `qkvz_nvfp4`/`_t`, prefill
+    /// `qkvz_nvfp4_t` — so the dense concat is only reachable through the
+    /// explicit BF16 force levers, which the caller must exclude. Returns
+    /// whether the concat was actually freed.
+    pub fn retire_dense_qkvz(&mut self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> bool {
+        if self.qkvz_nvfp4.is_none()
+            || self.qkvz_nvfp4_t.is_none()
+            || self.out_proj_dense.is_some()
+            || self.ssm.in_proj_qkvz.weight.is_null()
+        {
+            return false;
+        }
+        let _ = gpu.free(self.ssm.in_proj_qkvz.weight);
+        self.ssm.in_proj_qkvz = crate::weight_map::DenseWeight {
+            weight: spark_runtime::gpu::DevicePtr::NULL,
+        };
+        true
+    }
 }

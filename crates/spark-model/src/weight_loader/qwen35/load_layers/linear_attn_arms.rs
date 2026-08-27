@@ -544,5 +544,18 @@ pub(crate) fn build_linear_attention_nvfp4(
             "SSM[{lp}] ATLAS_GDN_BF16_WEIGHTS: out_proj routed through BF16 dense_gemm (overrides FP8/NVFP4)"
         );
     }
+    // ATLAS_GDN_SLIM (presence): retire the BF16 QKVZ concat once both NVFP4
+    // copies exist. Decode reads `qkvz_nvfp4`, batched verify `qkvz_nvfp4`/
+    // `_t`, prefill `qkvz_nvfp4_t` — the dense concat is only reachable
+    // through the ATLAS_GDN_BF16_WEIGHTS / force-bf16 levers, which this flag
+    // is incompatible with (and which guard below by skipping the free).
+    // 63 MB x 36 GDN layers ≈ 2.3 GB on Qwen3.8-Flash-Next — the difference
+    // between the speculative-verify reserve fitting at util 0.84 and OOM.
+    if std::env::var("ATLAS_GDN_SLIM").is_ok()
+        && std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref() != Some("1")
+        && layer.retire_dense_qkvz(gpu)
+    {
+        tracing::debug!("SSM[{lp}] ATLAS_GDN_SLIM: BF16 QKVZ concat retired");
+    }
     Ok(Box::new(layer))
 }
