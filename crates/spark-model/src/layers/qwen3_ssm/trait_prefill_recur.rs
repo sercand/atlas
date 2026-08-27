@@ -211,6 +211,7 @@ impl Qwen3SsmLayer {
                 self.gdn_prefill_fla_chunk_delta_h_k,
                 self.gdn_prefill_fla_chunk_delta_h_tc_vblock_k,
                 self.gdn_prefill_fla_chunk_delta_h_fused_k,
+                self.gdn_prefill_fla_chunk_delta_h_tma_k,
                 self.gdn_prefill_fla_chunk_fwd_o_k,
                 h_state,
                 q_ptr,
@@ -391,6 +392,7 @@ impl Qwen3SsmLayer {
                     ops::conv1d_update_prefill(
                         ctx.gpu,
                         self.conv1d_prefill_k,
+                        self.conv1d_prefill_tp_k,
                         conv_state,
                         input.offset(start * qkvz_size * bf16),
                         &self.ssm.conv1d,
@@ -428,6 +430,7 @@ impl Qwen3SsmLayer {
         ops::conv1d_update_prefill(
             ctx.gpu,
             self.conv1d_prefill_k,
+            self.conv1d_prefill_tp_k,
             conv_state,
             input,
             &self.ssm.conv1d,

@@ -33,11 +33,22 @@ impl TtftGate {
             Err(_) => return (Verdict::info("no handle"), Vec::new()),
         };
         let id = self.mode.descriptor().id;
-        let stored = baseline::load(&store, id);
+        // Model-keyed: a gate with several checkpoints (BENCH.toml `hw.models`)
+        // otherwise has its variants overwrite one shared baseline.json, and the
+        // run after every variant switch finds another target's numbers,
+        // declines to compare, and reports `info` instead of a verdict.
+        let model_now = self.handle().ok().map(|h| h.target().model.clone());
+        let stored = baseline::load_for(&store, id, model_now.as_deref());
         let mut summary = vec![
             Stat::new("Median TTFT", stats::fmt_ms(median), "ms").with_style(CellStyle::Accent),
             Stat::new("p90 TTFT", stats::fmt_ms(p90), "ms"),
         ];
+        if !median.is_some_and(super::valid_ttft_ms) || !p90.is_some_and(super::valid_ttft_ms) {
+            return (
+                Verdict::fail("run produced no usable median and p90 TTFT measurements"),
+                summary,
+            );
+        }
         let Some(base) = stored else {
             summary.push(Stat::new("Baseline", "none", "").with_style(CellStyle::Dim));
             return (
@@ -60,6 +71,18 @@ impl TtftGate {
                     "baseline was recorded against {} / {} — not comparable, reporting only",
                     base.target, base.model
                 )),
+                summary,
+            );
+        }
+        if !base.get("median_ms").is_some_and(super::valid_ttft_ms)
+            || !base.get("p90_ms").is_some_and(super::valid_ttft_ms)
+        {
+            summary.push(Stat::new("Baseline", "incomplete", "").with_style(CellStyle::Warn));
+            return (
+                Verdict::info(
+                    "same-box baseline is missing usable median_ms or p90_ms — not comparable, \
+                     reporting only",
+                ),
                 summary,
             );
         }

@@ -162,6 +162,18 @@ pub fn invalidating_paths(
     record_sha: &str,
     gate: &super::coverage::GateCoverage,
 ) -> Option<Vec<String>> {
+    invalidating_paths_with(root, head, record_sha, gate, |path| {
+        super::amnesty::excused(root, head, path)
+    })
+}
+
+fn invalidating_paths_with(
+    root: &Path,
+    head: &str,
+    record_sha: &str,
+    gate: &super::coverage::GateCoverage,
+    mut is_excused: impl FnMut(&str) -> bool,
+) -> Option<Vec<String>> {
     if head == record_sha {
         return Some(Vec::new());
     }
@@ -181,16 +193,16 @@ pub fn invalidating_paths(
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .filter(|p| super::coverage::invalidates(gate, p))
-            // ★ The one-time 2026-08-16 amnesty: a surviving path whose blob
+            // ★ A one-time content-pinned amnesty: a surviving path whose blob
             // at `head` is exactly the grant's pinned content is excused,
             // loudly. Content-pinned, so any later edit to the file changes
             // the OID and invalidates as before. See `amnesty.rs` for the
             // grant, the fail-closed rule, and the removal condition.
             .filter(|p| {
-                if super::amnesty::excused(root, head, p) {
+                if is_excused(p) {
                     tracing::warn!(
                         "amnesty: {p} would re-open {} but its content at {head} is the \
-                         pinned one-time 2026-08-16 grant — excused (see gate/amnesty.rs)",
+                         pinned one-time grant; excused (see gate/amnesty.rs)",
                         gate.id
                     );
                     return false;
@@ -200,6 +212,19 @@ pub fn invalidating_paths(
             .map(str::to_string)
             .collect(),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn invalidating_paths_with_amnesty(
+    root: &Path,
+    head: &str,
+    record_sha: &str,
+    gate: &super::coverage::GateCoverage,
+    table: &[super::amnesty::AmnestyEntry],
+) -> Option<Vec<String>> {
+    invalidating_paths_with(root, head, record_sha, gate, |path| {
+        super::amnesty::excused_by(root, head, path, table)
+    })
 }
 
 /// The full gate verdict for `sha`: every required bench, in order.
@@ -215,7 +240,7 @@ pub fn check_gates(root: &Path, sha: &str) -> BTreeMap<String, GateStatus> {
 ///
 /// Records were located by DIRECTORY and their own `benchmark_id` was never
 /// read back. Nothing stopped one gate's record from satisfying another's, and
-/// two of the five gates make that a one-command forgery:
+/// two of the required gates make that a one-command forgery:
 /// `ttft-warm-gate` and `ttft-cold-gate` share a checkpoint, a hardware key and
 /// their metric names (`median_ms`, `p90_ms`). On `main` today the committed
 /// WARM record reads 1562.58 / 4478.42 against the COLD ceilings of
@@ -326,6 +351,13 @@ fn check_one(root: &Path, benchmark_id: &str, sha: &str) -> GateStatus {
             // commit is not in this clone (a shallow fetch). Say that, rather
             // than reporting an empty path list as if nothing had changed.
             Some(newest_record) => {
+                if newest_record.benchmark_id != benchmark_id {
+                    return GateStatus::Missing(format!(
+                        "latest record belongs to {}, not {benchmark_id} ({})",
+                        newest_record.benchmark_id,
+                        paths[0].file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
                 // A newest record that is another VARIANT's is not stale — it
                 // is off-subject, and saying "build inputs do not match" would
                 // send the reader diffing commits instead of reading the
@@ -349,10 +381,7 @@ fn check_one(root: &Path, benchmark_id: &str, sha: &str) -> GateStatus {
                         "latest record is for {newest} ({}) — git cannot diff that commit \
                          against this one; is it in this clone? (the gate job needs \
                          `fetch-depth: 0`)",
-                        paths[0]
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
+                        paths[0].file_name().unwrap_or_default().to_string_lossy()
                     ));
                 };
                 let because = if why.is_empty() {
@@ -378,10 +407,7 @@ fn check_one(root: &Path, benchmark_id: &str, sha: &str) -> GateStatus {
                 };
                 format!(
                     "latest record is for {newest} ({}) — {because}",
-                    paths[0]
-                        .file_name()
-                        .map(|n| n.to_string_lossy())
-                        .unwrap_or_default()
+                    paths[0].file_name().unwrap_or_default().to_string_lossy()
                 )
             }
             None => "latest record is unreadable".to_string(),

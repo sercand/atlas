@@ -11,7 +11,9 @@ mod bench_resolve;
 pub mod bench_run;
 mod bench_selfstart;
 pub(crate) mod flag_values;
+pub(crate) mod manifest;
 mod serve_args;
+pub(crate) mod sync_recipes;
 mod validate;
 pub use bench_args::BenchmarkArgs;
 pub use serve_args::{DEFAULT_KV_CACHE_DTYPE, DEFAULT_NUM_DRAFTS, ServeArgs};
@@ -42,6 +44,27 @@ pub enum Command {
     Serve(ServeArgs),
     /// Run and inspect the benchmark suite, without the dashboard.
     Benchmark(BenchmarkArgs),
+    /// Print the serve flag surface as JSON.
+    ///
+    /// Hidden because it is a build tool, not part of the supported CLI: it
+    /// exists so downstream tooling can be GENERATED from clap rather than
+    /// transcribed from it. `ServeArgs` still has no `Serialize` derive and
+    /// this does not promise that any flag keeps its name — a rename shows up
+    /// as a diff in whatever consumes the output.
+    #[command(hide = true)]
+    DumpServeOptions,
+    /// Populate the local recipe index from the recipe repository.
+    ///
+    /// The index is what `benchmark run` resolves a recipe id against, and
+    /// until this existed the only thing that wrote it was the TUI Library —
+    /// so the error a headless box got was "open the TUI Library once to
+    /// populate it", which is advice a CI runner, a container, or a machine
+    /// reached over ssh cannot take. That is not a hint, it is a dead end.
+    ///
+    /// Deliberately explicit rather than an automatic fetch inside
+    /// `benchmark run`: a benchmark that silently reaches the network mid-run
+    /// is a benchmark whose result depends on something nobody declared.
+    SyncRecipes,
 }
 
 #[cfg(test)]

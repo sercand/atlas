@@ -28,6 +28,7 @@ pub mod closure;
 pub mod codeowners;
 pub mod coverage;
 pub mod record;
+mod record_path;
 pub mod scoring;
 pub mod taxon;
 
@@ -51,11 +52,11 @@ pub use record::{
     variant_slug, write_record,
 };
 
-/// The five benches whose records must pass for the branch to be gated.
+/// The ten benches whose records must pass for the branch to be gated.
 ///
-/// Gate A (agentic webserver), Gate C (warm + cold TTFT), and the two BFCL
-/// gates. Every id is a registered benchmark, and registration is tested
-/// against this list.
+/// Agentic webserver, vision and video fidelity, warm and cold TTFT, two BFCL
+/// draws, SSM state poisoning, decode floor, and concurrency sweep. Every id
+/// is a registered benchmark, and registration is tested against this list.
 ///
 /// ★ **There are two BFCL entries because there are two draws, and a score from
 /// one is not comparable to a threshold from the other.** The dense 27B is
@@ -210,6 +211,11 @@ pub fn dirty_perf_paths(root: &Path) -> Result<Vec<String>> {
 #[path = "tests.rs"]
 mod tests;
 
+/// Construction and replay contracts split from `tests.rs` for its LoC cap.
+#[cfg(test)]
+#[path = "record_contract_tests.rs"]
+mod record_contract_tests;
+
 #[cfg(test)]
 #[path = "variant_tests.rs"]
 mod variant_tests;
@@ -224,6 +230,11 @@ mod fixture_baseline;
 #[cfg(test)]
 #[path = "coverage_map_tests.rs"]
 mod coverage_map_tests;
+
+/// Proofs for the exact, `#[cfg(test)]`-guarded Rust module exemption.
+#[cfg(test)]
+#[path = "test_only_coverage_tests.rs"]
+mod test_only_coverage_tests;
 
 #[cfg(test)]
 #[path = "coverage_promotion_tests.rs"]

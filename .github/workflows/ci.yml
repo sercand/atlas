@@ -792,15 +792,16 @@ jobs:
     # ENFORCING as of this commit. The `continue-on-error: true` that used to
     # sit here was justified by a bootstrap gap — "no bench record is committed
     # yet, and the PR that introduces the gate cannot commit one". That gap is
-    # closed: `.benchmarks/` now carries a BASELINE plus records for all five
+    # closed: `.benchmarks/` now carries a BASELINE plus records for all ten
     # required gates, so the precondition its own comment named for removal is
     # met, and keeping the line would leave a check that cannot fail.
     #
     # What a red here means: this branch has no record that still COVERS its
-    # head. `record_covers` invalidates every earlier record once the diff
-    # touches a PERF_PATH (crates, kernels, Cargo.*, vendor, jinja-templates,
-    # rust-toolchain.toml) — which is the point. Fix it by measuring on a GPU
-    # box and committing the record, not by re-adding continue-on-error.
+    # head. `record_covers` invalidates earlier records when the diff touches a
+    # measured input (crates, kernels, Cargo.*, vendor, jinja-templates, or the
+    # toolchain), except for exact paths with a reviewed coverage exclusion.
+    # Fix a real invalidation by measuring on a GPU box and committing the
+    # record.
     #
     # It is deliberately NOT in `release-matrix`'s `needs`: a missing GPU
     # measurement must show as red without wedging the image path. It IS a
@@ -837,3 +838,15 @@ jobs:
           # this gate through the flag within the PR's own run.
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: cargo run --locked -p spark-server --bin spark -- benchmark --pull-request-gate-check ${PR_NUMBER:+--pr "$PR_NUMBER"}
+      # ── Queue-composition diagnosis ──────────────────────────────────────
+      # A record-bearing perf PR can be GREEN at its head and still bounce
+      # here: the queue tests the MERGE tree, and records cannot compose
+      # across PRs — a campaign that covered this PR's tree does not cover a
+      # tree with another perf PR's kernels placed under it (observed
+      # 2026-08-23: #732 bounced behind #731, then behind post-#733 main; then
+      # #731 bounced behind post-#733 main — every head was green).
+      # When that is what happened, say so instead of ten bare NONEs.
+      - name: Name the failure if it is queue composition
+        if: failure() && github.event_name == 'merge_group'
+        run: |
+          echo "::error title=Queue-composition failure::This PR's benchmark records were valid at its head; the MERGE GROUP composed other performance changes underneath them, which invalidates records by design (unmeasured interaction). Retrying will not help. Apply the serialized-landing protocol (scripts/queue-perf-pr.sh): update the branch to current main, FREEZE that sha, run the ten gates against exactly that tree, commit the records, and queue with no other performance PR ahead. See docs/gate-queue-protocol.md."

@@ -224,10 +224,28 @@ impl Qwen3SsmLayer {
             gdn_prefill_fla_chunk_delta_h_fused_k: super::super::try_kernel(
                 gpu,
                 "gated_delta_rule_fla",
-                match std::env::var("ATLAS_GDN_VTILE").ok().as_deref() {
-                    Some("1") => "gated_delta_rule_chunk_delta_h_vtile",
-                    _ => "gated_delta_rule_chunk_delta_h_vfused",
+                // Logged, not silent: which spine ran is the single most
+                // consequential fact about a GDN measurement, and a run record
+                // that cannot say which one it used cannot be compared to
+                // another. An A/B on this kernel is otherwise unfalsifiable —
+                // both arms produce a number either way.
+                {
+                    let name = match (
+                        std::env::var("ATLAS_GDN_PIPE").ok().as_deref(),
+                        std::env::var("ATLAS_GDN_VTILE").ok().as_deref(),
+                    ) {
+                        (Some("1"), _) => "gated_delta_rule_chunk_delta_h_pipe",
+                        (_, Some("1")) => "gated_delta_rule_chunk_delta_h_vtile",
+                        _ => "gated_delta_rule_chunk_delta_h_vfused",
+                    };
+                    tracing::info!("GDN state spine: {name}");
+                    name
                 },
+            ),
+            gdn_prefill_fla_chunk_delta_h_tma_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_fla",
+                "gated_delta_rule_chunk_delta_h_tma",
             ),
             gdn_prefill_fla_chunk_fwd_o_k: super::super::try_kernel(
                 gpu,
@@ -263,6 +281,11 @@ impl Qwen3SsmLayer {
             compute_gdn_gates_k: gpu.kernel("ssm_preprocess", "compute_gdn_gates")?,
             ba_gates_prefill_k: gpu.kernel("ssm_preprocess", "dense_gemm_ba_gates_prefill")?,
             conv1d_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
+            conv1d_prefill_tp_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d",
+                "causal_conv1d_update_prefill_tp",
+            ),
             gdn_chunk2_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk2")?,
             conv1d_chunk2_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_chunk2")?,
             gdn_chunk3_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk3")?,
