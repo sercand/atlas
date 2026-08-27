@@ -57,3 +57,49 @@ resident if PLE deferred to NVMe: 78.23 GB   (budget: 97.3 GB at 0.80 util)
 
 Note `index.json`'s `total_size` is **bytes** (135,195,303,851 = 125.91 GiB);
 reading it as GB is how you get a phantom 9 GB discrepancy.
+
+## Serving the RadixArk release on one GB10 — the three snapshot builders
+
+The dev-box recipe served the Inferact release (BF16 PLE, one file). The
+RadixArk release needs a one-time preprocessing pass, because its PLE table
+ships FP8 across 10 files (the row cache wants BF16 in one file) and its MTP
+block ships fused BF16 (the loader wants per-expert ModelOpt NVFP4). Run, in
+order (any Python with numpy; `QWEN4EXP_SRC_SNAPSHOT` overrides the HF-cache
+glob):
+
+1. `convert_ple_bf16.py <out.safetensors>` — dequantizes the 128 FP8 n-gram
+   shards with the checkpoint's scalar `weight_scale` into ONE BF16
+   safetensors file (102.4 GB, ~5 min), the exact layout
+   `weight_loader/qwen4_exp/ple.rs` + the segmented NVMe row cache expect.
+   Spot-checks its own output.
+2. `make_mtp_extra.py` — slices the fused MTP experts
+   (`gate_up_proj [512,1280,2560]`, `down_proj [512,2560,640]`) per expert
+   and quantizes to ModelOpt NVFP4 (1.6 GB), replicating
+   `quantize_bf16_to_nvfp4.cu`'s scale + E2M1 rounding math bit-for-bit;
+   every other `mtp.*` tensor passes through BF16. Output name matters:
+   `extra_weights.safetensors` rides the loader's extra-weights hook, which
+   bypasses the main shards' `skip_mtp`.
+3. `build_serving_snapshot.py` — assembles a serving snapshot: symlinks the
+   original files minus the 10 `model-plefp8-*` shards, adds the two files
+   above, patches `model.safetensors.index.json` to point the PLE shard
+   entries at the BF16 file (the scalar-scale entry is dropped — the BF16
+   path never reads it).
+
+Serve fingerprint that measured 45.8 tok/s code / 39.4 prose / 53.1 counting
+(gx10-ecdf, 2026-08-28, commit bdfc322b, n=3 steady-state streamed timing,
+thinking=low, temp 0 — preliminary, single-harness):
+
+```
+ATLAS_QWEN4EXP_BF16_GDN=0 ATLAS_GDN_SLIM=1 ATLAS_CUDA_HEADROOM_MB=3072 \
+ATLAS_DFLASH_SPEC_THINK=1 ATLAS_PLE_MAX_TOKENS=2176 \
+spark serve --model-from-path <snapshot> --kernel-target qwen3.8-flash-next \
+  --max-seq-len 8192 --max-num-seqs 2 --max-batch-size 2 \
+  --gpu-memory-utilization 0.84 --kv-cache-dtype bf16 \
+  --speculative --num-drafts 2 --ssm-cache-slots 2 \
+  --max-prefill-tokens 2048 --enable-prefix-caching
+```
+
+K sweep on the code prompt: K=2 41.2, **K=3 45.8**, K=4 37.1 (verify cost
+outruns depth). `ATLAS_DFLASH_SPEC_THINK=1` is the whole payoff on this
+always-thinking model and inherits the known batch-K T=0 numerics floor;
+the agentic-gate measurement for spec-in-think on THIS model is still owed.
