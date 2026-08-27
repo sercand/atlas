@@ -189,6 +189,10 @@ impl TransformerModel {
         let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && draft_lm_head_nvfp4.is_some())
+            // qwen4_exp's MTP module loads OUTSIDE `mtp_weights` (factory
+            // step 6b, like DeepSeek-V4) — but unlike V4 this model has GDN
+            // layers, whose K-row verify needs the SSM intermediate pools.
+            || (use_speculative && config.model_type == "qwen4_exp")
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)
@@ -380,7 +384,10 @@ impl TransformerModel {
         }
 
         // MTP hidden state save buffer (1 × hidden_size FP32)
-        let mtp_hidden_save = gpu.alloc(config.hidden_size * 4)?;
+        // qwen4_exp's MTP head consumes the PRE-MIXER highway row (FP32,
+        // hc_mult × hidden); every other model saves the BF16 hidden. Size
+        // for the wider of the two.
+        let mtp_hidden_save = gpu.alloc(config.hidden_size * 4 * config.hc_mult.max(1))?;
         // Batched-verify hidden stash: [VERIFY_WY_TABLE_SEQS, hidden] BF16 —
         // one slot per sequence of the widest batched verify chunk (n ≤ 32,
         // the K-vs-batch ladder envelope, SSOT in `crate::layer`). Only

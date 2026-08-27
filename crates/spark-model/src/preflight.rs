@@ -291,6 +291,9 @@ fn check_mtp_consumability(config: &ModelConfig) -> Result<()> {
         "holo3_1_moe",
         "qwen3_vl_moe",
         "qwen3_coder_next",
+        // qwen4_exp: MTP module loaded from extra_weights.safetensors
+        // (factory step 6b, weight_loader/qwen4_exp/mtp.rs).
+        "qwen4_exp",
     ];
     if MTP_SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
         return Ok(());

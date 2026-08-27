@@ -59,9 +59,11 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 mod aux;
 mod ffn;
 mod hc;
+mod mtp;
 mod ple;
 mod probe;
 
+pub use mtp::load_mtp_module;
 pub use probe::audit_namespace;
 
 /// The PLE table's shard layout, read straight from a checkpoint's

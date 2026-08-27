@@ -288,6 +288,20 @@ impl TransformerModel {
         // Save the RAW hidden state (before final_norm), not norm_output.
         // The MTP head applies its own pre_fc_norm_hidden — passing norm_output
         // would double-normalize and degrade prediction accuracy.
+        //
+        // qwen4_exp: the MTP head consumes the PRE-MIXER 4-stream highway row
+        // (FP32, hc_mult × hidden), which the layers left in `hc_streams` —
+        // the mixer collapse reads it without modifying it. Copy that instead
+        // of the collapsed hidden. (`mtp_hidden_save` is sized hc_mult-wide.)
+        if self.config.hc_lowrank > 0 && self.config.hc_mult > 0 {
+            let hw = self.config.hc_mult * h;
+            let src = self.buffers.hc_streams().offset(token_idx * hw * 4);
+            self.gpu
+                .copy_d2d_async(src, self.mtp_hidden_save, hw * 4, stream)?;
+            self.last_mtp_hidden_idx
+                .store(token_idx, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
         let src = self.buffers.hidden_states().offset(token_idx * h * fp32);
         self.gpu
             .copy_d2d_async(src, self.mtp_hidden_save, h * fp32, stream)?;

@@ -17,6 +17,7 @@ pub mod ple;
 pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4_exp_mtp;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 
@@ -66,6 +67,7 @@ pub use nemotron_mamba2::NemotronMamba2Layer;
 pub use nemotron_moe::NemotronMoeLayer;
 pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
+pub use qwen4_exp_mtp::Qwen4ExpMtpHead;
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
 
 use crate::layer::ForwardContext;

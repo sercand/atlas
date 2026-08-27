@@ -82,7 +82,17 @@ pub(super) fn load_layer_sites(
 /// the last one.
 pub(super) fn load_head(store: &WeightStore, config: &ModelConfig) -> Result<HcHeadWeights> {
     let prefix = format!("{}.hyper_connection_mixer", super::embed_prefix(config));
-    let lowrank = load_site(store, &prefix, config.hc_lowrank, false)?;
+    load_head_at(store, &prefix, config)
+}
+
+/// A mixer at an explicit prefix — the MTP head carries its own
+/// (`mtp.hyper_connection_mixer`), same three tensors, no inject.
+pub(super) fn load_head_at(
+    store: &WeightStore,
+    prefix: &str,
+    config: &ModelConfig,
+) -> Result<HcHeadWeights> {
+    let lowrank = load_site(store, prefix, config.hc_lowrank, false)?;
     Ok(HcHeadWeights {
         hc_fn: DevicePtr::NULL,
         hc_base: DevicePtr::NULL,

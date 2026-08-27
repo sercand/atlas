@@ -278,11 +278,30 @@ pub fn build_model(
     // QuantizedWeight). The draft head resolves to the separate draft-only
     // NVFP4 head (main head kept BF16) or the main NVFP4 head. `None` ⇒ no
     // NVFP4 head available ⇒ the V4 proposer can't draft and is skipped.
+    // qwen4_exp MTP module (mirrors the V4 block above): loaded from the
+    // pre-sliced `extra_weights.safetensors` namespace when `--speculative`
+    // is set. Rank-0 only; drafts are re-verified by the target.
+    let qwen4_mtp_module =
+        if config.model_type == "qwen4_exp" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::qwen4_exp::load_mtp_module(&store, &config, gpu.as_ref()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let v4_mtp_embed = embed;
     // DeepSeek-V4-Flash keeps the LM head in BF16; the proposer drafts with the
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
+    // qwen4_exp MTP drafts through the target's NVFP4 head (QuantizedWeight is
+    // Copy); captured before `lm_head_nvfp4` moves into `TransformerModel::new`.
+    let lm_head_nvfp4_copy = lm_head_nvfp4;
 
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
@@ -601,6 +620,33 @@ pub fn build_model(
     // resolved draft NVFP4 head, and the shared embedding. Installed via the
     // existing proposer setter. DFlash (below) is CLI-exclusive with
     // `--speculative`, so the two never both install.
+    if let Some(q4_module) = qwen4_mtp_module {
+        // The draft head needs the target's NVFP4 LM head (this model's main
+        // head is NVFP4 by default).
+        let draft_head = mtp_lm_head_nvfp4.or(lm_head_nvfp4_copy);
+        match draft_head {
+            Some(headw) => match crate::layers::Qwen4ExpMtpHead::new(
+                q4_module,
+                v4_mtp_embed,
+                headw,
+                model.config_ref(),
+                model.gpu_backend(),
+                max_seq_len,
+            ) {
+                Ok(head) => {
+                    model.set_dflash_proposer(std::sync::Arc::new(head));
+                    tracing::info!("qwen4_exp MTP speculative decoding: ENABLED");
+                }
+                Err(e) => tracing::warn!(
+                    "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
+                ),
+            },
+            None => tracing::warn!(
+                "qwen4_exp MTP module loaded but no NVFP4 LM head resolved — speculative decoding disabled."
+            ),
+        }
+    }
+
     if let Some(v4_module) = v4_mtp_module {
         match crate::layers::DeepseekV4MtpHead::new(
             v4_module,
