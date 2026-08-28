@@ -106,7 +106,11 @@ impl AnthropicTranslator {
     /// clients merge message_delta.usage over message_start's.
     fn final_usage(&self) -> serde_json::Value {
         serde_json::json!({
-            "input_tokens": self.prompt_tokens,
+            // Anthropic semantics: `input_tokens` is the UNCACHED input only;
+            // clients sum input_tokens + cache_read_input_tokens for the total
+            // prompt. Reporting the full prompt here double-counted the cached
+            // prefix on every warm agentic turn (translate.rs has the numbers).
+            "input_tokens": self.prompt_tokens.saturating_sub(self.cached_prompt_tokens),
             "cache_read_input_tokens": self.cached_prompt_tokens,
             "output_tokens": self.completion_tokens,
         })

@@ -368,7 +368,11 @@ fn response_maps_reasoning_text_tools_and_usage() {
     assert_eq!(json["id"], "msg_abc");
     assert_eq!(json["model"], "m");
     assert_eq!(json["stop_reason"], "tool_use");
-    assert_eq!(json["usage"]["input_tokens"], 10);
+    // Anthropic semantics: input_tokens is the UNCACHED input; the total
+    // prompt is input_tokens + cache_read_input_tokens (10 = 7 + 3).
+    // Reporting the full prompt in input_tokens double-counted the cached
+    // prefix in every client's display (2026-08-28).
+    assert_eq!(json["usage"]["input_tokens"], 7);
     assert_eq!(json["usage"]["output_tokens"], 5);
     // B5: prefix-cache hits surface as Anthropic cache accounting.
     assert_eq!(json["usage"]["cache_read_input_tokens"], 3);
