@@ -36,15 +36,26 @@ use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
 use crate::weight_map::dense;
 
-/// Resident rows in the pinned arena. A prefill pins `tokens * ngram_heads`
-/// rows at once (2048 x 16 = 32,768), so the default leaves headroom over the
-/// largest batch this model currently fits; at 320 B/row it costs ~21 MB.
+/// Resident rows in the pinned arena. A prefill chunk pins up to
+/// `max_ple_tokens * ngram_heads` rows AT ONCE, so the default is sized from
+/// those (1.5x headroom, rounded up to a power of two, floor 65,536 — the
+/// old fixed default, which chunk 2048 x 16 heads maps to exactly). The old
+/// CONSTANT default silently under-provisioned larger chunks: at chunk 8192
+/// x 16 heads a ~7.6k-token prompt legitimately demands >65,536 pinned rows
+/// and the resolve refuses (2026-08-28 incident; the pin leak that turned
+/// those refusals into a permanent brick is fixed in ngram_cache.rs).
+/// At 320 B/row: 65,536 slots = 21 MB, 262,144 = 84 MB.
+/// `ATLAS_PLE_CACHE_SLOTS` still overrides.
 #[cfg(feature = "cuda")]
-fn slots_from_env() -> usize {
+fn resolve_slots(max_tokens: usize, heads: usize) -> usize {
     std::env::var("ATLAS_PLE_CACHE_SLOTS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(65536)
+        .unwrap_or_else(|| {
+            (max_tokens * heads * 3 / 2)
+                .next_power_of_two()
+                .max(65536)
+        })
 }
 
 /// Read a small I64 device tensor back to the host.
@@ -149,7 +160,7 @@ pub(super) fn load(
          table is 102 GB of BF16 and would not have fit."
     );
     let path = path.expect("checked non-empty");
-    let slots = slots_from_env();
+    let slots = resolve_slots(max_tokens, heads);
     let cache = spark_storage::NgramRowCache::open_segmented(
         &path,
         bases.clone(),

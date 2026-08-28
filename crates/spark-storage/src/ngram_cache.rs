@@ -255,6 +255,16 @@ impl NgramRowCache {
     /// after this returns, so a later resolve in the same batch must not
     /// evict a row the kernel is about to read. Call [`Self::end_batch`] once
     /// the gather has been issued.
+    ///
+    /// An ERROR aborts the whole batch: no gather will consume the slots, so
+    /// every pin is released and this call's map inserts are rolled back
+    /// before returning. Pins used to survive a failed resolve — each
+    /// all-slots-pinned refusal then leaked its pins permanently, and after a
+    /// few such failures every slot was pinned forever: the server answered
+    /// nothing until restart (observed 2026-08-28 at chunk 8192 x 16 heads
+    /// against 65,536 slots). The victim-exhaustion path also left map
+    /// entries pointing at slots whose rows were never faulted in — a later
+    /// hit on such an entry would have gathered garbage.
     pub fn resolve(&mut self, row_ids: &[u64], out_slots: &mut Vec<u32>) -> Result<()> {
         out_slots.clear();
         out_slots.reserve(row_ids.len());
@@ -262,12 +272,14 @@ impl NgramRowCache {
         // miss (a repeated missing id hits the map on its second occurrence,
         // so each unique row faults once). No I/O under this loop.
         let mut jobs: Vec<crate::ngram_cache_fault::FaultJob> = Vec::new();
+        let mut phase1_err: Option<anyhow::Error> = None;
         for &id in row_ids {
             if id >= self.rows_total {
-                bail!(
+                phase1_err = Some(anyhow::anyhow!(
                     "NgramRowCache: row id {id} >= table rows {} (hash/table mismatch)",
                     self.rows_total
-                );
+                ));
+                break;
             }
             let slot = match self.map.get(&id) {
                 Some(&s) => {
@@ -278,16 +290,33 @@ impl NgramRowCache {
                 }
                 None => {
                     self.misses += 1;
-                    let s = self.victim()?;
+                    let s = match self.victim() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            phase1_err = Some(e);
+                            break;
+                        }
+                    };
                     self.map.insert(id, s);
                     self.slot_row[s as usize] = id;
                     self.refbit[s as usize] = true;
                     self.pinned[s as usize] = true;
-                    jobs.push(self.fault_job(id, s)?);
+                    match self.fault_job(id, s) {
+                        Ok(j) => jobs.push(j),
+                        Err(e) => {
+                            phase1_err = Some(e);
+                            break;
+                        }
+                    }
                     s
                 }
             };
             out_slots.push(slot);
+        }
+        if let Some(e) = phase1_err {
+            self.abort_batch(&jobs);
+            out_slots.clear();
+            return Err(e);
         }
         // Phase 2 — fault every miss in, parallel past a few (the serial
         // QD=1 pread-per-miss loop was the diverse-prefill stall).
@@ -300,18 +329,25 @@ impl NgramRowCache {
                 &mut self.bounce,
             );
             if let Err(e) = r {
-                // Roll the failed batch's map entries back: they were
-                // inserted in phase 1 and now describe slots holding garbage.
-                for j in &jobs {
-                    self.map.remove(&j.row_id);
-                    self.slot_row[j.slot as usize] = u64::MAX;
-                    self.pinned[j.slot as usize] = false;
-                    self.refbit[j.slot as usize] = false;
-                }
+                self.abort_batch(&jobs);
+                out_slots.clear();
                 return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// Error-path rollback: this call's map inserts describe slots whose rows
+    /// were never (fully) faulted in — remove them so a later hit cannot
+    /// gather garbage — and release EVERY pin, because the aborted batch's
+    /// gather will never run and pins have no other release point.
+    fn abort_batch(&mut self, jobs: &[crate::ngram_cache_fault::FaultJob]) {
+        for j in jobs {
+            self.map.remove(&j.row_id);
+            self.slot_row[j.slot as usize] = u64::MAX;
+            self.refbit[j.slot as usize] = false;
+        }
+        self.end_batch();
     }
 
     /// Resolve one miss to byte offsets + destination addresses — the
@@ -432,6 +468,55 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         assert!(msg.contains("O_DIRECT block"), "{msg}");
+    }
+
+    /// Regression: a resolve that FAILS (more unique rows than slots) must
+    /// not poison the cache. Before the abort_batch rollback, each such
+    /// failure leaked its pins permanently — after a few failures every slot
+    /// was pinned and the server answered nothing until restart (2026-08-28,
+    /// chunk 8192 x 16 heads vs 65,536 slots) — and the failed batch's map
+    /// entries pointed at slots whose rows were never faulted in.
+    /// GPU test (pinned arena): run with `-- --ignored`.
+    #[test]
+    #[ignore]
+    fn failed_resolve_releases_pins_and_rolls_back_map() {
+        // Pinned arena needs a live CUDA context (same pattern as the
+        // expert_arena GPU tests).
+        let _ctx = crate::cuda_min::CudaCtx::new(0).unwrap();
+        let stride = 256usize;
+        let rows = 64u64;
+        let dir = std::env::temp_dir().join(format!("ngram_cache_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("table.bin");
+        let mut data = vec![0u8; rows as usize * stride];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&path, &data).unwrap();
+
+        let mut cache = NgramRowCache::open(&path, None, rows, stride, 8).unwrap();
+        let mut slots = Vec::new();
+
+        // 9 unique rows > 8 slots: must refuse...
+        let too_many: Vec<u64> = (0..9).collect();
+        assert!(cache.resolve(&too_many, &mut slots).is_err());
+
+        // ...and afterwards a batch that fits must succeed — including ids
+        // from the failed batch (their rolled-back map entries must fault in
+        // cleanly, not "hit" a garbage slot).
+        let ok: Vec<u64> = (0..8).collect();
+        cache.resolve(&ok, &mut slots).expect("cache poisoned by failed resolve");
+        assert_eq!(slots.len(), 8);
+        cache.end_batch();
+
+        // Repeatedly failing must not accumulate pins (the production brick).
+        for _ in 0..5 {
+            assert!(cache.resolve(&too_many, &mut slots).is_err());
+        }
+        cache.resolve(&[40, 41], &mut slots).expect("pins leaked across failed resolves");
+        cache.end_batch();
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The seam arithmetic: with a base offset that is only 8-byte aligned
