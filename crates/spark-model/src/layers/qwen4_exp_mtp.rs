@@ -100,8 +100,12 @@ pub struct Qwen4ExpMtpHead {
     mixer_hc: HcWeights,
     kv_cache: Mutex<PagedKvCache>,
 
+    /// Device staging for `prefill_drafter`'s per-chunk token ids.
+    ids_dev: DevicePtr,
+
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    embed_ids_k: KernelHandle,
     residual_add_k: KernelHandle,
     hc_head_k: KernelHandle,
     argmax_k: KernelHandle,
@@ -166,10 +170,12 @@ impl Qwen4ExpMtpHead {
             lm_head_nvfp4,
             mixer_hc,
             kv_cache: Mutex::new(kv_cache),
+            ids_dev: gpu.alloc(PRIME_CHUNK * 4)?,
             // qwen4_exp ships Gemma-convention zero-centred plain norms —
             // the offset-from-1 kernel ("norm"/"rms_norm") is the right one.
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            embed_ids_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
@@ -309,8 +315,14 @@ impl Qwen4ExpMtpHead {
         let block_idx = state.block_table[state.seq_len / bs];
         let global_slot = (block_idx as i64) * (bs as i64) + ((state.seq_len % bs) as i64);
         let actual_seq_len = (state.seq_len + 1) as i32;
+        // KEY-SPACE RoPE: the head's rows are roped at their PAIR KEY (row r
+        // holds (streams[r], token[r+1]) roped at r), one below the
+        // scheduler's `position` (= key + 1). RoPE attention depends only on
+        // position DIFFERENCES, so the uniform -1 shift is attention-
+        // invariant — it exists so `prefill_drafter` can prime rows through
+        // the body's prefill path, which ropes row i at `seq_len_start + i`.
         let meta_buf = pack_mtp_attn_meta(
-            position as u32,
+            position.saturating_sub(1) as u32,
             global_slot,
             actual_seq_len,
             &state.block_table,
@@ -449,9 +461,280 @@ fn argmax_grammar_masked(
     Ok(best_tok)
 }
 
+/// Rows folded per drafter-prefill chunk. Bounds the scratch partition below
+/// (~40 MB of `ssm_deinterleaved`, whose minimum capacity at this model's
+/// serving config is ~50 MB) and stays under the QSA ingest slab.
+const PRIME_CHUNK: usize = 256;
+
+impl Qwen4ExpMtpHead {
+    /// Whole-prompt drafter priming (oMLX "prompt priming" / the same idea as
+    /// Atlas's Qwen-shaped `drafter_rows_impl`): fold pair
+    /// `(streams[r], token[r+1])` into drafter row `r` for `r = 0..p-2`, so
+    /// the head starts generation with the prompt in its KV instead of cold.
+    /// `hiddens` is the model's `mtp_prefill_hidden` capture — rows of
+    /// `hc_mult * hidden` FP32 pre-mixer highway, one per prompt position.
+    ///
+    /// Rows rope at their pair key (`seq_len_start = kv_write_start = r0`),
+    /// matching `forward_one`'s key-space convention. A failure degrades to
+    /// an unprimed drafter — acceptance cost, never correctness (the target
+    /// verifies every draft).
+    fn prefill_drafter_impl(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        state: &mut Qwen4ExpMtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        if state.seq_len != 0 || prompt_tokens.len() < 2 {
+            return Ok(0);
+        }
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let hc_mult = ctx.config.hc_mult;
+        let hw = hc_mult * h;
+        let bf16 = 2usize;
+        let rows_total = prompt_tokens.len() - 1;
+        let t0 = std::time::Instant::now();
+
+        // Scratch partition inside `ssm_deinterleaved` (the attention-type
+        // body never touches the SSM buffers). Offsets sized for PRIME_CHUNK.
+        let deint = ctx.buffers.ssm_deinterleaved();
+        let streams_bf16 = deint; // [n, hw] BF16   (<= 5.3 MB)
+        let hn = deint.offset(8 << 20); // [n, hw] BF16
+        let x_bf16 = deint.offset(16 << 20); // [n, hc, h] BF16
+        let ep_rep = deint.offset(24 << 20); // [n, hc, h] BF16
+        let ep = deint.offset(32 << 20); // [n, h] BF16
+        let normed_embed = deint.offset(36 << 20); // [n, h] BF16
+        let embed_out = ctx.buffers.ssm_qkvz(); // [n, h] BF16
+
+        // Grow the drafter block table to cover every primed row up front.
+        {
+            let mut kv_cache = self.kv_cache.lock();
+            let bs = kv_cache.block_size();
+            let blocks_needed = (rows_total - 1) / bs + 1;
+            while state.block_table.len() < blocks_needed {
+                state.block_table.push(kv_cache.alloc_block()?);
+            }
+        }
+
+        let mut r0 = 0usize;
+        while r0 < rows_total {
+            let n = PRIME_CHUNK.min(rows_total - r0);
+            // ── Embed tokens[r0+1 .. r0+n+1] ──
+            let ids: Vec<u8> = prompt_tokens[r0 + 1..r0 + 1 + n]
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .collect();
+            ctx.gpu.copy_h2d_async(&ids, self.ids_dev, stream)?;
+            ops::batched_embed(
+                ctx.gpu,
+                self.embed_ids_k,
+                self.ids_dev,
+                self.embed_tokens.weight,
+                embed_out,
+                n as u32,
+                h as u32,
+                stream,
+            )?;
+
+            // ── Combiner, batched over n rows ──
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                embed_out,
+                &self.module.pre_fc_norm_embedding,
+                normed_embed,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            ops::cublas_bf16_proj_dense(
+                normed_embed,
+                self.module.fc_embedding.weight,
+                ep,
+                n as u32,
+                h as u32,
+                h as u32,
+                stream,
+            )?;
+            // Capture rows r0.. are dense FP32 [n, hw] → BF16.
+            let n_hw = (n * hw) as u32;
+            KernelLaunch::new(ctx.gpu, self.f32_to_bf16_k)
+                .grid([n_hw.div_ceil(256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(hiddens.offset(r0 * hw * 4))
+                .arg_ptr(streams_bf16)
+                .arg_u32(n_hw)
+                .launch(stream)?;
+            // ONE RMS over each row's whole hw vector.
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                streams_bf16,
+                &self.module.pre_fc_norm_hidden,
+                hn,
+                n as u32,
+                hw as u32,
+                eps,
+                stream,
+            )?;
+            // Per-stream fc_hidden as ONE GEMM over n*hc rows, then the
+            // broadcast ep add: replicate ep into every stream lane with
+            // hc pitched copies + one flat add.
+            ops::cublas_bf16_proj_dense(
+                hn,
+                self.module.fc_hidden.weight,
+                x_bf16,
+                (n * hc_mult) as u32,
+                h as u32,
+                h as u32,
+                stream,
+            )?;
+            for s_lane in 0..hc_mult {
+                ctx.gpu.copy_d2d_2d_async(
+                    ep,
+                    h * bf16,
+                    ep_rep.offset(s_lane * h * bf16),
+                    hw * bf16,
+                    h * bf16,
+                    n,
+                    stream,
+                )?;
+            }
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                x_bf16,
+                ep_rep,
+                (n * hw) as u32,
+                stream,
+            )?;
+            // → the FP32 highway rows the body's prefill reads.
+            KernelLaunch::new(ctx.gpu, self.bf16_to_f32_k)
+                .grid([n_hw.div_ceil(256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(x_bf16)
+                .arg_ptr(ctx.buffers.hc_streams())
+                .arg_u32(n_hw)
+                .launch(stream)?;
+
+            // ── Per-chunk attention metadata (positions / KV slots /
+            // block table) at the head's own scratch slab. Positions are
+            // key-space (row index) to match `forward_one`'s -1 shift. ──
+            let mut kv_cache = self.kv_cache.lock();
+            let bs = kv_cache.block_size();
+            let mut meta_buf: Vec<u8> = Vec::with_capacity(16384);
+            for i in 0..n {
+                meta_buf.extend_from_slice(&((r0 + i) as u32).to_le_bytes());
+            }
+            meta_buf.resize(2048, 0);
+            for i in 0..n {
+                let pos = r0 + i;
+                let slot = (state.block_table[pos / bs] as i64) * (bs as i64) + (pos % bs) as i64;
+                meta_buf.extend_from_slice(&slot.to_le_bytes());
+            }
+            meta_buf.resize(2048 + 4096, 0);
+            meta_buf.extend_from_slice(&(((r0 + n) as i32).to_le_bytes()));
+            meta_buf.resize(2048 + 4096 + 256, 0);
+            for b in &state.block_table {
+                meta_buf.extend_from_slice(&(*b as i32).to_le_bytes());
+            }
+            anyhow::ensure!(
+                MTP_META_OFFSET + meta_buf.len() <= ctx.buffers.scratch_bytes(),
+                "qwen4_exp MTP prime: metadata ({} B) exceeds the scratch slab",
+                meta_buf.len()
+            );
+            let meta_base = ctx.buffers.scratch().offset(MTP_META_OFFSET);
+            ctx.gpu.copy_h2d_async(&meta_buf, meta_base, stream)?;
+            let prime_meta = AttnMetadataDev {
+                positions: meta_base,
+                positions_h: meta_base,
+                positions_w: meta_base,
+                slot: meta_base.offset(2048),
+                seq_len: meta_base.offset(2048 + 4096),
+                block_table: meta_base.offset(2048 + 4096 + 256),
+                max_blocks_per_seq: state.block_table.len() as u32,
+                num_seqs: 1,
+                seq_slot: DevicePtr(0),
+                moe_row_adapter: DevicePtr::NULL,
+            };
+            let mut disk_block_ids: Vec<u32> = Vec::new();
+            let mut disk_last: Vec<u32> = vec![0u32; 1];
+            let prime_ctx = ForwardContext {
+                buffers: ctx.buffers,
+                hc_row_offset: 0,
+                gpu: ctx.gpu,
+                config: ctx.config,
+                dispatch: ctx.dispatch,
+                derived: ctx.derived,
+                levers: ctx.levers,
+                stats: ctx.stats,
+                attn_metadata: Some(prime_meta),
+                profile: false,
+                comm: None,
+                graph_capture: false,
+                gdn_exact_replay: false,
+                token_ids: None,
+                host_token_ids: None,
+                routed_lora_layers: None,
+                midchunk_capture: None,
+                moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            };
+            self.module.body.prefill(
+                ctx.buffers.hidden_states(),
+                ctx.buffers.residual(),
+                n,
+                state.body_state.as_mut(),
+                &mut kv_cache,
+                r0,
+                &mut state.block_table,
+                &mut disk_block_ids,
+                &mut disk_last,
+                r0,
+                &prime_ctx,
+                stream,
+            )?;
+            drop(kv_cache);
+            r0 += n;
+        }
+        state.seq_len = rows_total;
+        tracing::info!(
+            "qwen4_exp MTP drafter primed: {} rows in {:.0} ms",
+            rows_total,
+            t0.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(rows_total)
+    }
+}
+
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         Ok(Box::new(self.alloc_state_inner(gpu)?))
+    }
+
+    fn prefill_drafter(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        let st = state
+            .as_any_mut()
+            .downcast_mut::<Qwen4ExpMtpProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
+        self.prefill_drafter_impl(prompt_tokens, hiddens, st, ctx, stream)
+    }
+
+    fn drafter_rows(&self, state: &mut dyn ProposerState) -> usize {
+        state
+            .as_any_mut()
+            .downcast_mut::<Qwen4ExpMtpProposerState>()
+            .map(|s| s.seq_len)
+            .unwrap_or(0)
     }
 
     fn propose(

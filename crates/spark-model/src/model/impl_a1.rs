@@ -428,7 +428,35 @@ impl TransformerModel {
         // not be killed, and the head must be a precision the batched prefill
         // can actually run at — an NVFP4/FP8 MTP head would allocate this and
         // never write it.
+        // qwen4_exp's MTP head consumes the PRE-MIXER 4-stream highway, so
+        // its prompt capture is `hc_mult x hidden` FP32 per row (not the
+        // BF16 collapsed hidden) and does not depend on the Qwen-shaped
+        // head's BF16-only batched prefill.
+        // OPT-IN (ATLAS_QWEN4EXP_MTP_PRIME, presence): measured 2026-08-28 on
+        // gx10-ecdf, priming was NEUTRAL at K=2 and ~5% SLOWER at K=3 on a
+        // 768-token code bench with tok_step unchanged (~2.55) — this head
+        // never had the wrong-position defect that made priming a 0.26→0.90
+        // acceptance jump elsewhere, and its cold-start penalty self-heals
+        // within ~100 steps. Kept as a lever for short-response workloads,
+        // where the cold rounds dominate.
+        let qwen4_streams_capture = config.model_type == "qwen4_exp"
+            && config.hc_mult > 0
+            && std::env::var("ATLAS_QWEN4EXP_MTP_PRIME").is_ok();
         let mtp_prefill_hidden = if has_mtp
+            && qwen4_streams_capture
+            && crate::layers::mtp_drafter_prefill_enabled(&levers)
+        {
+            let bytes = max_seq_len * config.hc_mult * config.hidden_size * 4;
+            tracing::info!(
+                "MTP drafter context: allocating {:.0} MB prompt-STREAMS capture \
+                 ({} x {}x{} FP32)",
+                bytes as f64 / 1e6,
+                max_seq_len,
+                config.hc_mult,
+                config.hidden_size,
+            );
+            gpu.alloc(bytes)?
+        } else if has_mtp
             && mtp_quant.supports_drafter_prefill()
             && crate::layers::mtp_drafter_prefill_enabled(&levers)
         {
@@ -443,6 +471,7 @@ impl TransformerModel {
             gpu.alloc(bytes)?
         } else {
             if has_mtp
+                && !qwen4_streams_capture
                 && !mtp_quant.supports_drafter_prefill()
                 && crate::layers::mtp_drafter_prefill_enabled(&levers)
             {

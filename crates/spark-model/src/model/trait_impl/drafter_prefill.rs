@@ -142,12 +142,33 @@ impl TransformerModel {
         }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        self.gpu.copy_d2d_async(
-            src,
-            self.mtp_prefill_hidden.offset(chunk_start * h * bf16),
-            proc_count * h * bf16,
-            stream,
-        )?;
+        if self.config.model_type == "qwen4_exp" && self.config.hc_mult > 0 {
+            // qwen4_exp captures the PRE-MIXER highway rows (hc_mult x h
+            // FP32), which the chunk's layer loop left in `hc_streams` —
+            // the mixer collapse reads them without modifying them. The
+            // caller's `src` names the HIDDEN rows and identifies the path:
+            // the pure prefill passes the buffer head (highway rows at 0);
+            // the mixed forward offsets it (highway rows at padded_n), and
+            // v1 skips that capture — the stale-short length then safely
+            // disables priming for the sequence.
+            if src != self.buffers.hidden_states() {
+                return Ok(());
+            }
+            let hw = self.config.hc_mult * h;
+            self.gpu.copy_d2d_async(
+                self.buffers.hc_streams(),
+                self.mtp_prefill_hidden.offset(chunk_start * hw * 4),
+                proc_count * hw * 4,
+                stream,
+            )?;
+        } else {
+            self.gpu.copy_d2d_async(
+                src,
+                self.mtp_prefill_hidden.offset(chunk_start * h * bf16),
+                proc_count * h * bf16,
+                stream,
+            )?;
+        }
         if let Some(new_len) = contiguous_from_zero {
             self.mtp_prefill_capture_len
                 .store(new_len, Ordering::Relaxed);
