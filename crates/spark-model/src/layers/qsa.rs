@@ -35,6 +35,44 @@ mod qsa_select;
 #[path = "qsa_tests.rs"]
 mod tests;
 
+/// `host_topk_blocks` must be OUTPUT-IDENTICAL to the full sort it replaced
+/// (the selection feeds attention — a different set is a numerics change,
+/// not a speedup). CPU-only, so it runs in the default test sweep.
+#[cfg(test)]
+mod topk_equivalence_tests {
+    use super::host_topk_blocks;
+
+    fn reference_full_sort(scores: &[f32], k: usize) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..scores.len() as u32).collect();
+        order.sort_by(|&a, &b| {
+            scores[b as usize]
+                .partial_cmp(&scores[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        order[..k].to_vec()
+    }
+
+    #[test]
+    fn quickselect_matches_full_sort_including_ties() {
+        // Deterministic LCG; heavy duplicate mass (quantized to 1/8 steps)
+        // so the (score, index) tie-break is exercised at the k boundary.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32 * 8.0).floor() / 8.0
+        };
+        for &(n, k) in &[(256usize, 256usize), (257, 256), (4096, 256), (23128, 256), (300, 299)] {
+            let scores: Vec<f32> = (0..n).map(|_| next()).collect();
+            assert_eq!(
+                host_topk_blocks(&scores, k),
+                reference_full_sort(&scores, k),
+                "n={n} k={k}"
+            );
+        }
+    }
+}
+
 /// One decode step's selection: contiguous NHD `k/v` scratch + identity table.
 pub struct QsaSelection {
     pub k_scratch: DevicePtr,
@@ -103,6 +141,35 @@ pub struct QsaIndexer {
 
 /// Prefill ingest GEMM slab (rows), bounding `qk_scratch`.
 const INGEST_SLAB: usize = 2048;
+
+/// Exact torch.topk over one row of block scores: the k best by
+/// (score DESC, index ASC — the tie-break torch uses), returned in that
+/// comparator order.
+///
+/// Quickselect (`select_nth_unstable_by`, O(n)) then sort only the k
+/// survivors — output-identical to fully sorting the row because the
+/// comparator is a TOTAL order (the index tie-break means no two elements
+/// compare equal), but ~15x less work per row at 200k context. The full
+/// sort here was the long-context prefill wall: 2048 rows x depth/ratio
+/// scores x 12 QSA layers per chunk, all on one host thread — ~40-60 s of
+/// CPU sort per 2048-token chunk at 115-185k depth.
+pub(crate) fn host_topk_blocks(scores: &[f32], k: usize) -> Vec<u32> {
+    let n = scores.len();
+    debug_assert!(n >= k, "topk over fewer than k scores");
+    let cmp = |a: &u32, b: &u32| {
+        scores[*b as usize]
+            .partial_cmp(&scores[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(b))
+    };
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    if n > k {
+        order.select_nth_unstable_by(k - 1, cmp);
+        order.truncate(k);
+    }
+    order.sort_unstable_by(cmp);
+    order
+}
 
 impl QsaIndexer {
     #[allow(clippy::too_many_arguments)]
@@ -461,16 +528,11 @@ impl QsaIndexer {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let mut order: Vec<u32> = (0..complete as u32).collect();
-        // torch.topk returns the k largest, ties broken by LOWER index —
-        // sort by (-score, index) and take the first k for identical sets.
-        order.sort_by(|&a, &b| {
-            scores[b as usize]
-                .partial_cmp(&scores[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        let mut blocks: Vec<u32> = order[..self.block_topk as usize].to_vec();
+        // torch.topk semantics (k largest, ties broken by LOWER index) via
+        // the shared quickselect helper — the former full sort was O(n log n)
+        // per decode token per layer, which at 185k context is a ~23k-element
+        // host sort x 12 layers per step.
+        let mut blocks = host_topk_blocks(&scores, self.block_topk as usize);
         blocks.sort_unstable();
 
         let ratio = self.ratio as usize;

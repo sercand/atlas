@@ -203,7 +203,12 @@ impl QsaIndexer {
             )?;
 
             // Host top-k per row (sync D2H drains the stream first). Torch
-            // tie-break: larger score first, lower index on ties.
+            // tie-break: larger score first, lower index on ties — via the
+            // shared quickselect helper (see `host_topk_blocks`): the former
+            // per-row FULL sort on one thread was the long-context prefill
+            // wall (~40-60 s/chunk at 115-185k depth). Quickselect is O(n)
+            // per row and rows are independent, so split them across cores;
+            // each thread writes a disjoint slice of `host_lists`.
             let mut raw = vec![0u8; rows * stride * 4];
             gpu.copy_d2h_on_stream(scores, &mut raw, stream)?;
             let sc: Vec<f32> = raw
@@ -211,21 +216,28 @@ impl QsaIndexer {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let mut host_lists = vec![0u8; rows * topk * 4];
-            for r in 0..rows {
-                let complete = (first_pos + r + 1) / ratio;
-                let row_sc = &sc[r * stride..r * stride + complete];
-                let mut order: Vec<u32> = (0..complete as u32).collect();
-                order.sort_by(|&a, &b| {
-                    row_sc[b as usize]
-                        .partial_cmp(&row_sc[a as usize])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.cmp(&b))
-                });
-                for (i, b) in order[..topk].iter().enumerate() {
-                    host_lists[(r * topk + i) * 4..(r * topk + i) * 4 + 4]
-                        .copy_from_slice(&(*b as i32).to_le_bytes());
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, rows.max(1));
+            let rows_per = rows.div_ceil(threads);
+            std::thread::scope(|s| {
+                for (t, out_chunk) in host_lists.chunks_mut(rows_per * topk * 4).enumerate() {
+                    let sc = &sc;
+                    s.spawn(move || {
+                        for (i, out) in out_chunk.chunks_mut(topk * 4).enumerate() {
+                            let r = t * rows_per + i;
+                            let complete = (first_pos + r + 1) / ratio;
+                            let row_sc = &sc[r * stride..r * stride + complete];
+                            let order = super::host_topk_blocks(row_sc, topk);
+                            for (j, b) in order.iter().enumerate() {
+                                out[j * 4..j * 4 + 4]
+                                    .copy_from_slice(&(*b as i32).to_le_bytes());
+                            }
+                        }
+                    });
                 }
-            }
+            });
             gpu.copy_h2d_async(&host_lists, lists, stream)?;
 
             ops::qsa_prefill_attn(
