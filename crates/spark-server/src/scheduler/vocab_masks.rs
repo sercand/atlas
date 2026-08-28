@@ -39,6 +39,16 @@ pub struct VocabMasks {
     /// alphanumeric, i.e. emitting `</think>` right after it would split a
     /// word. `None` → the suppression is skipped.
     pub mid_word: Option<Arc<[bool]>>,
+    /// `mask[id]` iff token `id` decodes to text STARTING with `=` (the bare
+    /// `=` included). Drives the `<parameter=KEY>` opener detection in the
+    /// tool-body state machine: Qwen BPE merges the `=` with the first
+    /// fragment of many parameter names (`=path`, `=new`, `=options`, …), so
+    /// matching the literal `=` token alone misses those openers — the whole
+    /// parameter VALUE then counts as tool-call ENVELOPE and the envelope-stuck
+    /// guard kills legitimate large writes (observed 2026-08-28: three
+    /// consecutive `edit_file` calls truncated at streak=1025, `new_text`
+    /// dropped). `None` → detection falls back to the bare-`=` token only.
+    pub eq_prefix: Option<Arc<[bool]>>,
 }
 
 impl VocabMasks {
@@ -55,6 +65,10 @@ impl VocabMasks {
 
     pub fn is_mid_word(&self, id: u32) -> bool {
         Self::at(&self.mid_word, id)
+    }
+
+    pub fn is_eq_prefix(&self, id: u32) -> bool {
+        Self::at(&self.eq_prefix, id)
     }
 
     fn at(mask: &Option<Arc<[bool]>>, id: u32) -> bool {
@@ -76,6 +90,7 @@ impl std::fmt::Debug for VocabMasks {
             .field("numeric", &count(&self.numeric))
             .field("boundary", &count(&self.boundary))
             .field("mid_word", &count(&self.mid_word))
+            .field("eq_prefix", &count(&self.eq_prefix))
             .finish()
     }
 }
@@ -110,14 +125,15 @@ mod tests {
     }
 
     #[test]
-    fn the_three_masks_are_independent() {
+    fn the_masks_are_independent() {
         let m = VocabMasks {
             numeric: mask(&[true, false]),
             boundary: mask(&[false, true]),
             mid_word: None,
+            eq_prefix: mask(&[false, true]),
         };
-        assert!(m.is_numeric(0) && !m.is_boundary(0) && !m.is_mid_word(0));
-        assert!(!m.is_numeric(1) && m.is_boundary(1) && !m.is_mid_word(1));
+        assert!(m.is_numeric(0) && !m.is_boundary(0) && !m.is_mid_word(0) && !m.is_eq_prefix(0));
+        assert!(!m.is_numeric(1) && m.is_boundary(1) && !m.is_mid_word(1) && m.is_eq_prefix(1));
     }
 
     #[test]

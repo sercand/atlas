@@ -141,7 +141,7 @@ pub fn emit_token(
     // was silently dead code. (The pos-0 close-tag/AM1 logit-bias that
     // also depended on this state was removed 2026-06-03; the state is
     // still required for A1/B1 and the adadec_diag dump.)
-    update_tool_param_state(a, tok);
+    update_tool_param_state(a, tok, &sched.masks);
 
     // Fix A (2026-06-05): mark a tool call complete on `</tool_call>` (outside
     // thinking) so the EOS-escape gate can lift suppression. Inert unless
@@ -640,8 +640,12 @@ pub enum StartPrefillResult {
 //  - `a.param_body_chars_emitted` ++ per non-close body token
 //  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
 //
-// Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
+// Token IDs are Qwen3.x byte-level BPE (verified via /tokenize 2026-05-25,
+// re-verified on Qwen3.8-Flash-Next 2026-08-28):
 //   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+// The `=` is frequently MERGED with the first fragment of the parameter name
+// (`=path`, `=new`, `=options`, …) — the opener scan therefore also accepts
+// any token classified by `VocabMasks::eq_prefix` in the `=` slot.
 
 /// Cap on tool-call ENVELOPE tokens (everything inside `<tool_call>…</tool_call>`
 /// that is NOT a parameter-value body). Catches a model that opens `<tool_call>`
@@ -664,7 +668,11 @@ fn advance_envelope_streak(inside_parameter_body: bool, streak: u32) -> (u32, bo
     }
 }
 
-pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
+pub fn update_tool_param_state(
+    a: &mut ActiveSeq,
+    tok: u32,
+    masks: &crate::scheduler::vocab_masks::VocabMasks,
+) {
     if a.inside_thinking {
         return;
     }
@@ -766,8 +774,16 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     }
 
     // Not yet inside_parameter_body: scan for `<parameter=KEY>` opener
-    // ending at this `>` (29). Lookback 8 tokens for `[27, 15704, 28]`
-    // signature without an intervening close.
+    // ending at this `>` (29). Lookback 8 tokens for `[27, 15704, =…]`
+    // signature without an intervening close. The `=` slot accepts BOTH the
+    // bare `=` token (28) and any token whose text STARTS with `=`
+    // (VocabMasks::eq_prefix): Qwen BPE merges the `=` into the first
+    // fragment of many parameter names (`=path` 79114, `=new` 8083,
+    // `=options` 91750, `=text` 46696 — verified via /tokenize 2026-08-28),
+    // and a model emitting the canonical merge never produces token 28.
+    // Missing the opener reclassified the whole value as ENVELOPE and the
+    // envelope-stuck guard killed legitimate large `edit_file`/`write` calls
+    // at streak=1025 (three consecutive kills, 2026-08-28 session).
     if tok != TOK_GT {
         return;
     }
@@ -788,7 +804,10 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     let window = &a.output_tokens[start..n_for_lookback];
     let mut sig_idx: Option<usize> = None;
     for i in 0..window.len().saturating_sub(2) {
-        if window[i] == TOK_LT && window[i + 1] == TOK_PARAMETER && window[i + 2] == TOK_EQ {
+        if window[i] == TOK_LT
+            && window[i + 1] == TOK_PARAMETER
+            && (window[i + 2] == TOK_EQ || masks.is_eq_prefix(window[i + 2]))
+        {
             sig_idx = Some(i + 3);
         }
     }

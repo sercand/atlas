@@ -197,6 +197,34 @@ pub(crate) fn resolve_tokenizer_runtime(
         );
     }
 
+    // `=`-prefix token mask (2026-08-28): `mask[id]` is true iff the token
+    // decodes to text starting with `=`. Drives the `<parameter=KEY>` opener
+    // detection in the tool-body state machine (emit_step): Qwen BPE merges
+    // the `=` with the first fragment of many parameter names (`=path`,
+    // `=new`, `=options`, …), so the detector cannot rely on the bare `=`
+    // token appearing. Without this, an undetected opener reclassifies the
+    // whole parameter VALUE as tool-call ENVELOPE and the envelope-stuck
+    // guard force-kills legitimate large writes at 1024 tokens. Built
+    // unconditionally like its siblings; fail-open per-id on decode error.
+    {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let mut mask: Vec<bool> = vec![false; vocab_size];
+        let mut eq_count = 0usize;
+        for (id, slot) in mask.iter_mut().enumerate() {
+            if let Ok(s) = tokenizer.decode_with_special(&[id as u32])
+                && s.starts_with('=')
+            {
+                *slot = true;
+                eq_count += 1;
+            }
+        }
+        vocab_masks.eq_prefix = Some(std::sync::Arc::from(mask));
+        tracing::info!(
+            "Eq-prefix token mask: {eq_count}/{vocab_size} ids start with '=' \
+             (<parameter=KEY> opener detection covers merged '=name' tokens)"
+        );
+    }
+
     if let Some(tid) = think_end_token {
         tracing::info!(
             "Thinking end token: {} ({})",
