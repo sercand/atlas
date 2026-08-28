@@ -70,6 +70,9 @@ impl SsmSnapshotIndex {
                 // insert_tail's supersede sweep maintains.
                 entry.is_tail = false;
                 entry.is_tail_sibling = false;
+                // A plain save re-homing this prefix is durable — it must not
+                // be swept by the decode-checkpoint ring.
+                entry.is_decode_ckpt = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return old;
@@ -86,6 +89,7 @@ impl SsmSnapshotIndex {
             tiered: false,
             is_tail: false,
             is_tail_sibling: false,
+            is_decode_ckpt: false,
         });
         None
     }
@@ -128,6 +132,7 @@ impl SsmSnapshotIndex {
                 entry.tiered = false;
                 entry.is_tail = true;
                 entry.is_tail_sibling = false;
+                entry.is_decode_ckpt = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return displaced;
@@ -143,6 +148,7 @@ impl SsmSnapshotIndex {
             tiered: false,
             is_tail: true,
             is_tail_sibling: false,
+            is_decode_ckpt: false,
         });
         displaced
     }
@@ -167,6 +173,7 @@ impl SsmSnapshotIndex {
                 entry.tiered = false;
                 entry.is_tail = false;
                 entry.is_tail_sibling = true;
+                entry.is_decode_ckpt = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return old;
@@ -183,7 +190,91 @@ impl SsmSnapshotIndex {
             tiered: false,
             is_tail: false,
             is_tail_sibling: true,
+            is_decode_ckpt: false,
         });
         None
+    }
+
+    /// Insert a DECODE-time Marconi checkpoint, keeping at most `keep`
+    /// decode-checkpoint entries for this session (the ring): after the
+    /// insert, this session's shallowest `is_decode_ckpt` entries beyond
+    /// `keep` are removed. Returns displaced snapshot ids for the caller to
+    /// free.
+    ///
+    /// Why a ring and not plain `insert`: decode checkpoints fire every few
+    /// blocks for the whole response, and each older one is dominated for the
+    /// SAME growing sequence by the ones after it — but on a small pool the
+    /// unswept stream LRU-evicts the prefill prompt-boundary anchors that
+    /// serve the next warm turn when the re-rendered prompt diverges at the
+    /// generation seam (the common agentic case). The ring bounds a turn's
+    /// decode footprint to `keep` slots while still covering warm matches
+    /// that land a few blocks below the finish leaf.
+    ///
+    /// Non-tail semantics: state is captured at exactly `token_count`, so the
+    /// entry is content-addressed and safe cross-session (see the `is_tail`
+    /// invariant in `snapshot.rs`).
+    pub(super) fn insert_decode_ckpt(
+        &mut self,
+        prefix_hash: u64,
+        snapshot_id: usize,
+        session_hash: u64,
+        token_count: usize,
+        keep: usize,
+    ) -> Vec<usize> {
+        let mut displaced = Vec::new();
+        let mut re_homed = false;
+        for entry in &mut self.entries {
+            if entry.prefix_hash == prefix_hash {
+                displaced.extend(freeable_slot(entry));
+                entry.snapshot_id = snapshot_id;
+                entry.session_hash = session_hash;
+                entry.token_count = token_count;
+                entry.tiered = false;
+                entry.is_tail = false;
+                entry.is_tail_sibling = false;
+                entry.is_decode_ckpt = true;
+                self.access_counter += 1;
+                entry.last_access = self.access_counter;
+                re_homed = true;
+                break;
+            }
+        }
+        if !re_homed {
+            self.access_counter += 1;
+            self.stats.saves += 1;
+            self.entries.push(SnapshotEntry {
+                snapshot_id,
+                session_hash,
+                token_count,
+                prefix_hash,
+                last_access: self.access_counter,
+                tiered: false,
+                is_tail: false,
+                is_tail_sibling: false,
+                is_decode_ckpt: true,
+            });
+        }
+        // Ring sweep: while this session holds more than `keep` decode
+        // checkpoints, drop the SHALLOWEST (smallest token_count) — deeper
+        // ones dominate it for every future lookup of this growing sequence.
+        let keep = keep.max(1);
+        loop {
+            let mut count = 0usize;
+            let mut shallowest: Option<(usize, usize)> = None; // (idx, token_count)
+            for (i, e) in self.entries.iter().enumerate() {
+                if e.is_decode_ckpt && e.session_hash == session_hash {
+                    count += 1;
+                    if shallowest.is_none_or(|(_, tc)| e.token_count < tc) {
+                        shallowest = Some((i, e.token_count));
+                    }
+                }
+            }
+            if count <= keep {
+                break;
+            }
+            let (idx, _) = shallowest.expect("count > keep implies at least one entry");
+            displaced.extend(freeable_slot(&self.entries.swap_remove(idx)));
+        }
+        displaced
     }
 }

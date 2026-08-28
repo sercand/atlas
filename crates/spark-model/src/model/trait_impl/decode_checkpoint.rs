@@ -155,23 +155,21 @@ impl TransformerModel {
         // fire, so this is bit-identical to the old block-floored slice.
         let snap_tokens = seq.tokens.len();
         let boundary_tokens = &seq.tokens[..snap_tokens];
-        let boundary_blocks = &seq.block_table[..end_block];
-        let boundary_disk: &[u32] = if seq.disk_block_ids.len() >= end_block {
-            &seq.disk_block_ids[..end_block]
-        } else {
-            &[]
-        };
-        let displaced = self.prefix_cache.insert_intermediate_snapshot(
+        // Ring-swept insert (2026-08-28): a plain intermediate insert per fire
+        // (every `interval` blocks, for the whole response) LRU-evicted the
+        // prefill prompt-boundary anchors from a small pool — every warm turn
+        // whose re-rendered prompt diverged at the generation seam then logged
+        // "no SSM snapshot — recomputing all KV" (11-21 s TTFT at ~11k tokens
+        // on gx10). The ring keeps only the deepest few decode checkpoints per
+        // session (ATLAS_DECODE_CKPT_KEEP, default 2), which is all a future
+        // lookup of this growing sequence can ever use.
+        let displaced = self.prefix_cache.insert_decode_ckpt_snapshot(
             boundary_tokens,
-            boundary_blocks,
-            boundary_disk,
-            bs,
             snap_id,
             seq.session_hash,
-            snap_tokens,
             seq.adapter_id,
         );
-        if let Some(old) = displaced {
+        for old in displaced {
             self.ssm_snapshots.free(old);
         }
         tracing::info!(

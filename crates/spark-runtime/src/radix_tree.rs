@@ -222,6 +222,32 @@ impl PrefixCache for RadixTree {
         )
     }
 
+    fn insert_decode_ckpt_snapshot(
+        &self,
+        tokens: &[u32],
+        snapshot_id: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Vec<usize> {
+        // Ring size: total decode checkpoints kept per session. 2 covers the
+        // dominant warm-turn geometry (the block-floored match lands within a
+        // checkpoint interval of the finish leaf) while bounding a turn's
+        // decode footprint to 2 pool slots regardless of response length.
+        let keep = std::env::var("ATLAS_DECODE_CKPT_KEEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2);
+        let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
+        self.snapshot_index.lock().insert_decode_ckpt(
+            prefix_hash,
+            snapshot_id,
+            session_hash,
+            tokens.len(),
+            keep,
+        )
+    }
+
     fn insert_intermediate_snapshot(
         &self,
         tokens: &[u32],

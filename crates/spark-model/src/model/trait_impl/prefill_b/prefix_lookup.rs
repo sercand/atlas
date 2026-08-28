@@ -106,6 +106,26 @@ impl TransformerModel {
             let matched = prefix_match.matched_tokens;
             seq.cached_prefix_tokens = matched;
             seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
+            // Seam-divergence diagnostic (2026-08-28, env-gated): on warm
+            // agentic turns the radix match repeatedly stops at the PREVIOUS
+            // prompt's block-floored boundary instead of running through the
+            // cached decode tokens — i.e. the re-rendered assistant turn
+            // diverges from what was decoded (chat-template `|trim` of
+            // reasoning_content, sanitizer rewrites, client normalization…).
+            // Log the prompt-side token ids around the match end so the
+            // diverging bytes can be identified offline via /detokenize.
+            if matched > 0
+                && matched < total
+                && std::env::var_os("ATLAS_PREFIX_DIVERGE_DBG").is_some()
+            {
+                let lo = matched.saturating_sub(8);
+                let hi = (matched + 24).min(tokens.len());
+                tracing::info!(
+                    "prefix-diverge-dbg: matched={matched} total={total} \
+                     prompt tokens[{lo}..{hi}]={:?}",
+                    &tokens[lo..hi],
+                );
+            }
             // Stash the matched prefix so `free_sequence` can release the radix
             // refs the lookup just bumped even if this prefill fails to allocate
             // its suffix before `seq.tokens` is populated (else those nodes leak

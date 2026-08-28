@@ -282,6 +282,21 @@ pub trait PrefixCache: Send + Sync {
         adapter_id: u64,
     ) -> Option<usize>;
 
+    /// Register a DECODE-time Marconi checkpoint in the index WITHOUT touching
+    /// the radix tree (the retiring sequence's `insert` lays the tree nodes; the
+    /// index pairs with them by prefix hash). Keeps only a small ring of
+    /// decode checkpoints per session — the shallowest beyond the ring are
+    /// superseded, so a long decode cannot LRU-evict the prefill
+    /// prompt-boundary anchors the next warm turn restores from. Returns
+    /// displaced snapshot ids for the caller to free.
+    fn insert_decode_ckpt_snapshot(
+        &self,
+        tokens: &[u32],
+        snapshot_id: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Vec<usize>;
+
     /// Register the per-session TAIL snapshot in the index WITHOUT touching the
     /// radix tree (the final chunk's `insert` covers those blocks). Supersedes
     /// this session's previous tail; returns displaced snapshot ids to free.

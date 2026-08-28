@@ -45,6 +45,17 @@ pub(super) struct SnapshotEntry {
     /// but leased alongside the tail. At most one per session (swept together
     /// with the tail by `insert_tail`).
     pub(super) is_tail_sibling: bool,
+    /// True for a DECODE-time Marconi checkpoint (#155 iter3, every
+    /// `ATLAS_DECODE_CKPT_BLOCKS` blocks). These strictly supersede each other
+    /// within a session — only the deepest few can ever serve the next warm
+    /// turn — yet each fires every ~64 generated tokens, so on a small pool an
+    /// unswept stream of them LRU-evicts the prefill prompt-boundary anchors
+    /// the next turn actually needs (measured 2026-08-28 gx10: 4-slot pool,
+    /// every warm turn "no SSM snapshot — recomputing all KV", TTFT 11-21 s at
+    /// ~11k tokens). `insert_decode_ckpt` sweeps this session's older
+    /// decode-checkpoint entries past a small keep-ring; exact-prefix keyed
+    /// like plain inserts (state at exactly `token_count`, safe cross-session).
+    pub(super) is_decode_ckpt: bool,
 }
 
 /// Where a matched snapshot's state currently lives (Phase 1b).

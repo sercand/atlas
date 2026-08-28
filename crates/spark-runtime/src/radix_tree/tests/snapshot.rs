@@ -345,3 +345,78 @@ fn test_ssm_snapshot_adapter_isolation_via_tree() {
     assert_eq!(m_a.ssm_snapshot, Some(42));
     tree.release(&tokens, 16, A);
 }
+
+#[test]
+fn test_decode_ckpt_ring_supersedes_shallowest_and_spares_prefill_anchor() {
+    let tree = RadixTree::new();
+    const SESSION: u64 = 0xABC;
+
+    // Prefill lays 8 blocks and a prompt-boundary intermediate anchor at
+    // token 32 (snapshot 7) — the entry the ring must NOT displace.
+    let tokens: Vec<u32> = (0..128).collect();
+    tree.insert(&tokens, &[10, 20, 30, 40, 50, 60, 70, 80], &[], 16, 0, 0);
+    let anchor: Vec<u32> = (0..32).collect();
+    tree.insert_intermediate_snapshot(&anchor, &[10, 20], &[], 16, 7, SESSION, 0, 0);
+
+    // Decode fires checkpoints at tokens 64 / 80 / 96 / 112 (ids 100..104).
+    // With ATLAS_DECODE_CKPT_KEEP unset the ring keeps 2: each insert past
+    // the second displaces the SHALLOWEST decode ckpt, never the anchor.
+    let mut displaced_all = Vec::new();
+    for (i, end) in [64usize, 80, 96, 112].iter().enumerate() {
+        let t: Vec<u32> = (0..*end as u32).collect();
+        displaced_all.extend(tree.insert_decode_ckpt_snapshot(&t, 100 + i, SESSION, 0));
+    }
+    // 4 inserted, ring of 2 → the two shallowest (ids 100, 101) came back.
+    displaced_all.sort_unstable();
+    assert_eq!(displaced_all, vec![100, 101]);
+
+    // Deepest decode ckpt wins a full-prefix lookup…
+    let m = tree.lookup(&tokens, 16, SESSION, 0);
+    assert_eq!(m.matched_tokens, 128);
+    assert_eq!(m.ssm_snapshot, Some(103));
+    assert_eq!(m.ssm_snapshot_tokens, 112);
+    tree.release(&tokens, 16, 0);
+
+    // …and the prompt-boundary anchor still serves a seam-diverged warm turn
+    // (match capped below every surviving decode ckpt).
+    let mut diverged: Vec<u32> = (0..48).collect();
+    diverged[33] = 9999; // diverges inside block 3 → radix match stops at 32
+    let m2 = tree.lookup(&diverged, 16, SESSION, 0);
+    assert_eq!(m2.matched_tokens, 32);
+    assert_eq!(
+        m2.ssm_snapshot,
+        Some(7),
+        "prefill anchor must survive the decode-ckpt churn"
+    );
+    assert_eq!(m2.ssm_snapshot_tokens, 32);
+    tree.release(&diverged[..32].to_vec(), 16, 0);
+}
+
+#[test]
+fn test_decode_ckpt_ring_is_per_session() {
+    let tree = RadixTree::new();
+    let t64: Vec<u32> = (0..64).collect();
+    let t80: Vec<u32> = (0..80).collect();
+    let t96: Vec<u32> = (0..96).collect();
+    tree.insert(&t96, &[10, 20, 30, 40, 50, 60], &[], 16, 0, 0);
+
+    // Session A holds two ckpts; session B's inserts must not sweep them.
+    assert!(tree.insert_decode_ckpt_snapshot(&t64, 1, 0xA, 0).is_empty());
+    assert!(tree.insert_decode_ckpt_snapshot(&t80, 2, 0xA, 0).is_empty());
+    let u64_: Vec<u32> = (1000..1064).collect();
+    let u80_: Vec<u32> = (1000..1080).collect();
+    let u96_: Vec<u32> = (1000..1096).collect();
+    assert!(
+        tree.insert_decode_ckpt_snapshot(&u64_, 3, 0xB, 0)
+            .is_empty()
+    );
+    assert!(
+        tree.insert_decode_ckpt_snapshot(&u80_, 4, 0xB, 0)
+            .is_empty()
+    );
+    // Third B ckpt sweeps B's shallowest (id 3), not anything of A.
+    assert_eq!(tree.insert_decode_ckpt_snapshot(&u96_, 5, 0xB, 0), vec![3]);
+    let m = tree.lookup(&t96, 16, 0xA, 0);
+    assert_eq!(m.ssm_snapshot, Some(2), "session A's ring untouched");
+    tree.release(&t96, 16, 0);
+}
