@@ -100,6 +100,11 @@ spark serve --model-from-path <snapshot> --kernel-target qwen3.8-flash-next \
 ```
 
 K sweep on the code prompt: K=2 41.2, **K=3 45.8**, K=4 37.1 (verify cost
-outruns depth). `ATLAS_DFLASH_SPEC_THINK=1` is the whole payoff on this
+outruns depth). The batched-verify-attention commit (ms body,
+QSA ingest batched through prefill_ingest) lifts K=3 code to **49.4**.
+Graph pricing (ATLAS_NO_DECODE_GRAPHS A/B): graphs are NEUTRAL at C=1 and
+only recover a C>1 eager-shape penalty — the serial floor is intra-kernel
+latency, and the routed-expert reads that scale with K are the verify's one
+non-amortizable bandwidth term. `ATLAS_DFLASH_SPEC_THINK=1` is the whole payoff on this
 always-thinking model and inherits the known batch-K T=0 numerics floor;
 the agentic-gate measurement for spec-in-think on THIS model is still owed.

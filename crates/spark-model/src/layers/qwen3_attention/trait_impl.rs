@@ -270,9 +270,22 @@ impl TransformerLayer for Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         if self.hc.is_some() {
-            // K verify rows under the mHC highway: batched highway brackets,
-            // per-row attention through the single-token path so QSA ingests
-            // into the REAL sequence state (see decode_batched_hc.rs).
+            // K verify rows under the mHC highway. While QSA selection is
+            // provably inert for every row, take the BATCHED ms body — one
+            // launch set for all K rows (measured ~8 ms/row on the per-row
+            // loop at K=2, dominated by launch latency, not weights). An
+            // active-selection sequence takes the per-row attention loop,
+            // whose single-token path does select + gathered attention
+            // against the real carry (see decode_batched_hc.rs).
+            let inert = match self.qsa.as_ref() {
+                None => true,
+                Some(q) => seq_len + num_tokens <= q.inert_bound(),
+            };
+            if inert {
+                return self.decode_batched_verify_hc(
+                    hidden, residual, num_tokens, state, kv_cache, seq_len, ctx, stream,
+                );
+            }
             return self.decode_batched_inner_hc(
                 hidden,
                 num_tokens,

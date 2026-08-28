@@ -248,7 +248,15 @@ impl TransformerModel {
         // graphs for the whole model — a graph captured on the dense path
         // would silently replay WRONG attention once selection activates.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
+        // ATLAS_NO_DECODE_GRAPHS (presence): force eager decode. Diagnostic
+        // A/B lever for pricing graph capture on a given model — e.g. the
+        // qwen4_exp launch-overhead question, where the QSA veto had made
+        // graphs unmeasurable. Presence, not value, per house convention.
+        static NO_GRAPHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_graphs_env =
+            *NO_GRAPHS.get_or_init(|| std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok());
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+            && !no_graphs_env
             && !self.profile
             && !self
                 .suppress_graphs

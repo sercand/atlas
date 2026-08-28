@@ -27,7 +27,54 @@ mod mla;
 mod mla_gemv;
 mod qkv;
 
+/// Whose QSA carry the hc batched body ingests into.
+///
+/// `PerSeq`: real concurrent decode — N sequences, one state each, positions
+/// from `seq_lens`. `VerifyRows`: the K-row speculative verify — K SEQUENTIAL
+/// tokens of ONE sequence, ingested in row order into the single real state
+/// (rewound on partial accept via `rewind_verify`). Attention itself is
+/// stateless either way; this only routes the indexer bookkeeping.
+pub(in crate::layers::qwen3_attention) enum MsQsaMode<'a, 'b> {
+    PerSeq(&'a mut [&'b mut (dyn LayerState + 'static)]),
+    VerifyRows {
+        state: &'a mut (dyn LayerState + 'b),
+        seq_len: usize,
+    },
+}
+
 impl Qwen3AttentionLayer {
+    /// K-row single-sequence speculative verify through the BATCHED ms body
+    /// (one launch set for all K rows) — legal only while QSA selection is
+    /// provably inert for every row (the caller gates on `inert_bound`);
+    /// active-selection sequences take the per-row `attention_forward` loop
+    /// in `decode_batched_hc.rs` instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn decode_batched_verify_hc(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let bs = kv_cache.block_size() as u32;
+        let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_tokens, bs, stream);
+        if let Some(m) = ctx.attn_metadata.as_ref() {
+            c.seq_slot = m.seq_slot;
+        }
+        self.decode_multi_seq_inner_hc(
+            c,
+            MsQsaMode::VerifyRows { state, seq_len },
+            &[],
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::layers::qwen3_attention) fn decode_multi_seq_inner<'a, 'b: 'a>(
         &self,
@@ -50,7 +97,14 @@ impl Qwen3AttentionLayer {
 
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
-            return self.decode_multi_seq_inner_hc(c, states, _seq_lens, kv_cache, ctx, stream);
+            return self.decode_multi_seq_inner_hc(
+                c,
+                MsQsaMode::PerSeq(states),
+                _seq_lens,
+                kv_cache,
+                ctx,
+                stream,
+            );
         }
         let _ = states; // Non-hc attention keeps no per-seq state.
 
@@ -121,12 +175,13 @@ impl Qwen3AttentionLayer {
     fn decode_multi_seq_inner_hc<'a, 'b: 'a>(
         &self,
         c: ctx::MultiSeqCtx<'_>,
-        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        mode: MsQsaMode<'a, 'b>,
         seq_lens: &[usize],
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let verify_rows = matches!(mode, MsQsaMode::VerifyRows { .. });
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let n = c.n;
@@ -240,26 +295,43 @@ impl Qwen3AttentionLayer {
         // means the gate and this path disagree — refuse loudly rather than
         // serve dense-past-budget (not the reference model).
         if let Some(qsa) = self.qsa.as_ref() {
-            for (i, state) in states.iter_mut().enumerate().take(n) {
-                let st =
-                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, *state, ctx.gpu)?;
-                let sel = qsa.decode_select(
-                    st,
-                    c.normed.offset(i * h * c.bf16),
-                    seq_lens[i],
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    meta.block_table
-                        .offset(i * meta.max_blocks_per_seq as usize * 4),
-                    c.bs,
-                    ctx.gpu,
-                    stream,
-                )?;
-                anyhow::ensure!(
-                    sel.is_none(),
-                    "QSA selection active for seq {i} on the batched ms path; \
-                     the dispatch gate should have routed this batch per-seq"
-                );
+            match mode {
+                MsQsaMode::PerSeq(states) => {
+                    for (i, state) in states.iter_mut().enumerate().take(n) {
+                        let st = crate::layers::qwen3_attention::helpers::qsa_seq_state(
+                            qsa, *state, ctx.gpu,
+                        )?;
+                        let sel = qsa.decode_select(
+                            st,
+                            c.normed.offset(i * h * c.bf16),
+                            seq_lens[i],
+                            kv_cache.k_pool_ptr(self.attn_layer_idx),
+                            kv_cache.v_pool_ptr(self.attn_layer_idx),
+                            meta.block_table
+                                .offset(i * meta.max_blocks_per_seq as usize * 4),
+                            c.bs,
+                            ctx.gpu,
+                            stream,
+                        )?;
+                        anyhow::ensure!(
+                            sel.is_none(),
+                            "QSA selection active for seq {i} on the batched ms path; \
+                             the dispatch gate should have routed this batch per-seq"
+                        );
+                    }
+                }
+                MsQsaMode::VerifyRows { state, seq_len } => {
+                    // K sequential positions of ONE sequence: one BATCHED
+                    // ingest of all K rows into the real carry (the same
+                    // slab GEMM + park + pool the prefill path runs), with
+                    // the base marked for the partial-accept rewind. The
+                    // caller gated on `inert_bound`, so no row selects.
+                    let st = crate::layers::qwen3_attention::helpers::qsa_seq_state(
+                        qsa, state, ctx.gpu,
+                    )?;
+                    qsa.begin_verify(st);
+                    qsa.prefill_ingest(st, c.normed, n, seq_len, ctx.gpu, stream)?;
+                }
             }
         }
 
@@ -387,27 +459,51 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(c.hidden, c.normed, n * h * 2, stream)?;
         }
 
-        // Per-token sequential FFN (MLA models always take this path).
-        for i in 0..n {
-            let normed2_i = c.normed.offset(i * c.h * c.bf16);
-            let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
-            // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
-            let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
-            let post_i = post.offset(i * hc.hc_mult * 4);
-            let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
+        // Verify rows: one fused K-row MoE + one hc_post over all rows —
+        // the per-token loop below re-reads the routed experts per row.
+        if verify_rows && (n == 2 || n == 3) {
+            if n == 2 {
+                self.ffn.forward_k2(c.normed, ctx, stream)?;
+            } else {
+                self.ffn.forward_k3(c.normed, ctx, stream)?;
+            }
+            let moe_rows = ctx.buffers.moe_output();
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
-                moe_out,
-                hc_streams_i,
-                post_i,
-                comb_i,
-                hc_streams_i,
-                1,
+                moe_rows,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                n as u32,
                 h as u32,
                 stream,
             )?;
+        } else {
+            // Per-token sequential FFN (MLA models always take this path).
+            for i in 0..n {
+                let normed2_i = c.normed.offset(i * c.h * c.bf16);
+                let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
+                // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
+                let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
+                let post_i = post.offset(i * hc.hc_mult * 4);
+                let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    moe_out,
+                    hc_streams_i,
+                    post_i,
+                    comb_i,
+                    hc_streams_i,
+                    1,
+                    h as u32,
+                    stream,
+                )?;
+            }
         }
         if diag_this {
             super::diag_norm_f32(
