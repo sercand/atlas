@@ -459,6 +459,13 @@ impl TransformerModel {
         } else if has_mtp
             && mtp_quant.supports_drafter_prefill()
             && crate::layers::mtp_drafter_prefill_enabled(&levers)
+            // qwen4_exp's ONLY capture layout is the hc-streams one above
+            // (hc_mult x h FP32 per row). Allocating this BF16 buffer for it
+            // handed the streams-stride writer (drafter_prefill.rs) a buffer
+            // 20x too small per row: fine by accident under ~13k prompt
+            // tokens at the 200k row capacity, then cuMemcpyDtoDAsync
+            // INVALID_VALUE on the first longer prefill.
+            && !(config.model_type == "qwen4_exp" && config.hc_mult > 0)
         {
             let bytes = max_seq_len * config.hidden_size * 2;
             tracing::info!(
