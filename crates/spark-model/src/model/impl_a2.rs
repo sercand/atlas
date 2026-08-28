@@ -72,6 +72,48 @@ impl TransformerModel {
         tokens.iter().any(|&t| t == image || t == video)
     }
 
+    /// Cache-key view of `tokens` for prefix-cache and SSM-snapshot
+    /// addressing (image-hash-aware prefix caching, 2026-08-28 — see
+    /// `model::vision_cache` for the scheme and its soundness argument).
+    ///
+    /// - Text-only slice → `Some(Borrowed)`, byte-identical to today.
+    /// - Vision pads + stamped `seq.vision_content_hashes` → `Some(Owned)`
+    ///   with each pad replaced by its image's virtual id — pass THIS to
+    ///   every `prefix_cache.*` call in place of the raw tokens (lookup,
+    ///   insert, snapshot registration AND release must all use the same
+    ///   stream, or radix refs unbalance).
+    /// - Vision pads without usable hashes → `None`: keep the legacy vision
+    ///   veto (no lookup, no insert) for this slice.
+    pub(super) fn cache_key_view<'a>(
+        &self,
+        tokens: &'a [u32],
+        seq: &SequenceState,
+    ) -> Option<std::borrow::Cow<'a, [u32]>> {
+        let (image, video) = self.vision_pad_ids();
+        crate::model::vision_cache::substitute_vision_pads(
+            tokens,
+            image,
+            video,
+            &seq.vision_content_hashes,
+        )
+    }
+
+    /// V1 warm-restore gate for vision prompts: true iff every vision pad in
+    /// `tokens` lies STRICTLY below `cut` (the resume point of a cache skip).
+    /// A resume point inside or below a pad run is excluded because the
+    /// recomputed suffix would then contain pad positions, and neither the
+    /// chunk splice (pad runs must not straddle chunk boundaries — see
+    /// prefill_b.rs) nor its image-index cursor supports starting mid-prompt
+    /// with earlier images skipped. The gated request falls back to full
+    /// recompute (today's vision behavior); the dominant agentic case — the
+    /// screenshot deep in history, new turns appending text — passes.
+    pub(super) fn vision_pads_below(&self, tokens: &[u32], cut: usize) -> bool {
+        let (image, video) = self.vision_pad_ids();
+        !tokens[cut.min(tokens.len())..]
+            .iter()
+            .any(|&t| t == image || t == video)
+    }
+
     /// Whether `--high-speed-swap` has slid this sequence's rolling window, so
     /// `block_table` no longer parallels the token stream from position 0.
     ///

@@ -47,4 +47,40 @@ impl VisionItem {
         let sms = spatial_merge_size.max(1);
         self.t_len() * (self.grid_h / sms) * (self.grid_w / sms)
     }
+
+    /// Deterministic 64-bit content hash (FNV-1a over grid dims + every
+    /// group's raw f32 bits). Keys image-hash-aware prefix caching
+    /// (`model::vision_cache`): identical pixels+grid → identical hash →
+    /// the pad run's virtual cache ids match across requests; any pixel
+    /// difference changes the hash and the cached prefix diverges at the
+    /// image. FNV is deterministic across processes, so a restart neither
+    /// helps nor hurts (the in-memory cache is empty anyway).
+    pub fn content_hash(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x1000_0000_01b3;
+        let mut h = FNV_OFFSET;
+        let mut eat_u64 = |v: u64| {
+            for b in v.to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
+            }
+        };
+        eat_u64(self.grid_h as u64);
+        eat_u64(self.grid_w as u64);
+        eat_u64(self.groups.len() as u64);
+        for g in &self.groups {
+            eat_u64(g.len() as u64);
+            // Word-at-a-time over the f32 bit patterns (byte-at-a-time FNV
+            // over multi-MB pixel buffers is needlessly slow).
+            let mut acc = FNV_OFFSET;
+            for chunk in g.chunks(2) {
+                let mut w = 0u64;
+                for (i, f) in chunk.iter().enumerate() {
+                    w |= (f.to_bits() as u64) << (32 * i);
+                }
+                acc = (acc ^ w).wrapping_mul(FNV_PRIME);
+            }
+            eat_u64(acc);
+        }
+        h
+    }
 }

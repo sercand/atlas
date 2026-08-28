@@ -70,9 +70,13 @@ impl TransformerModel {
         self.final_norm_apply(hidden, normed, 1, h, eps, stream)?;
         self.lm_head(normed, stream)?;
         // Prefix cache insert (no new snapshot needed — SSM state unchanged).
-        if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        // Vision: insert under the cache-key view (model::vision_cache);
+        // `None` keeps the legacy veto.
+        if let Some(ck) = self.cache_key_view(tokens, seq)
+            && !self.hss_window_slid(seq)
+        {
             let acquired = self.prefix_cache.insert(
-                tokens,
+                ck.as_ref(),
                 &seq.block_table,
                 &seq.disk_block_ids,
                 bs,
@@ -97,6 +101,12 @@ impl TransformerModel {
         bs: usize,
         stream: u64,
     ) {
+        // Image-hash-aware addressing (model::vision_cache): every cache call
+        // in this fn uses the cache-key view (pads -> per-image virtual ids).
+        // `vision_veto` = pads without stamped hashes -> the legacy veto.
+        let ckey = self.cache_key_view(tokens, seq);
+        let vision_veto = ckey.is_none();
+        let tokens: &[u32] = ckey.as_deref().unwrap_or(tokens);
         if self.ssm_snapshots.is_enabled() {
             let snap_result = match self.ssm_snapshots.save(
                 seq.slot_idx,
@@ -138,7 +148,7 @@ impl TransformerModel {
                 if let Err(e) = self.record_snapshot_save_dispatch(stream) {
                     tracing::warn!("prefill snapshot save: record snapshot event: {e}");
                 }
-                if self.tokens_have_vision_pad(tokens) || self.hss_window_slid(seq) {
+                if vision_veto || self.hss_window_slid(seq) {
                     // Vision prefill: snapshot is image-tainted and the
                     // token stream collides across distinct images, so do
                     // not admit either the snapshot or the radix block.
@@ -164,7 +174,7 @@ impl TransformerModel {
                         self.ssm_snapshots.free(old);
                     }
                 }
-            } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+            } else if !vision_veto && !self.hss_window_slid(seq) {
                 let acquired = self.prefix_cache.insert(
                     tokens,
                     &seq.block_table,
@@ -175,7 +185,7 @@ impl TransformerModel {
                 );
                 super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        } else if !vision_veto && !self.hss_window_slid(seq) {
             let acquired = self.prefix_cache.insert(
                 tokens,
                 &seq.block_table,
@@ -200,6 +210,12 @@ impl TransformerModel {
         bs: usize,
         stream: u64,
     ) {
+        // Image-hash-aware addressing (model::vision_cache): every cache call
+        // in this fn uses the cache-key view (pads -> per-image virtual ids).
+        // `vision_veto` = pads without stamped hashes -> the legacy veto.
+        let ckey = self.cache_key_view(tokens, seq);
+        let vision_veto = ckey.is_none();
+        let tokens: &[u32] = ckey.as_deref().unwrap_or(tokens);
         if self.ssm_snapshots.is_enabled() {
             let snap_result = match self.ssm_snapshots.save(
                 seq.slot_idx,
@@ -245,7 +261,7 @@ impl TransformerModel {
                 if let Err(e) = self.record_snapshot_save_dispatch(stream) {
                     tracing::warn!("prefill snapshot save [twophase]: record snapshot event: {e}");
                 }
-                if self.tokens_have_vision_pad(tokens) || self.hss_window_slid(seq) {
+                if vision_veto || self.hss_window_slid(seq) {
                     // Vision prefill: the SSM snapshot is image-tainted and
                     // the token stream collides across distinct images (the
                     // prefix-cache key hashes token IDs only, and image-pad
@@ -290,7 +306,7 @@ impl TransformerModel {
                         self.ssm_snapshots.free(old);
                     }
                 }
-            } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+            } else if !vision_veto && !self.hss_window_slid(seq) {
                 let acquired = self.prefix_cache.insert(
                     tokens,
                     &seq.block_table,
@@ -301,7 +317,7 @@ impl TransformerModel {
                 );
                 super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        } else if !vision_veto && !self.hss_window_slid(seq) {
             let acquired = self.prefix_cache.insert(
                 tokens,
                 &seq.block_table,

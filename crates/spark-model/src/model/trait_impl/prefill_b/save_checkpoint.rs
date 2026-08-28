@@ -158,14 +158,15 @@ impl TransformerModel {
             return Ok(());
         }
         let boundary_blocks = &seq.block_table[..end_block];
-        // Vision chunks: skip both the radix insert and the SSM snapshot
-        // attach — the placeholder token stream is identical for distinct
-        // images of the same prompt, so a future hit would resurrect the
-        // prior image's state.
-        if self.tokens_have_vision_pad(boundary_tokens) {
+        // Vision chunks: register under the cache-key view (pads → per-image
+        // virtual ids, model::vision_cache) so a future hit is content-
+        // addressed. `None` = pads without stamped hashes → the legacy veto
+        // (skip both the radix insert and the SSM snapshot attach).
+        let Some(boundary_ckey) = self.cache_key_view(boundary_tokens, seq) else {
             self.ssm_snapshots.free(snap_id);
             return Ok(());
-        }
+        };
+        let boundary_tokens: &[u32] = boundary_ckey.as_ref();
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
         } else {

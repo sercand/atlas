@@ -52,10 +52,12 @@ impl TransformerModel {
             // from cache eviction, leaking the seq's blocks every request.
             // Also skip on HSS-slid (front of block_table no longer parallels
             // tokens) and vision prompts — both handled by the guard below.
-            if self.prefix_cache.is_active()
-                && !self.tokens_have_vision_pad(&seq.tokens)
-                && seq.hss_window_start() == 0
-            {
+            // Image-hash-aware addressing: insert under the SAME cache-key
+            // view the lookup used (pads → per-image virtual ids). `None` =
+            // pads without stamped hashes → legacy vision veto (no insert).
+            let ckey = self.cache_key_view(&seq.tokens, seq);
+            if self.prefix_cache.is_active() && ckey.is_some() && seq.hss_window_start() == 0 {
+                let ck = ckey.as_deref().expect("ckey checked Some above");
                 // #155: leaf snapshot at FULL length (prompt + generated) so
                 // the next warm hit restores at this turn's END and replays
                 // ~nothing. Save logic + the secondary-stream ordering guard
@@ -63,7 +65,7 @@ impl TransformerModel {
                 let finish_snap = self.finish_leaf_snapshot(seq);
                 let acquired = if let Some(snap_id) = finish_snap {
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
-                        &seq.tokens,
+                        ck,
                         &seq.block_table,
                         &seq.disk_block_ids,
                         bs,
@@ -78,7 +80,7 @@ impl TransformerModel {
                     acquired
                 } else {
                     self.prefix_cache.insert(
-                        &seq.tokens,
+                        ck,
                         &seq.block_table,
                         &seq.disk_block_ids,
                         bs,
@@ -160,8 +162,14 @@ impl TransformerModel {
         // short to cover the matched prefix, release over the stashed prefix
         // tokens instead. Exactly one of the two covers the matched nodes, so
         // they are released once (never double-released).
-        let release_tokens = if seq.tokens.len() >= seq.cached_prefix_tokens {
-            &seq.tokens
+        // Image-hash-aware addressing: release with the same cache-key view
+        // the lookup/inserts used. When the view is unavailable (pads without
+        // hashes) nothing was ever looked up or inserted under the raw stream,
+        // so releasing over it is a harmless radix no-op. `prefix_ref_tokens`
+        // is stashed ALREADY substituted at lookup time.
+        let ckey = self.cache_key_view(&seq.tokens, seq);
+        let release_tokens: &[u32] = if seq.tokens.len() >= seq.cached_prefix_tokens {
+            ckey.as_deref().unwrap_or(&seq.tokens)
         } else {
             &seq.prefix_ref_tokens
         };

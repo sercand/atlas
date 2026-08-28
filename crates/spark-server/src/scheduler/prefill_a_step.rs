@@ -158,6 +158,11 @@ pub fn start_chunked_prefill(
     // which route through free_sequence) hold + release the ref symmetrically.
     seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);
     seq.collect_prompt_logprobs = req_prompt_logprobs;
+    // Image-hash-aware prefix caching: stamp per-item content hashes (prompt
+    // order) so the model's cache-key view can content-address each pad run
+    // (spark_model::model::vision_cache). Must precede prefill — the chunk-0
+    // prefix lookup reads it. Empty for text-only requests (zero cost).
+    seq.vision_content_hashes = image_pixels.iter().map(|it| it.content_hash()).collect();
 
     // Beam search (NLLB): run the whole search to completion in the model and
     // return a FINISHED sequence carrying the winning hypothesis, bypassing both

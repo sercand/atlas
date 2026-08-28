@@ -44,7 +44,14 @@ impl TransformerModel {
             // position — a cache/Marconi skip would leave gaps. Force the
             // full-recompute path (documented perf cost, scoring calls only).
             let reserved = reserved_match.is_some();
-            let mut prefix_match = if self.tokens_have_vision_pad(tokens)
+            // Image-hash-aware cache addressing (model::vision_cache): every
+            // prefix-cache / snapshot call in this scope uses `ckey` — the
+            // pad-substituted cache-key view — in place of the raw tokens, so
+            // lookup, the EP release/re-lookup and the `prefix_ref_tokens`
+            // stash all address the SAME stream. `None` = vision pads without
+            // stamped hashes → the legacy vision veto (no lookup, no reuse).
+            let ckey = self.cache_key_view(tokens, seq);
+            let mut prefix_match = if ckey.is_none()
                 || seq.collect_prompt_logprobs.is_some()
                 || self.mla_prefill_needs_full_recompute()
             {
@@ -52,9 +59,13 @@ impl TransformerModel {
             } else if let Some(prefix_match) = reserved_match {
                 prefix_match
             } else {
+                let ck = ckey.as_deref().expect("ckey checked Some above");
                 self.prefix_cache
-                    .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                    .lookup(ck, bs, seq.session_hash, seq.adapter_id)
             };
+            // Empty slice sentinel only reachable while matched == 0 (vetoed
+            // path) — every use below is guarded by `matched > 0`.
+            let ck: &[u32] = ckey.as_deref().unwrap_or(&[]);
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
             // diverge (eviction order differences, async insert
@@ -82,10 +93,10 @@ impl TransformerModel {
                 let local = prefix_match.matched_tokens as u32;
                 let agreed = self.ep_min_u32(local)? as usize;
                 if agreed < prefix_match.matched_tokens {
-                    self.prefix_cache.release(tokens, bs, seq.adapter_id);
+                    self.prefix_cache.release(ck, bs, seq.adapter_id);
                     if agreed > 0 {
                         prefix_match = self.prefix_cache.lookup(
-                            &tokens[..agreed],
+                            &ck[..agreed],
                             bs,
                             seq.session_hash,
                             seq.adapter_id,
@@ -132,7 +143,9 @@ impl TransformerModel {
             // and the block pool progressively wedges). Cleared on the no-match
             // path so a later cache-less turn on the same seq doesn't over-release.
             if matched > 0 {
-                seq.prefix_ref_tokens = tokens[..matched].to_vec();
+                // Stash the SUBSTITUTED prefix — `free_sequence` releases the
+                // radix refs with the same cache-key stream the lookup bumped.
+                seq.prefix_ref_tokens = ck[..matched].to_vec();
             } else {
                 seq.prefix_ref_tokens.clear();
             }
@@ -229,6 +242,9 @@ impl TransformerModel {
                     // e.g. mid-chunk tail captures — rather than restore a
                     // stale lexical state. See prefill_a.
                     && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
+                    // Vision V1 gate: restore only when every image lies
+                    // fully below the resume point (see `vision_pads_below`).
+                    && self.vision_pads_below(tokens, snap_tok)
                 {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint
@@ -336,13 +352,22 @@ impl TransformerModel {
                     prefix_match.matched_blocks.len(),
                 );
             } else if matched > 0 && !skip {
-                // F82 (2026-04-30): non-SSM cache-hit skip path.
-                skip = true;
-                tracing::info!(
-                    "Prefix cache hit: {} tokens ({} blocks) reused (F82+F83: non-SSM cache-hit skip)",
-                    matched,
-                    prefix_match.matched_blocks.len(),
-                );
+                // F82 (2026-04-30): non-SSM cache-hit skip path. Vision V1
+                // gate applies here too — resuming at `matched` must not
+                // leave pad positions in the recomputed suffix.
+                if self.vision_pads_below(tokens, matched) {
+                    skip = true;
+                    tracing::info!(
+                        "Prefix cache hit: {} tokens ({} blocks) reused (F82+F83: non-SSM cache-hit skip)",
+                        matched,
+                        prefix_match.matched_blocks.len(),
+                    );
+                } else {
+                    tracing::info!(
+                        "Prefix cache hit: {} tokens but resume point overlaps a vision pad run — recomputing all KV",
+                        matched,
+                    );
+                }
             }
             // For SSM models: use ssm_snapshot_tokens (not matched) as skip point.
             // Exception: when the snapshot covers the ENTIRE matched prefix

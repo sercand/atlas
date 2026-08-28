@@ -307,9 +307,13 @@ impl TransformerModel {
         } else if cap_applied {
             // Cap forced — never attach the full-length snapshot to a
             // truncated tree (would be unreachable + leak a pool slot).
-            if !self.tokens_have_vision_pad(cache_tokens) && !self.hss_window_slid(seq) {
+            // Vision: insert under the cache-key view (model::vision_cache);
+            // `None` keeps the legacy veto.
+            if let Some(ck) = self.cache_key_view(cache_tokens, seq)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    cache_tokens,
+                    ck.as_ref(),
                     cache_block_table,
                     cache_disk_block_ids,
                     bs,
@@ -365,9 +369,14 @@ impl TransformerModel {
                     None
                 }
             };
+            // Vision: register under the cache-key view (model::vision_cache)
+            // so identical images are content-addressed. `None` = pads
+            // without stamped hashes → the legacy vision veto.
+            let tokens_ckey = self.cache_key_view(tokens, seq);
             if let Some(snap_id) = snap_result {
-                if self.tokens_have_vision_pad(tokens) || self.hss_window_slid(seq) {
-                    // Vision-pad: image-tainted snapshot + colliding token key.
+                if tokens_ckey.is_none() || self.hss_window_slid(seq) {
+                    // Vision-pad without a usable content-hash view: image-
+                    // tainted snapshot + colliding token key.
                     // HSS-slid: `block_table` no longer parallels the token
                     // stream (see `hss_window_slid`). Either way we decline the
                     // radix insert, and the snapshot is only reachable through
@@ -395,8 +404,9 @@ impl TransformerModel {
                     // (lm_head reads it without mutating).
                     self.ssm_snapshots
                         .save_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
+                    let ck = tokens_ckey.as_deref().expect("checked is_none above");
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
-                        tokens,
+                        ck,
                         &seq.block_table,
                         &seq.disk_block_ids,
                         bs,
@@ -410,9 +420,11 @@ impl TransformerModel {
                         self.ssm_snapshots.free(old);
                     }
                 }
-            } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+            } else if let Some(ck) = tokens_ckey
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    tokens,
+                    ck.as_ref(),
                     &seq.block_table,
                     &seq.disk_block_ids,
                     bs,
@@ -421,9 +433,11 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        } else if let Some(ck) = self.cache_key_view(tokens, seq)
+            && !self.hss_window_slid(seq)
+        {
             let acquired = self.prefix_cache.insert(
-                tokens,
+                ck.as_ref(),
                 &seq.block_table,
                 &seq.disk_block_ids,
                 bs,

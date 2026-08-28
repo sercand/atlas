@@ -76,11 +76,12 @@ impl TransformerModel {
         }
         // Cadence/log only — NOT the registered coverage (see snap_tokens below).
         let end_token = end_block * bs;
-        // The registered prefix is the FULL token slice, so vision-pad must be
-        // checked over the full slice too.
-        if self.tokens_have_vision_pad(&seq.tokens) {
+        // Image-hash-aware addressing: register under the cache-key view
+        // (pads → per-image virtual ids). `None` = pads without stamped
+        // hashes → legacy vision veto (no decode checkpoints).
+        let Some(ckey) = self.cache_key_view(&seq.tokens, seq) else {
             return;
-        }
+        };
         // Order the default stream after any in-flight secondary-stream commit
         // (MTP path writes the canonical live SSM state there) so the snapshot
         // reads the committed state, not a racing partial. No-op on the
@@ -154,7 +155,7 @@ impl TransformerModel {
         // are). On the non-MTP +1 stride tokens.len() == end_token at every
         // fire, so this is bit-identical to the old block-floored slice.
         let snap_tokens = seq.tokens.len();
-        let boundary_tokens = &seq.tokens[..snap_tokens];
+        let boundary_tokens = &ckey[..snap_tokens];
         // Ring-swept insert (2026-08-28): a plain intermediate insert per fire
         // (every `interval` blocks, for the whole response) LRU-evicted the
         // prefill prompt-boundary anchors from a small pool — every warm turn

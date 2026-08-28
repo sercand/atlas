@@ -135,6 +135,10 @@ pub fn prefill_request(
     // refused while this seq is in-flight; released symmetrically in
     // free_sequence (normal finish + the error guard below both route there).
     seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);
+    // Image-hash-aware prefix caching: stamp per-item content hashes (prompt
+    // order) so the model's cache-key view can content-address each pad run
+    // (spark_model::model::vision_cache). Must precede prefill.
+    seq.vision_content_hashes = image_pixels.iter().map(|it| it.content_hash()).collect();
 
     // Beam search (NLLB): run the whole search to completion in the model and
     // build a FINISHED ActiveSeq carrying the winning hypothesis, bypassing the

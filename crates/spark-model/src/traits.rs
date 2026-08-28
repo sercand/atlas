@@ -257,6 +257,15 @@ pub struct SequenceState {
     /// NLLB beam search: stop as soon as `num_beams` finished hypotheses
     /// exist (`false` = exhaust `max_new`). Unused by other models.
     pub early_stopping: bool,
+    /// Per-vision-item content hashes (`VisionItem::content_hash`), in prompt
+    /// order, stamped by the scheduler before chunk-0 prefill. Keys
+    /// image-hash-aware prefix caching (`model::vision_cache`): the cache-key
+    /// view substitutes each pad run's tokens with virtual ids derived from
+    /// its item's hash. Empty for text-only requests, AND on any path that
+    /// never stamps it (EP worker ranks, post-swap restore) — there the view
+    /// builder returns `None` and the request falls back to the legacy
+    /// vision veto (no caching, never mis-addressed caching).
+    pub vision_content_hashes: Vec<u64>,
 }
 
 impl SequenceState {
@@ -305,6 +314,7 @@ impl SequenceState {
             num_beams: 1,
             length_penalty: 1.0,
             early_stopping: false,
+            vision_content_hashes: Vec::new(),
         }
     }
 
