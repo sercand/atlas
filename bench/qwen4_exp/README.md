@@ -99,6 +99,18 @@ spark serve --model-from-path <snapshot> --kernel-target qwen3.8-flash-next \
   --max-prefill-tokens 2048 --enable-prefix-caching
 ```
 
+Memory campaign (2026-08-28, commits 01aec27e/4fd3fe77): slab-packed weight
+upload (the driver's 2 MiB granule padding on ~150k per-expert tensors was
+~10 GB), dead-weight retirement (GDN BF16 originals + BF16 lm_head, 5.05 GB,
+poison-validated), and `ATLAS_NO_VISION=1` (~1 GB) take pre-KV from 93.1 to
+~76 GB — the KV pool at util 0.84 is then ~21.5 GB ≈ 940k tokens even at
+`--max-seq-len 200000`. Long-context serving needs two knobs the 8k profile
+didn't: `ATLAS_QSA_MAX_TOKENS` ≥ max-seq-len (QSA per-seq key buffers,
+~58 MB/attention-layer/seq at 200k, lazily allocated) and a `--request-timeout`
+sized for chunked-prefill TTFT (a 119k-token prompt prefills in ~22 min on
+gx10-ecdf). Decode after the campaign: 47.8 tok/s median code, 41.6 prose
+(n=3 steady-state streamed, within the 47–50 boot-to-boot band).
+
 K sweep on the code prompt: K=2 41.2, **K=3 45.8**, K=4 37.1 (verify cost
 outruns depth). The batched-verify-attention commit (ms body,
 QSA ingest batched through prefill_ingest) lifts K=3 code to **49.4**.
