@@ -71,6 +71,7 @@ pub(crate) fn load_weight_store(
             loader.peak_memory_multiplier = mult;
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config);
+            loader.skip_vision = skip_vision();
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -95,6 +96,7 @@ pub(crate) fn load_weight_store(
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
         loader.skip_mtp = skip_mtp(config);
+        loader.skip_vision = skip_vision();
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
@@ -254,4 +256,15 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
 /// that are then discarded is memory the KV cache needs.
 fn skip_mtp(config: &ModelConfig) -> bool {
     matches!(config.model_type.as_str(), "qwen4_exp")
+}
+
+/// `ATLAS_NO_VISION=1`: don't upload the vision tower (text-only serving).
+/// The vision loaders return `Ok(None)` with a warning when the tensors are
+/// absent, so image requests fail loudly at request time rather than at load.
+fn skip_vision() -> bool {
+    let on = std::env::var("ATLAS_NO_VISION").ok().as_deref() == Some("1");
+    if on {
+        tracing::info!("ATLAS_NO_VISION=1: vision tower not uploaded (text-only serving)");
+    }
+    on
 }

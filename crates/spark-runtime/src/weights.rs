@@ -3,7 +3,7 @@
 //! Weight loading from safetensors files (SBIO IORouter for filesystem I/O).
 
 use crate::gpu::{DevicePtr, GpuBackend};
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -176,6 +176,20 @@ pub struct WeightStore {
     /// quantize-on-load or straight off NVMe by `NgramRowCache`, both of
     /// which need only this (path, offset) locator.
     deferred: HashMap<String, DeferredTensor>,
+    /// Slab allocations backing many small tensors each (fast loader).
+    ///
+    /// The driver rounds individual `cuMemAlloc`s in the ~1–2 MB range up to
+    /// 2 MiB pages; a 512-expert NVFP4 checkpoint has ~150k tensors in
+    /// exactly that range, and the padding was ~10 GB on Qwen3.8-Flash-Next
+    /// (measured: 73.3 GB of shard bytes consumed 83.4 GB). Tensors whose
+    /// `ptr` lands inside one of these `(base, len)` ranges are interior
+    /// pointers: they are never freed individually — the slab is freed once
+    /// in `release`, and `retire` refuses them.
+    slabs: Vec<(DevicePtr, usize)>,
+    /// Names queued by [`Self::retire`], freed at one deferred point by
+    /// [`Self::free_retired`] (after every loader has run, so "retired then
+    /// read at construction" is impossible).
+    retired: Vec<String>,
 }
 
 /// Where a skipped tensor lives, so a consumer can read it in place.
@@ -196,7 +210,86 @@ impl WeightStore {
         Self {
             weights: HashMap::new(),
             deferred: HashMap::new(),
+            slabs: Vec::new(),
+            retired: Vec::new(),
         }
+    }
+
+    /// Record a slab allocation whose interior backs many tensors.
+    /// See the field doc on [`Self::slabs`].
+    pub fn add_slab(&mut self, base: DevicePtr, len: usize) {
+        self.slabs.push((base, len));
+    }
+
+    /// True if `ptr` points INTO a slab (interior pointer — must never be
+    /// passed to `gpu.free`).
+    fn is_slab_interior(&self, ptr: DevicePtr) -> bool {
+        self.slabs
+            .iter()
+            .any(|(base, len)| ptr.0 >= base.0 && ptr.0 < base.0 + *len as u64)
+    }
+
+    /// Queue a tensor for retirement: its GPU memory is freed by the next
+    /// [`Self::free_retired`] call and the entry removed, so a stray later
+    /// `get` fails loudly instead of reading freed memory.
+    ///
+    /// Returns `false` (and retires nothing) if the tensor is absent or is
+    /// backed by a slab — slab interiors cannot return memory individually.
+    pub fn retire(&mut self, name: &str) -> bool {
+        match self.weights.get(name) {
+            Some(t) if !self.is_slab_interior(t.ptr) => {
+                self.retired.push(name.to_string());
+                true
+            }
+            Some(_) => {
+                tracing::warn!("retire({name}): slab-backed, cannot free individually — kept");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Free every tensor queued by [`Self::retire`]. Call exactly once, after
+    /// ALL loaders have run (layers, embedding, lm_head, MTP, vision) — the
+    /// deferral is what makes "retired then read" impossible.
+    ///
+    /// `ATLAS_POISON_RETIRED_WEIGHTS=1` validation mode: instead of freeing,
+    /// fill each buffer with 0xA5 and KEEP the entry. A consumer that still
+    /// aliases the buffer then reads garbage (loud, attributable) rather than
+    /// happening to read intact bytes after a plain free.
+    pub fn free_retired(&mut self, gpu: &dyn GpuBackend) -> Result<(usize, usize)> {
+        let poison = std::env::var("ATLAS_POISON_RETIRED_WEIGHTS").ok().as_deref() == Some("1");
+        let names = std::mem::take(&mut self.retired);
+        let (mut bytes, mut count) = (0usize, 0usize);
+        for name in names {
+            let Some(t) = self.weights.get(&name) else {
+                continue;
+            };
+            let sz = t.byte_size();
+            if poison {
+                gpu.memset(t.ptr, 0xA5, sz)
+                    .with_context(|| format!("poisoning retired weight {name}"))?;
+            } else {
+                let ptr = t.ptr;
+                self.weights.remove(&name);
+                gpu.free(ptr)
+                    .with_context(|| format!("freeing retired weight {name}"))?;
+            }
+            bytes += sz;
+            count += 1;
+        }
+        if count > 0 {
+            tracing::info!(
+                "Retired {count} store weights: {:.2} GB {}",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                if poison {
+                    "POISONED (0xA5, kept resident — validation mode)"
+                } else {
+                    "freed"
+                },
+            );
+        }
+        Ok((bytes, count))
     }
 
     /// Record a tensor that was skipped at load, with its on-disk location.
@@ -226,6 +319,8 @@ impl WeightStore {
         Self {
             weights,
             deferred: HashMap::new(),
+            slabs: Vec::new(),
+            retired: Vec::new(),
         }
     }
 
@@ -321,6 +416,9 @@ pub struct SafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// Skip the vision tower at load (text-only serving). Mirrors
+    /// `FastSafetensorsLoader::skip_vision`.
+    pub skip_vision: bool,
 }
 
 impl Default for SafetensorsLoader {
@@ -339,6 +437,7 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_vision: false,
         }
     }
 
@@ -351,6 +450,7 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_vision: false,
         }
     }
 
@@ -366,6 +466,13 @@ impl SafetensorsLoader {
         // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
         // almost pure granule padding at expert scale.
         if self.skip_activation_scales && name.ends_with(".input_scale") {
+            return true;
+        }
+        // Vision tower for text-only serving (mirrors the fast loader).
+        if self.skip_vision
+            && (name.starts_with("model.visual.")
+                || name.starts_with("model.language_model.visual."))
+        {
             return true;
         }
         if self.ep_world_size <= 1 {
@@ -433,13 +540,32 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
 
     fn release(&mut self, gpu: &dyn GpuBackend) -> anyhow::Result<()> {
         let mut first_error = None;
+        // Slab-backed tensors are interior pointers: skip them here and free
+        // each slab base exactly once below. `drain`-then-free would lose the
+        // membership test, so collect the slab ranges first.
+        let slabs = std::mem::take(&mut self.slabs);
+        let in_slab = |ptr: DevicePtr| {
+            slabs
+                .iter()
+                .any(|(base, len)| ptr.0 >= base.0 && ptr.0 < base.0 + *len as u64)
+        };
         // `drain` rather than iterate: the map must not be left holding
         // pointers to memory that is gone, and it makes this idempotent.
         for (name, tensor) in self.weights.drain() {
+            if in_slab(tensor.ptr) {
+                continue;
+            }
             if let Err(e) = gpu.free(tensor.ptr)
                 && first_error.is_none()
             {
                 first_error = Some(e.context(format!("freeing weight {name}")));
+            }
+        }
+        for (base, _) in slabs {
+            if let Err(e) = gpu.free(base)
+                && first_error.is_none()
+            {
+                first_error = Some(e.context("freeing weight slab"));
             }
         }
         match first_error {

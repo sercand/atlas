@@ -77,7 +77,25 @@ pub struct FastSafetensorsLoader {
     /// sequentially before the per-tensor copy loop starts. This helps NFS
     /// mounts where many small tensor reads defeat normal readahead.
     pub prefetch_shards: bool,
+    /// Skip the `model.visual.*` / `model.language_model.visual.*` vision
+    /// tower at load (text-only serving). The vision loaders already return
+    /// `None` with a warning when the tensors are absent, so skipping here is
+    /// sufficient — ~1 GB back on Qwen3.8-Flash-Next's 27-block ViT.
+    pub skip_vision: bool,
 }
+
+/// Pack tensors smaller than this into one per-shard slab allocation.
+///
+/// The CUDA driver rounds individual allocations in the ~1–2 MB range up to
+/// 2 MiB pages (measured on GB10: interleaved 0.8 MB weights + 0.1 MB scales
+/// consume 16% over their byte size; one slab consumes ~1% over). A 512-expert
+/// NVFP4 checkpoint has ~150k tensors in exactly that range — ~10 GB of pure
+/// padding on Qwen3.8-Flash-Next. Tensors at or above the threshold keep their
+/// own allocation so they stay individually retirable (`WeightStore::retire`).
+const SLAB_TENSOR_MAX: usize = 2 * 1024 * 1024;
+/// Offset alignment of each tensor inside a slab. 4 KiB keeps every kernel's
+/// vectorized-load alignment assumption intact with negligible padding.
+const SLAB_ALIGN: usize = 4096;
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
 /// loader uses buffered reads even when `try_direct_io = true`. See the
@@ -105,6 +123,7 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            skip_vision: false,
         }
     }
 
@@ -119,6 +138,7 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            skip_vision: false,
         }
     }
 }
@@ -178,6 +198,9 @@ impl WeightLoader for FastSafetensorsLoader {
         let mut weights: HashMap<String, WeightTensor> = HashMap::new();
         // Locations of tensors deliberately NOT uploaded (the n-gram tables).
         let mut deferred: HashMap<String, crate::weights::DeferredTensor> = HashMap::new();
+        // Slab allocations backing the packed small tensors (freed once each
+        // at store release; interior tensor pointers are never freed).
+        let mut slabs: Vec<(crate::gpu::DevicePtr, usize)> = Vec::new();
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
@@ -218,6 +241,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.prefetch_shards,
                 &mut weights,
                 &mut deferred,
+                &mut slabs,
                 &mut offload_logged,
             )?;
 
@@ -261,12 +285,20 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.prefetch_shards,
                 &mut weights,
                 &mut deferred,
+                &mut slabs,
                 &mut extra_offload,
             )?;
         }
 
-        tracing::info!("Fast-loaded {} weight tensors", weights.len());
+        tracing::info!(
+            "Fast-loaded {} weight tensors ({} packed slabs)",
+            weights.len(),
+            slabs.len()
+        );
         let mut store = WeightStore::from_map(weights);
+        for (base, len) in slabs {
+            store.add_slab(base, len);
+        }
         for (name, d) in deferred {
             store.defer(name, d);
         }
@@ -294,6 +326,7 @@ fn load_shard_fast(
     prefetch_shards: bool,
     out: &mut HashMap<String, WeightTensor>,
     deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
+    slabs_out: &mut Vec<(crate::gpu::DevicePtr, usize)>,
     offload_logged: &mut bool,
 ) -> Result<()> {
     // Header parsing uses a buffered fd — header is a few KB, cache pollution
@@ -339,6 +372,44 @@ fn load_shard_fast(
         );
         deferred_out.extend(deferred_here);
     }
+
+    // Slab plan: pack every tensor under SLAB_TENSOR_MAX into one shard-wide
+    // allocation at SLAB_ALIGN'd offsets (granule-padding fix — see the
+    // constants' doc). Tensors at/above the threshold keep individual
+    // allocations so they stay retirable. `ATLAS_NO_WEIGHT_SLABS=1` restores
+    // the old per-tensor path for A/B or driver-suspect debugging.
+    let slabs_off = std::env::var("ATLAS_NO_WEIGHT_SLABS").ok().as_deref() == Some("1");
+    let mut slab_total = 0usize;
+    let slab_offsets: Vec<Option<usize>> = tensors
+        .iter()
+        .map(|t| {
+            if slabs_off || t.len >= SLAB_TENSOR_MAX || t.len == 0 {
+                None
+            } else {
+                let off = slab_total;
+                slab_total = (slab_total + t.len).div_ceil(SLAB_ALIGN) * SLAB_ALIGN;
+                Some(off)
+            }
+        })
+        .collect();
+    let slab_base = if slab_total > 0 {
+        match gpu.alloc(slab_total) {
+            Ok(p) => {
+                slabs_out.push((p, slab_total));
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "weight slab alloc failed ({:.1} MB): {e} — falling back to \
+                     per-tensor allocations for this shard",
+                    slab_total as f64 / (1024.0 * 1024.0),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Per-shard heuristic: above `direct_io_tensor_cap` tensors, O_DIRECT's
     // per-tensor syscall + 4 KiB alignment overhead costs more than kernel
@@ -409,6 +480,22 @@ fn load_shard_fast(
         } else {
             raw
         };
+
+        // Slab members copy into their pre-assigned interior offset; the
+        // slab base was allocated (and registered) before the loop.
+        if let (Some(base), Some(off)) = (slab_base, slab_offsets[idx]) {
+            let p = base.offset(off);
+            gpu.copy_h2d(src, p)?;
+            out.insert(
+                meta.name.clone(),
+                WeightTensor {
+                    ptr: p,
+                    shape: meta.shape.clone(),
+                    dtype: meta.dtype,
+                },
+            );
+            continue;
+        }
 
         let ptr = match gpu.alloc(meta.len) {
             Ok(p) => {

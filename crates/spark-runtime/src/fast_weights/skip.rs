@@ -28,6 +28,14 @@ impl FastSafetensorsLoader {
         if self.skip_activation_scales && name.ends_with(".input_scale") {
             return true;
         }
+        // Vision tower for text-only serving. Both prefixes the vision
+        // loaders probe; they return `Ok(None)` (with a warning) when absent.
+        if self.skip_vision
+            && (name.starts_with("model.visual.")
+                || name.starts_with("model.language_model.visual."))
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }

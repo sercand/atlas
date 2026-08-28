@@ -50,7 +50,7 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
 use crate::weight_loader::ModelWeightLoader;
-use crate::weight_map::{DenseWeight, MtpWeights, dense};
+use crate::weight_map::{DenseWeight, MtpWeights, Nvfp4Variant, dense};
 
 // `aux_sites`, NOT `aux`: bare `aux` is a RESERVED filename on Windows
 // (CON/PRN/AUX/NUL...) — git checkout of `aux.rs` fails with "invalid
@@ -426,6 +426,44 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         );
         let pfx = embed_prefix(config);
         dense(store, &format!("{pfx}.embed_tokens.weight")).context("qwen4_exp: tied lm_head")
+    }
+
+    /// GDN BF16 store originals are dead once the requant arm has run.
+    ///
+    /// Under `ATLAS_QWEN4EXP_BF16_GDN=0` (the serving default on gx10 — +37%
+    /// decode), `build_linear_attention_nvfp4` reads each GDN layer's
+    /// `in_proj_qkv`/`in_proj_z` only to `gpu_concat_rows` them (a copy) and
+    /// `out_proj` only to quantize it to NVFP4 (a copy); at tp=1 nothing
+    /// keeps the store pointers. That is 36 layers × ~115 MB ≈ 4.1 GB of BF16
+    /// held resident while the KV cache goes without.
+    ///
+    /// Gates: the requant arm must actually have run (env =0), the checkpoint
+    /// must ship these BF16 (variant Standard — on Fp8Dequanted the arm frees
+    /// its own dense expansions and the FP8 originals feed other paths), and
+    /// the BF16-override lever must be off (it installs the out_proj alias as
+    /// `out_proj_dense`). Validated with ATLAS_POISON_RETIRED_WEIGHTS=1.
+    fn retirable_weights(&self, store: &WeightStore, config: &ModelConfig) -> Vec<String> {
+        let requant_gdn = std::env::var("ATLAS_QWEN4EXP_BF16_GDN").as_deref() == Ok("0");
+        let bf16_override =
+            std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref() == Some("1");
+        let variant = crate::weight_map::detect_nvfp4_variant(store, config);
+        if !requant_gdn || bf16_override || variant != Nvfp4Variant::Standard {
+            return Vec::new();
+        }
+        let mut names = Vec::new();
+        for (i, t) in config.layer_types.iter().enumerate() {
+            if *t != LayerType::LinearAttention {
+                continue;
+            }
+            let lp = config.layer_prefix(i);
+            for proj in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+                let name = format!("{lp}.linear_attn.{proj}.weight");
+                if store.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
     }
 
     fn load_vision_encoder(

@@ -269,6 +269,18 @@ pub trait ModelWeightLoader {
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight>;
 
+    /// Store tensors that are DEAD once this loader's `load_layers` has run —
+    /// e.g. BF16 originals that were concatenated or requantized into copies
+    /// the layers own. `build_model` retires them at one deferred point (after
+    /// every loader has run) so their memory reaches the KV budget.
+    ///
+    /// Contract: a name may be returned ONLY if no layer holds the store
+    /// tensor's pointer (alias) and no runtime dispatch can read it. Validate
+    /// new entries with `ATLAS_POISON_RETIRED_WEIGHTS=1`. Default: nothing.
+    fn retirable_weights(&self, _store: &WeightStore, _config: &ModelConfig) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Load MTP head weights (returns None if no MTP weights in store).
     fn load_mtp_weights(
         &self,

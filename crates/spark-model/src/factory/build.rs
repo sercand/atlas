@@ -28,7 +28,7 @@ pub fn build_model(
     // weight pointer, and it used to be a local in `startup()` that was dropped
     // once the layers had copied pointers out of it: the memory stayed live
     // with nothing able to free it. The model owns it now, so `teardown` can.
-    store: WeightStore,
+    mut store: WeightStore,
     gpu: Box<dyn GpuBackend>,
     max_batch_tokens: usize,
     kv_block_size: usize,
@@ -293,6 +293,49 @@ pub fn build_model(
         } else {
             None
         };
+
+    // ── Dead-weight retirement (deferred; pre-KV-sizing) ──
+    //
+    // Every loader has run by here (layers, embedding, lm_head, MTP, vision),
+    // so store tensors the loaders declared dead can be freed NOW — before
+    // Step 5 sizes the KV cache from free memory, so the bytes become KV
+    // blocks instead of stranded padding. Two sources:
+    //
+    //   1. `loader.retirable_weights()` — model-declared (e.g. qwen4_exp's
+    //      GDN BF16 originals after the NVFP4 requant, ~4.1 GB).
+    //   2. The BF16 lm_head once an NVFP4 head exists and no BF16 dispatch
+    //      remains reachable: every lm_head site (impl_a3 `lm_head`/
+    //      `lm_head_batched`, decode_b2, trait_impl lm_head_batched) uses the
+    //      BF16 weight only as the no-NVFP4 fallback, and the qwen4_exp MTP
+    //      proposer drafts through the NVFP4 head. The BF16 pointer IS shared
+    //      with a DFlash drafter and the DeepSeek-V4 MTP head, so both gate
+    //      it off. The model's DenseWeight is NULLed so a stray reader faults
+    //      loudly instead of reading freed memory. ~1.2 GB on Flash-Next.
+    //
+    // Validation: ATLAS_POISON_RETIRED_WEIGHTS=1 fills the buffers with 0xA5
+    // and keeps them resident — an aliased consumer then produces loudly
+    // wrong output instead of silently correct-because-still-intact reads.
+    // ATLAS_KEEP_BF16_LMHEAD=1 opts the lm_head out.
+    let mut lm_head = lm_head;
+    {
+        for name in loader.retirable_weights(&store, &config) {
+            store.retire(&name);
+        }
+        let keep_bf16_lmhead =
+            std::env::var("ATLAS_KEEP_BF16_LMHEAD").ok().as_deref() == Some("1");
+        if config.model_type == "qwen4_exp"
+            && lm_head_nvfp4.is_some()
+            && dflash_args.is_none()
+            && !config.tie_word_embeddings
+            && !keep_bf16_lmhead
+            && store.retire("lm_head.weight")
+        {
+            lm_head = crate::weight_map::DenseWeight {
+                weight: spark_runtime::gpu::DevicePtr::NULL,
+            };
+        }
+        store.free_retired(gpu.as_ref())?;
+    }
 
     let v4_mtp_embed = embed;
     // DeepSeek-V4-Flash keeps the LM head in BF16; the proposer drafts with the
