@@ -56,6 +56,39 @@ pub(super) struct SnapshotEntry {
     /// decode-checkpoint entries past a small keep-ring; exact-prefix keyed
     /// like plain inserts (state at exactly `token_count`, safe cross-session).
     pub(super) is_decode_ckpt: bool,
+    /// True for a PREFILL intermediate checkpoint (`save_checkpoint.rs`, every
+    /// `ATLAS_SSM_CKPT_BLOCKS` blocks of a chunked prefill).
+    ///
+    /// Same failure shape as `is_decode_ckpt`, on the prefill side and one
+    /// turn earlier: a long prompt fires 4-6 of these, and with several
+    /// sessions in flight they LRU-evict the prompt-BOUNDARY anchors (the
+    /// finish-leaf saves) that the *next* turn's radix match actually lands on
+    /// — measured 2026-08-29 gx10, 16-slot pool, 4 sessions: a 28,896-token
+    /// prefix match found NO snapshot despite saves at 8196/16388/24580/28900
+    /// twelve minutes earlier. Within a turn the intermediates strictly
+    /// supersede each other (deeper dominates for every future lookup of a
+    /// growing prefix), so `insert_intermediate` sweeps this session's older
+    /// ones past a small keep-ring, and the victim scan prefers an
+    /// intermediate over a boundary anchor of equal staleness. Exact-prefix
+    /// keyed like plain inserts (state at exactly `token_count`).
+    pub(super) is_intermediate: bool,
+    /// True for the entry a COMPLETED turn leaves behind for the NEXT turn to
+    /// restore from — this session's deepest intermediate at the moment the
+    /// turn finalized, promoted out of the intermediate ring.
+    ///
+    /// It has to be promoted rather than simply kept, because "deepest wins"
+    /// is only true WITHIN a turn. Across turns it is actively wrong: the next
+    /// turn's radix match stops at the previous prompt's BLOCK-FLOORED
+    /// boundary (939 blocks = 15,024 of 15,051 tokens in the 2026-08-29
+    /// replay), and the entry sitting there is the previous turn's last
+    /// intermediate — which the current turn's deeper intermediates would
+    /// sweep out of the ring precisely because they are deeper. Measured
+    /// before promotion existed: 5/12 warm turns restored; the misses all
+    /// looked up a boundary the previous turn HAD saved.
+    ///
+    /// One per session (the ring in `promote_turn_anchor`): once a turn
+    /// completes, the turn before it no longer has a reachable seam.
+    pub(super) is_turn_anchor: bool,
 }
 
 /// Where a matched snapshot's state currently lives (Phase 1b).
@@ -424,9 +457,27 @@ impl SsmSnapshotIndex {
                 0.0
             }
         };
+        // Within a session, an intermediate prefill checkpoint is worth less
+        // than the boundary anchor beside it: the anchor is where the NEXT
+        // turn's block-floored match lands, while an intermediate only ever
+        // serves a resume inside the turn that made it. The +1.0 bias exceeds
+        // the (0..=1 + alpha) range of the base score, so it orders every
+        // intermediate ahead of every anchor of the same session — without
+        // touching cross-session staleness, which stays the primary key.
+        // The bias must exceed the base score's full range (0..=1+alpha) or a
+        // deep intermediate could still outrank a fresh anchor.
+        let anchor_bias = 2.0 + alpha.max(0.0);
         let score = |e: &SnapshotEntry| {
-            norm(e.last_access, min_a, max_a)
-                + alpha * norm(e.token_count as u64, min_t as u64, max_t as u64)
+            let base = norm(e.last_access, min_a, max_a)
+                + alpha * norm(e.token_count as u64, min_t as u64, max_t as u64);
+            if e.is_intermediate {
+                base
+            } else if e.is_turn_anchor {
+                // The next turn's actual restore point — evict it last.
+                base + 2.0 * anchor_bias
+            } else {
+                base + anchor_bias
+            }
         };
         // (stalest session first, then lowest S within it). The lease bites
         // only when >1 eligible entry remains, so a single-entry pool (even

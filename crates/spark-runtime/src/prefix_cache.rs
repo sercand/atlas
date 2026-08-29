@@ -268,7 +268,13 @@ pub trait PrefixCache: Send + Sync {
     /// `block_table` contains the physical block indices for those tokens.
     /// `session_hash` tags the snapshot for session-scoped isolation.
     /// `matched_tokens` has the same semantics as in `insert`.
-    /// Returns the displaced snapshot ID if an existing entry was overwritten.
+    ///
+    /// Keeps only a small ring of intermediate checkpoints per session (see
+    /// `ATLAS_SSM_INTERMEDIATE_KEEP`): a chunked prefill of a long prompt fires
+    /// several of these, and unswept they LRU-evict the prompt-BOUNDARY anchors
+    /// the next warm turn restores from. Returns every displaced snapshot ID
+    /// for the caller to free — the overwritten entry plus anything the ring
+    /// sweep dropped.
     #[allow(clippy::too_many_arguments)]
     fn insert_intermediate_snapshot(
         &self,
@@ -280,7 +286,44 @@ pub trait PrefixCache: Send + Sync {
         session_hash: u64,
         matched_tokens: usize,
         adapter_id: u64,
-    ) -> Option<usize>;
+    ) -> Vec<usize>;
+
+    /// Deepest SSM snapshot at or below `limit` tokens for this prefix, without
+    /// touching the radix tree or any refcount.
+    ///
+    /// The fallback for a consumer that was handed a snapshot it cannot use.
+    /// The only such case today is a snapshot at EXACTLY the prompt length:
+    /// producing the first output token needs SSM state@(N-1), the snapshot
+    /// holds state@N, and the recurrence is not invertible — so `prefill_b`
+    /// refuses it. Before this existed the refusal had no second choice and the
+    /// request recomputed the whole prompt from zero, even with a perfectly
+    /// usable anchor a few tokens below (measured 2026-08-29: a 5,741-token
+    /// replay, 100% KV hit, an anchor at 5,712, 5.1 s of wasted prefill).
+    ///
+    /// Returns `(snapshot_id, token_count)`; spilled entries are skipped
+    /// (the caller is on a path that cannot fault bytes in).
+    fn lookup_snapshot_at_most(
+        &self,
+        _tokens: &[u32],
+        _limit: usize,
+        _session_hash: u64,
+        _adapter_id: u64,
+    ) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Promote this session's deepest PREFILL intermediate checkpoint to the
+    /// turn's cross-turn anchor, superseding older ones. Call once when a turn
+    /// finalizes. Returns displaced snapshot IDs for the caller to free.
+    ///
+    /// The intermediate ring keeps the DEEPEST checkpoints, which is right
+    /// within a turn and wrong across turns: the next turn's radix match stops
+    /// at this prompt's block-floored end, and the entry there is this turn's
+    /// LAST intermediate — which the next turn's deeper intermediates would
+    /// sweep. Promotion lifts it out of that ring.
+    fn promote_turn_anchor(&self, _session_hash: u64) -> Vec<usize> {
+        Vec::new()
+    }
 
     /// Register a DECODE-time Marconi checkpoint in the index WITHOUT touching
     /// the radix tree (the retiring sequence's `insert` lays the tree nodes; the

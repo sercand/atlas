@@ -72,6 +72,12 @@ fn tier_miss_retires_the_key_instead_of_thrashing() {
 
     // 1. The warm session's anchor, resident in slot 0.
     let (warm, warm_blocks) = seq(0);
+    // A warm turn's prompt EXTENDS the anchor — the next user message is
+    // appended — so the lookup prompt is longer than the snapshot. Probing at
+    // exactly the anchor depth would ask for a snapshot at the full prompt
+    // length, which the engine cannot use (state@N cannot produce token N's
+    // logits) and `RadixTree::lookup` therefore no longer offers.
+    let warm_probe: Vec<u32> = warm.iter().copied().chain(std::iter::once(999_999)).collect();
     tree.insert_with_snapshot(
         &warm,
         &warm_blocks,
@@ -122,8 +128,8 @@ fn tier_miss_retires_the_key_instead_of_thrashing() {
     //    the key was already proven dead on turn 0.
     let mut tier_attempts = 0usize;
     for turn in 0..4u32 {
-        let m = tree.lookup(&warm, BLK, /*sess*/ 7, 0);
-        tree.release(&warm, BLK, 0);
+        let m = tree.lookup(&warm_probe, BLK, /*sess*/ 7, 0);
+        tree.release(&warm_probe, BLK, 0);
         let Some(k) = m.ssm_snapshot_tier_key else {
             continue;
         };
@@ -169,7 +175,7 @@ fn tier_miss_retires_the_key_instead_of_thrashing() {
          away — and under the cap that spill evicts yet another tier record"
     );
     assert_eq!(
-        tree.lookup(&warm, BLK, /*sess*/ 7, 0).ssm_snapshot_tier_key,
+        tree.lookup(&warm_probe, BLK, /*sess*/ 7, 0).ssm_snapshot_tier_key,
         None,
         "after the miss the anchor must stop advertising a tier key"
     );
@@ -240,6 +246,12 @@ fn tier_error_retains_the_key() {
     // present, only the reads fail.
     let warm: Vec<u32> = (0..DEEP).collect();
     let warm_blocks: Vec<u32> = (0..DEEP / BLK as u32).collect();
+    // A warm turn's prompt EXTENDS the anchor — the next user message is
+    // appended — so the lookup prompt is longer than the snapshot. Probing at
+    // exactly the anchor depth would ask for a snapshot at the full prompt
+    // length, which the engine cannot use (state@N cannot produce token N's
+    // logits) and `RadixTree::lookup` therefore no longer offers.
+    let warm_probe: Vec<u32> = warm.iter().copied().chain(std::iter::once(999_999)).collect();
     tree.insert_with_snapshot(
         &warm,
         &warm_blocks,
@@ -258,8 +270,8 @@ fn tier_error_retains_the_key() {
     p.free(slot);
     assert_eq!(store.len(), 1, "the blob is present throughout this test");
 
-    let m = tree.lookup(&warm, BLK, /*sess*/ 7, 0);
-    tree.release(&warm, BLK, 0);
+    let m = tree.lookup(&warm_probe, BLK, /*sess*/ 7, 0);
+    tree.release(&warm_probe, BLK, 0);
     let k = m.ssm_snapshot_tier_key.expect("the anchor is tiered");
     let free_before = p.free_slots.lock().len();
 
@@ -289,7 +301,7 @@ fn tier_error_retains_the_key() {
         "reaping on an error would delete a live 66MB snapshot to save one retry"
     );
     assert_eq!(
-        tree.lookup(&warm, BLK, /*sess*/ 7, 0).ssm_snapshot_tier_key,
+        tree.lookup(&warm_probe, BLK, /*sess*/ 7, 0).ssm_snapshot_tier_key,
         Some(k),
         "an error is not evidence of absence — the key must survive to be retried"
     );
@@ -317,6 +329,12 @@ fn spill_refusal_retires_the_entry_immediately() {
 
     let warm: Vec<u32> = (0..DEEP).collect();
     let warm_blocks: Vec<u32> = (0..DEEP / BLK as u32).collect();
+    // A warm turn's prompt EXTENDS the anchor — the next user message is
+    // appended — so the lookup prompt is longer than the snapshot. Probing at
+    // exactly the anchor depth would ask for a snapshot at the full prompt
+    // length, which the engine cannot use (state@N cannot produce token N's
+    // logits) and `RadixTree::lookup` therefore no longer offers.
+    let warm_probe: Vec<u32> = warm.iter().copied().chain(std::iter::once(999_999)).collect();
     tree.insert_with_snapshot(
         &warm,
         &warm_blocks,
@@ -338,8 +356,8 @@ fn spill_refusal_retires_the_entry_immediately() {
     assert_eq!(slot, 0);
     assert_eq!(store.len(), 0, "the tier took no bytes");
 
-    let m = tree.lookup(&warm, BLK, /*sess*/ 7, 0);
-    tree.release(&warm, BLK, 0);
+    let m = tree.lookup(&warm_probe, BLK, /*sess*/ 7, 0);
+    tree.release(&warm_probe, BLK, 0);
     assert_eq!(
         m.ssm_snapshot_tier_key, None,
         "a refused spill must not leave a findable-but-empty entry"

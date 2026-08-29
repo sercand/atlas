@@ -420,6 +420,16 @@ impl TransformerModel {
                         self.ssm_snapshots.free(old);
                     }
                 }
+                // The turn is done: lift this session's deepest prefill
+                // intermediate out of the intermediate ring, because the NEXT
+                // turn's radix match stops at this prompt's block-floored end
+                // — one block below the leaf just saved — and that is the
+                // entry sitting there. Left in the ring, the next turn's own
+                // deeper intermediates sweep it and the whole conversation
+                // re-prefills.
+                for old in self.prefix_cache.promote_turn_anchor(seq.session_hash) {
+                    self.ssm_snapshots.free(old);
+                }
             } else if let Some(ck) = tokens_ckey
                 && !self.hss_window_slid(seq)
             {

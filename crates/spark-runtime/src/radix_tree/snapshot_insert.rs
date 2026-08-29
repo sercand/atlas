@@ -71,8 +71,14 @@ impl SsmSnapshotIndex {
                 entry.is_tail = false;
                 entry.is_tail_sibling = false;
                 // A plain save re-homing this prefix is durable — it must not
-                // be swept by the decode-checkpoint ring.
+                // be swept by either checkpoint ring, and it is a boundary
+                // anchor for victim-ranking purposes even if an intermediate
+                // got here first (the finish-leaf save lands on the same
+                // prefix as the last intermediate when a prompt ends on a
+                // checkpoint boundary).
                 entry.is_decode_ckpt = false;
+                entry.is_intermediate = false;
+                entry.is_turn_anchor = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return old;
@@ -90,6 +96,8 @@ impl SsmSnapshotIndex {
             is_tail: false,
             is_tail_sibling: false,
             is_decode_ckpt: false,
+            is_intermediate: false,
+            is_turn_anchor: false,
         });
         None
     }
@@ -133,6 +141,8 @@ impl SsmSnapshotIndex {
                 entry.is_tail = true;
                 entry.is_tail_sibling = false;
                 entry.is_decode_ckpt = false;
+                entry.is_intermediate = false;
+                entry.is_turn_anchor = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return displaced;
@@ -149,6 +159,8 @@ impl SsmSnapshotIndex {
             is_tail: true,
             is_tail_sibling: false,
             is_decode_ckpt: false,
+            is_intermediate: false,
+            is_turn_anchor: false,
         });
         displaced
     }
@@ -174,6 +186,8 @@ impl SsmSnapshotIndex {
                 entry.is_tail = false;
                 entry.is_tail_sibling = true;
                 entry.is_decode_ckpt = false;
+                entry.is_intermediate = false;
+                entry.is_turn_anchor = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return old;
@@ -191,6 +205,8 @@ impl SsmSnapshotIndex {
             is_tail: false,
             is_tail_sibling: true,
             is_decode_ckpt: false,
+            is_intermediate: false,
+            is_turn_anchor: false,
         });
         None
     }
@@ -233,6 +249,8 @@ impl SsmSnapshotIndex {
                 entry.is_tail = false;
                 entry.is_tail_sibling = false;
                 entry.is_decode_ckpt = true;
+                entry.is_intermediate = false;
+                entry.is_turn_anchor = false;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 re_homed = true;
@@ -252,6 +270,8 @@ impl SsmSnapshotIndex {
                 is_tail: false,
                 is_tail_sibling: false,
                 is_decode_ckpt: true,
+                is_intermediate: false,
+            is_turn_anchor: false,
             });
         }
         // Ring sweep: while this session holds more than `keep` decode
@@ -266,6 +286,134 @@ impl SsmSnapshotIndex {
                     count += 1;
                     if shallowest.is_none_or(|(_, tc)| e.token_count < tc) {
                         shallowest = Some((i, e.token_count));
+                    }
+                }
+            }
+            if count <= keep {
+                break;
+            }
+            let (idx, _) = shallowest.expect("count > keep implies at least one entry");
+            displaced.extend(freeable_slot(&self.entries.swap_remove(idx)));
+        }
+        displaced
+    }
+
+    /// Insert a PREFILL intermediate checkpoint, sweeping this session's older
+    /// ones past a `keep`-deep ring. Returns displaced snapshot_ids to free.
+    ///
+    /// The twin of `insert_decode_ckpt`, and it exists for the same reason on
+    /// the other side of the turn: a chunked prefill fires one of these every
+    /// `ATLAS_SSM_CKPT_BLOCKS` blocks, so a long prompt contributes 4-6 index
+    /// entries that only ever serve a resume INSIDE that prompt. On a pool
+    /// shared by several sessions they LRU-evict the boundary anchors the next
+    /// turn's radix match actually lands on, and every warm turn then re-runs
+    /// the whole conversation through prefill.
+    ///
+    /// Sweeping the SHALLOWEST is right for the same reason as the decode
+    /// ring: within one growing prefix a deeper checkpoint dominates a
+    /// shallower one for every future lookup.
+    pub(super) fn insert_intermediate(
+        &mut self,
+        prefix_hash: u64,
+        snapshot_id: usize,
+        session_hash: u64,
+        token_count: usize,
+        keep: usize,
+    ) -> Vec<usize> {
+        let mut displaced = Vec::new();
+        let mut re_homed = false;
+        for entry in &mut self.entries {
+            if entry.prefix_hash == prefix_hash {
+                displaced.extend(freeable_slot(entry));
+                entry.snapshot_id = snapshot_id;
+                entry.session_hash = session_hash;
+                entry.token_count = token_count;
+                entry.tiered = false;
+                entry.is_tail = false;
+                entry.is_tail_sibling = false;
+                entry.is_decode_ckpt = false;
+                entry.is_intermediate = true;
+                entry.is_turn_anchor = false;
+                self.access_counter += 1;
+                entry.last_access = self.access_counter;
+                re_homed = true;
+                break;
+            }
+        }
+        if !re_homed {
+            self.access_counter += 1;
+            self.stats.saves += 1;
+            self.entries.push(SnapshotEntry {
+                snapshot_id,
+                session_hash,
+                token_count,
+                prefix_hash,
+                last_access: self.access_counter,
+                tiered: false,
+                is_tail: false,
+                is_tail_sibling: false,
+                is_decode_ckpt: false,
+                is_intermediate: true,
+                is_turn_anchor: false,
+            });
+        }
+        let keep = keep.max(1);
+        loop {
+            let mut count = 0usize;
+            let mut shallowest: Option<(usize, usize)> = None; // (idx, token_count)
+            for (i, e) in self.entries.iter().enumerate() {
+                if e.is_intermediate && e.session_hash == session_hash {
+                    count += 1;
+                    if shallowest.is_none_or(|(_, tc)| e.token_count < tc) {
+                        shallowest = Some((i, e.token_count));
+                    }
+                }
+            }
+            if count <= keep {
+                break;
+            }
+            let (idx, _) = shallowest.expect("count > keep implies at least one entry");
+            displaced.extend(freeable_slot(&self.entries.swap_remove(idx)));
+        }
+        displaced
+    }
+
+    /// Promote this session's deepest intermediate to the turn's cross-turn
+    /// anchor, superseding older promoted anchors past `keep`.
+    ///
+    /// Called when a turn finalizes. See `SnapshotEntry::is_turn_anchor` for
+    /// why the intermediate ring alone is not enough: the next turn looks up
+    /// the BLOCK-FLOORED end of this prompt, and the entry there is this
+    /// turn's last intermediate — which the next turn's own (deeper)
+    /// intermediates would sweep. Promotion moves it out of that ring's reach
+    /// and out of the victim scan's intermediate-first bias.
+    ///
+    /// No-op when the session has no intermediate (a prompt short enough to
+    /// finish inside one checkpoint interval never made one; its finish-leaf
+    /// entry already sits at the boundary).
+    pub(super) fn promote_turn_anchor(&mut self, session_hash: u64, keep: usize) -> Vec<usize> {
+        let mut displaced = Vec::new();
+        let deepest = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_intermediate && e.session_hash == session_hash)
+            .max_by_key(|(_, e)| e.token_count)
+            .map(|(i, _)| i);
+        let Some(i) = deepest else {
+            return displaced;
+        };
+        self.entries[i].is_intermediate = false;
+        self.entries[i].is_turn_anchor = true;
+        let keep = keep.max(1);
+        loop {
+            let mut count = 0usize;
+            let mut shallowest: Option<(usize, usize)> = None;
+            for (j, e) in self.entries.iter().enumerate() {
+                if e.is_turn_anchor && e.session_hash == session_hash {
+                    count += 1;
+                    if shallowest.is_none_or(|(_, tc)| e.token_count < tc) {
+                        shallowest = Some((j, e.token_count));
                     }
                 }
             }

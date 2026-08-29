@@ -420,3 +420,199 @@ fn test_decode_ckpt_ring_is_per_session() {
     assert_eq!(m.ssm_snapshot, Some(2), "session A's ring untouched");
     tree.release(&t96, 16, 0);
 }
+
+#[test]
+fn test_intermediate_ring_supersedes_shallowest_and_spares_the_boundary_anchor() {
+    let tree = RadixTree::new();
+    const SESSION: u64 = 0xBEEF;
+
+    // A long chunked prefill: the tree gets the whole prompt, then the
+    // per-chunk intermediate checkpoints fire at 32 / 48 / 64 / 80, and the
+    // turn's finish-leaf lands the boundary anchor (id 9) at token 16.
+    let tokens: Vec<u32> = (0..128).collect();
+    tree.insert(&tokens, &[10, 20, 30, 40, 50, 60, 70, 80], &[], 16, 0, 0);
+    let anchor: Vec<u32> = (0..16).collect();
+    // `insert_with_snapshot` is what finalize_last does — a durable anchor,
+    // not an intermediate.
+    tree.insert_with_snapshot(&anchor, &[10], &[], 16, 9, 0, 0, 0);
+
+    let mut displaced = Vec::new();
+    for (i, end) in [32usize, 48, 64, 80].iter().enumerate() {
+        let t: Vec<u32> = (0..*end as u32).collect();
+        displaced.extend(tree.insert_intermediate_snapshot(&t, &[10, 20], &[], 16, 20 + i, SESSION, 0, 0));
+    }
+    // Ring of 2 (ATLAS_SSM_INTERMEDIATE_KEEP default): the two shallowest
+    // intermediates came back, and the anchor was never a candidate.
+    displaced.sort_unstable();
+    assert_eq!(displaced, vec![20, 21]);
+
+    // The deepest surviving intermediate serves a resume inside this turn…
+    let t80: Vec<u32> = (0..80).collect();
+    let m = tree.lookup(&t80, 16, SESSION, 0);
+    assert_eq!(m.ssm_snapshot, Some(23));
+    tree.release(&t80, 16, 0);
+
+    // …and the boundary anchor still serves the next turn's shallower match.
+    let mut diverged: Vec<u32> = (0..32).collect();
+    diverged[20] = 7777; // diverges in block 1 → radix match stops at 16
+    let m2 = tree.lookup(&diverged, 16, SESSION, 0);
+    assert_eq!(m2.matched_tokens, 16);
+    assert_eq!(
+        m2.ssm_snapshot,
+        Some(9),
+        "the boundary anchor must survive the intermediate churn"
+    );
+    tree.release(&diverged[..16].to_vec(), 16, 0);
+}
+
+#[test]
+fn test_intermediate_ring_is_per_session() {
+    let tree = RadixTree::new();
+    let t32: Vec<u32> = (0..32).collect();
+    let t48: Vec<u32> = (0..48).collect();
+    tree.insert(&t48, &[10, 20, 30], &[], 16, 0, 0);
+
+    // Session A fills its ring; session B's prefill must not sweep it — the
+    // 2026-08-29 failure was exactly four sessions evicting each other.
+    assert!(
+        tree.insert_intermediate_snapshot(&t32, &[10, 20], &[], 16, 1, 0xA, 0, 0)
+            .is_empty()
+    );
+    assert!(
+        tree.insert_intermediate_snapshot(&t48, &[10, 20, 30], &[], 16, 2, 0xA, 0, 0)
+            .is_empty()
+    );
+    let u32_: Vec<u32> = (2000..2032).collect();
+    let u48_: Vec<u32> = (2000..2048).collect();
+    let u64_: Vec<u32> = (2000..2064).collect();
+    assert!(
+        tree.insert_intermediate_snapshot(&u32_, &[10], &[], 16, 3, 0xB, 0, 0)
+            .is_empty()
+    );
+    assert!(
+        tree.insert_intermediate_snapshot(&u48_, &[10], &[], 16, 4, 0xB, 0, 0)
+            .is_empty()
+    );
+    assert_eq!(
+        tree.insert_intermediate_snapshot(&u64_, &[10], &[], 16, 5, 0xB, 0, 0),
+        vec![3],
+        "B's third sweeps B's shallowest, nothing of A"
+    );
+    let m = tree.lookup(&t48, 16, 0xA, 0);
+    assert_eq!(m.ssm_snapshot, Some(2), "session A's ring untouched");
+    tree.release(&t48, 16, 0);
+}
+
+#[test]
+fn test_finish_leaf_over_an_intermediate_prefix_promotes_it_to_an_anchor() {
+    // A prompt whose last chunk ends exactly on a checkpoint boundary saves an
+    // intermediate and then the finish-leaf at the SAME prefix. The leaf must
+    // clear the intermediate flag, or the next turn's ring sweep would treat
+    // the turn's own restore point as disposable.
+    let tree = RadixTree::new();
+    const SESSION: u64 = 0xF00D;
+    let t32: Vec<u32> = (0..32).collect();
+    tree.insert(&t32, &[10, 20], &[], 16, 0, 0);
+    assert!(
+        tree.insert_intermediate_snapshot(&t32, &[10, 20], &[], 16, 1, SESSION, 0, 0)
+            .is_empty()
+    );
+    // finalize_last's insert over the same prefix hands back slot 1.
+    let (displaced, _) = tree.insert_with_snapshot(&t32, &[10, 20], &[], 16, 2, SESSION, 0, 0);
+    assert_eq!(displaced, Some(1));
+
+    // Two later intermediates would have swept a 3-deep ring; the promoted
+    // anchor is not in it, so nothing is displaced.
+    for (i, end) in [48usize, 64].iter().enumerate() {
+        let t: Vec<u32> = (0..*end as u32).collect();
+        tree.insert(&t, &[10, 20, 30, 40], &[], 16, 0, 0);
+        assert!(
+            tree.insert_intermediate_snapshot(&t, &[10, 20], &[], 16, 30 + i, SESSION, 0, 0)
+                .is_empty(),
+            "the promoted anchor must not be swept by the intermediate ring"
+        );
+    }
+    let m = tree.lookup(&t32, 16, SESSION, 0);
+    assert_eq!(m.ssm_snapshot, Some(2));
+    tree.release(&t32, 16, 0);
+}
+
+#[test]
+fn test_turn_anchor_promotion_survives_the_next_turns_intermediate_ring() {
+    // The exact 2026-08-29 replay failure. Turn A's prompt ends at 15051, so
+    // its intermediates land at 8196 and 15024 and the next turn's radix match
+    // stops at 15024 (block-floored). Turn B's intermediates (8196 / 16388 /
+    // 19232) are all DEEPER, so an un-promoted 15024 is swept by B's own ring
+    // and turn B re-prefills the whole conversation.
+    let tree = RadixTree::new();
+    const S: u64 = 0xC0FFEE;
+    let all: Vec<u32> = (0..20000).collect();
+    let blocks: Vec<u32> = (0..1250).collect();
+    tree.insert(&all, &blocks, &[], 16, 0, 0);
+
+    let at = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
+    // Turn A.
+    tree.insert_intermediate_snapshot(&at(8196), &blocks[..512], &[], 16, 1, S, 0, 0);
+    tree.insert_intermediate_snapshot(&at(15024), &blocks[..939], &[], 16, 2, S, 0, 0);
+    // finalize: leaf at 15051, then promote the deepest intermediate (15024).
+    tree.insert_with_snapshot(&at(15051), &blocks[..941], &[], 16, 3, S, 0, 0);
+    assert!(
+        tree.promote_turn_anchor(S).is_empty(),
+        "first promotion displaces nothing"
+    );
+
+    // Turn B: three deeper intermediates. A ring of 2 would have evicted 15024.
+    let mut displaced = Vec::new();
+    for (i, n) in [8196usize, 16388, 19232].iter().enumerate() {
+        displaced.extend(tree.insert_intermediate_snapshot(
+            &at(*n),
+            &blocks[..*n / 16],
+            &[],
+            16,
+            10 + i,
+            S,
+            0,
+            0,
+        ));
+    }
+
+    // The promoted anchor is still there and still serves the seam.
+    let m = tree.lookup(&at(15024), 16, S, 0);
+    assert_eq!(m.matched_tokens, 15024);
+    assert_eq!(
+        m.ssm_snapshot,
+        Some(2),
+        "turn A's block-floored anchor must survive turn B's intermediates; \
+         displaced={displaced:?}"
+    );
+    tree.release(&at(15024), 16, 0);
+
+    // Turn B's own promotion supersedes turn A's — one anchor per session.
+    tree.insert_with_snapshot(&at(19251), &blocks[..1203], &[], 16, 20, S, 0, 0);
+    assert_eq!(
+        tree.promote_turn_anchor(S),
+        vec![2],
+        "turn B's anchor replaces turn A's"
+    );
+}
+
+#[test]
+fn test_promote_turn_anchor_is_per_session_and_noop_without_intermediates() {
+    let tree = RadixTree::new();
+    let at = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
+    let blocks: Vec<u32> = (0..1250).collect();
+    tree.insert(&at(20000), &blocks, &[], 16, 0, 0);
+
+    // No intermediates for this session yet — nothing to promote.
+    assert!(tree.promote_turn_anchor(0xAA).is_empty());
+
+    tree.insert_intermediate_snapshot(&at(4096), &blocks[..256], &[], 16, 1, 0xAA, 0, 0);
+    tree.insert_intermediate_snapshot(&at(8192), &blocks[..512], &[], 16, 2, 0xBB, 0, 0);
+    // Promoting A must not touch B's intermediate…
+    assert!(tree.promote_turn_anchor(0xAA).is_empty());
+    // …and B's promotion picks B's own, not the deeper-or-shallower of A's.
+    assert!(tree.promote_turn_anchor(0xBB).is_empty());
+    let m = tree.lookup(&at(8192), 16, 0xBB, 0);
+    assert_eq!(m.ssm_snapshot, Some(2));
+    tree.release(&at(8192), 16, 0);
+}

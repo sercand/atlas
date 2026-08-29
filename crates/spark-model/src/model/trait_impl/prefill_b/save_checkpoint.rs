@@ -188,7 +188,10 @@ impl TransformerModel {
             seq.adapter_id,
         );
         super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
-        if let Some(old) = self.prefix_cache.insert_intermediate_snapshot(
+        // Displaced = the overwritten entry plus whatever this session's
+        // intermediate ring swept; each holds a pool slot the index no longer
+        // reaches, so every one must come back.
+        for old in self.prefix_cache.insert_intermediate_snapshot(
             boundary_tokens,
             boundary_blocks,
             boundary_disk,

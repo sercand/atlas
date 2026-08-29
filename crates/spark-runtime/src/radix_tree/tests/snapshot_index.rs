@@ -27,6 +27,8 @@ fn entry(
         is_tail: false,
         is_tail_sibling: false,
         is_decode_ckpt: false,
+            is_intermediate: false,
+            is_turn_anchor: false,
     }
 }
 

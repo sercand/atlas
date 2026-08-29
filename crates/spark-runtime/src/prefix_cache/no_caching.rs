@@ -60,8 +60,8 @@ impl PrefixCache for NoPrefixCaching {
         _session_hash: u64,
         _matched_tokens: usize,
         _adapter_id: u64,
-    ) -> Option<usize> {
-        None
+    ) -> Vec<usize> {
+        Vec::new()
     }
 
     fn insert_decode_ckpt_snapshot(

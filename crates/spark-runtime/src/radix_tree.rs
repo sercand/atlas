@@ -139,6 +139,28 @@ impl PrefixCache for RadixTree {
         }
     }
 
+    fn lookup_snapshot_at_most(
+        &self,
+        tokens: &[u32],
+        limit: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Option<(usize, usize)> {
+        if limit == 0 {
+            return None;
+        }
+        let m = self
+            .snapshot_index
+            .lock()
+            .lookup_tiered(tokens, limit, session_hash, adapter_id)?;
+        match m.loc {
+            snapshot::SnapLoc::Hbm(slot) => Some((slot, m.token_count)),
+            // A spilled entry needs a fault-in the caller of this fallback is
+            // not set up to drive; recomputing beats a half-done restore.
+            snapshot::SnapLoc::Tier(_) => None,
+        }
+    }
+
     fn peek_matched_tokens(&self, tokens: &[u32], block_size: usize, adapter_id: u64) -> usize {
         self.inner.lock().walk(tokens, block_size, adapter_id).2
     }
@@ -258,13 +280,37 @@ impl PrefixCache for RadixTree {
         session_hash: u64,
         _matched_tokens: usize,
         adapter_id: u64,
-    ) -> Option<usize> {
+    ) -> Vec<usize> {
         // Intermediate snapshots go directly into the index with the correct
         // token boundary (tokens.len()). Tree nodes are already inserted by
         // a prior `insert()` call, which handled the ref_count bookkeeping.
+        //
+        // Ring size: intermediate checkpoints kept per session. 2 leaves a
+        // resume point inside the turn while bounding a prompt's prefill
+        // footprint to 2 pool slots regardless of prompt length, so several
+        // concurrent sessions cannot crowd the boundary anchors out of a
+        // 16-slot pool (4 sessions x (2 intermediate + 1 anchor) = 12).
+        let keep = std::env::var("ATLAS_SSM_INTERMEDIATE_KEEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2);
         let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
         let mut idx = self.snapshot_index.lock();
-        idx.insert(prefix_hash, snapshot_id, session_hash, tokens.len())
+        idx.insert_intermediate(prefix_hash, snapshot_id, session_hash, tokens.len(), keep)
+    }
+
+    fn promote_turn_anchor(&self, session_hash: u64) -> Vec<usize> {
+        // One promoted anchor per session: once a turn completes, the turn
+        // before it has no reachable seam left to restore from.
+        let keep = std::env::var("ATLAS_SSM_TURN_ANCHOR_KEEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1);
+        self.snapshot_index
+            .lock()
+            .promote_turn_anchor(session_hash, keep)
     }
 
     fn release(&self, tokens: &[u32], block_size: usize, adapter_id: u64) {

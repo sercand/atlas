@@ -186,9 +186,43 @@ impl TransformerModel {
             // original values (a non-bit-equal rewrite would poison them).
             // Phase 1b spill-tier fault-in: fold a resident hit with a
             // faulted-back spilled anchor; see `ssm_fault_in::eff_ssm_snapshot`.
-            let (eff_snapshot, eff_snapshot_tokens) =
+            let (mut eff_snapshot, mut eff_snapshot_tokens) =
                 self.eff_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+            // A snapshot at EXACTLY the prompt length is unusable — state@N
+            // cannot produce token N's logits, and the recurrence is not
+            // invertible (see `bypass_exact` below). That refusal used to have
+            // no second choice, so a replayed identical prompt recomputed
+            // everything from zero even when a usable anchor sat a few tokens
+            // below. Ask for the deepest anchor STRICTLY below the prompt
+            // instead; `matched < total` (the ordinary warm turn) never reaches
+            // here. `ATLAS_MARCONI_EXACT=1` keeps the old exact-leaf shortcut,
+            // so leave its input alone.
+            if eff_snapshot_tokens == total
+                && total > 0
+                && !crate::runtime_levers::SSM_NO_EXACT_FALLBACK.get()
+                && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1")
+                && let Some((slot, tok)) = self.prefix_cache.lookup_snapshot_at_most(
+                    tokens,
+                    total - 1,
+                    seq.session_hash,
+                    seq.adapter_id,
+                )
+            {
+                tracing::info!(
+                    "SSM snapshot at the full prompt length ({total}) is unusable; \
+                     falling back to the anchor at {tok} ({} tokens to replay)",
+                    total - tok,
+                );
+                eff_snapshot = Some(slot);
+                eff_snapshot_tokens = tok;
+            }
 
+            // Why a snapshot that WAS found got refused. Without this the
+            // "no SSM snapshot" line below is indistinguishable from a genuine
+            // eviction, and a refusal reads on a live box as a cache that lost
+            // the entry — which is what sent the 2026-08-29 investigation
+            // hunting a nonexistent eviction bug for an hour.
+            let mut refused: Option<String> = None;
             let mut skip = if let Some(snap_id) = eff_snapshot {
                 let snap_tok = eff_snapshot_tokens;
                 // Exact full-prompt hit on a hiddenless snapshot (finish
@@ -320,6 +354,27 @@ impl TransformerModel {
                     }
                     true
                 } else {
+                    refused = Some(if exact_without_hidden {
+                        format!("snapshot {snap_id}@{snap_tok} is the exact full prompt and stashes no hidden state")
+                    } else if bypass_exact {
+                        format!(
+                            "snapshot {snap_id}@{snap_tok} is the exact full prompt (state@N cannot \
+                             produce token N's logits; ATLAS_MARCONI_EXACT=1 re-enables the unsound shortcut)"
+                        )
+                    } else if snap_tok < crate::model::mtp_carry::marconi_min_tokens() {
+                        format!(
+                            "snapshot {snap_id}@{snap_tok} is below the {}-token restore floor",
+                            crate::model::mtp_carry::marconi_min_tokens()
+                        )
+                    } else if prefix_match.ssm_snapshot_is_tail {
+                        format!("snapshot {snap_id}@{snap_tok} is a TAIL from another session")
+                    } else if self.requires_aux_state()
+                        && self.ssm_snapshots.aux(snap_id).is_none()
+                    {
+                        format!("snapshot {snap_id}@{snap_tok} carries no PLE/QSA aux state")
+                    } else {
+                        format!("snapshot {snap_id}@{snap_tok} has an image above the resume point")
+                    });
                     false
                 }
             } else {
@@ -332,8 +387,15 @@ impl TransformerModel {
             // path degrades output quality (cache-ON ws ~23% vs cache-OFF ~60% with
             // give-ups already eliminated). If ws climbs with this set, that path
             // is the residual bug.
+            // Must test what was ACTUALLY restored, not what the raw lookup
+            // offered: when the exact-length snapshot is refused above, the
+            // fallback restores a shallower anchor instead, and that restore is
+            // the ordinary sound path. Reading `prefix_match.ssm_snapshot_tokens`
+            // here saw the refused exact depth and cancelled the good restore,
+            // silently undoing the fallback (measured: a 5,449-token replay
+            // restored from 5,424, then recomputed all 5,449 anyway).
             if skip
-                && prefix_match.ssm_snapshot_tokens == matched
+                && eff_snapshot_tokens == matched
                 && matched == total
                 && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1")
             {
@@ -346,11 +408,20 @@ impl TransformerModel {
             }
             let has_ssm = self.config.num_ssm_layers() > 0;
             if matched > 0 && !skip && has_ssm {
-                tracing::info!(
-                    "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing all KV",
-                    matched,
-                    prefix_match.matched_blocks.len(),
-                );
+                match &refused {
+                    Some(why) => tracing::info!(
+                        "Prefix cache hit: {} tokens ({} blocks) but the SSM snapshot was REFUSED \
+                         ({why}) — recomputing all KV",
+                        matched,
+                        prefix_match.matched_blocks.len(),
+                    ),
+                    None => tracing::info!(
+                        "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot at or below \
+                         that depth — recomputing all KV",
+                        matched,
+                        prefix_match.matched_blocks.len(),
+                    ),
+                }
             } else if matched > 0 && !skip {
                 // F82 (2026-04-30): non-SSM cache-hit skip path. Vision V1
                 // gate applies here too — resuming at `matched` must not

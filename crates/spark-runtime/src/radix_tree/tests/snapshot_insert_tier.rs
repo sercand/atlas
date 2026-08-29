@@ -42,6 +42,8 @@ fn spilled(prefix_hash: u64, slot: usize) -> (SsmSnapshotIndex, u64, usize) {
             is_tail: false,
             is_tail_sibling: false,
             is_decode_ckpt: false,
+            is_intermediate: false,
+            is_turn_anchor: false,
         }],
         7,
     );
@@ -145,6 +147,8 @@ fn the_tail_supersede_sweep_does_not_hand_back_a_spilled_tail() {
             is_tail: true,
             is_tail_sibling: false,
             is_decode_ckpt: false,
+            is_intermediate: false,
+            is_turn_anchor: false,
         }],
         7,
     );
