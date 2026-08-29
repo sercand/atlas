@@ -131,6 +131,22 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
         config.num_hidden_layers,
     );
 
+    // The quantization block lives at the TOP level, beside `text_config` —
+    // and `config` was deserialized from `text_config` alone, so it does not
+    // carry one. Read it from `raw`.
+    //
+    // Skipping this was invisible on RadixArk/Qwen3.8-Flash-Next-NVFP4, whose
+    // config.json declares no `quantization_config` at all: the scheme came
+    // from the `hf_quant_config.json` sidecar, which `merge_sidecar_quant_config`
+    // only consults when this field is None. primitive-ai's mixed build ships
+    // BOTH — a compressed-tensors `mixed-precision` block in config.json (the
+    // truth: NVFP4-packed experts, FP8 per-channel attention/GDN) and a
+    // ModelOpt sidecar that describes the experts only. Leaving this None let
+    // the sidecar win, the variant resolved to `Standard`, and the MoE loader
+    // died looking for `experts.0.gate_proj.weight` against a checkpoint that
+    // spells it `.weight_packed`.
+    config.quantization_config = super::parse_quantization_config(raw);
+
     Ok(config)
 }
 

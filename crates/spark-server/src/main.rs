@@ -29,6 +29,7 @@ mod citation;
 mod citation_structured;
 mod cli;
 mod conversation_store;
+mod debug_io;
 mod disk_guard;
 mod error_hints;
 pub mod grammar;

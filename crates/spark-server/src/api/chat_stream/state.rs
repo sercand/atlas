@@ -36,6 +36,14 @@ pub(super) struct StreamState {
     pub(super) content_decoder: Option<crate::tokenizer::StreamingDecoder<'static>>,
     /// Buffer used for stop-string matching across delta boundaries.
     pub(super) accumulated_content: String,
+    /// ATLAS_DEBUG_IO only: every decoded chunk, concatenated.
+    ///
+    /// NOT `accumulated_content` — that one is the stop-string hold-back
+    /// buffer and stays EMPTY when the request configures no stop strings,
+    /// which is why the first version of this dump logged "0 chars" beside
+    /// 1590 token ids. NOT `content_decoded` either: that is cleared as the
+    /// stream advances. This is the only full record of the decoded text.
+    pub(super) debug_raw: String,
     /// Number of bytes of `accumulated_content` already forwarded to
     /// the client. The vLLM-style hold-back (see `handle_token`) keeps
     /// the last `max(stop_string_len) - 1` bytes back until either a
@@ -205,6 +213,7 @@ impl StreamState {
             detok_read_offset: 0,
             content_decoder: None,
             accumulated_content: String::new(),
+            debug_raw: String::new(),
             stop_string_emitted_len: 0,
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,

@@ -67,21 +67,46 @@ fn unset_effort_thinking_off_renders_none_settings() {
     assert!(r.contains(SETTINGS_NONE), "render:\n{r}");
 }
 
-/// Tiers Mistral does not have stay rejected: an explicit "low"/"xhigh"
-/// raises in-template (a 400 at the API). Only the neutral fallback is
-/// mapped — supported-tier vocabulary remains per-model.
+/// Tiers Mistral does not have stay rejected: an explicit "low" raises
+/// in-template (a 400 at the API). Supported-tier vocabulary remains
+/// per-model — the ONE exception is the high/xhigh synonym below.
 #[test]
 fn unsupported_explicit_tiers_still_raise() {
-    for effort in ["low", "xhigh"] {
-        let err = render_mistral(RenderFlags {
-            enable_thinking: true,
-            reasoning_effort: Some(effort),
-            ..Default::default()
-        })
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("reasoning_effort must be either"),
-            "effort={effort}: expected the Mistral validator to fire, got: {err:#}"
-        );
-    }
+    let err = render_mistral(RenderFlags {
+        enable_thinking: true,
+        reasoning_effort: Some("low"),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("reasoning_effort must be either"),
+        "expected the Mistral validator to fire, got: {err:#}"
+    );
+}
+
+/// BEHAVIOUR CHANGE 2026-08-29: `xhigh` used to raise here and now renders
+/// as Mistral's `high`.
+///
+/// `high` and `xhigh` are the same rung spelled two ways, and the templates
+/// disagree about which spelling they know: Qwen3.8-Flash-Next accepts only
+/// `xhigh`, Mistral accepts only `high`. Before this, `reasoning_effort:
+/// "high"` 400'd on Flash-Next — an ordinary OpenAI value rejected because
+/// of a spelling. `render_chat` now retries once with the neighbouring
+/// spelling when a template raises specifically about the effort value.
+///
+/// Fixing only the Flash-Next direction would be incoherent: `high` would
+/// work on a template that knows only `xhigh` while `xhigh` still 400'd on
+/// one that knows only `high`. So the retry is symmetric and a top-tier
+/// request lands on whatever the model calls its top tier. No OTHER tier is
+/// remapped — see `unsupported_explicit_tiers_still_raise` — so a genuinely
+/// unsupported value is still a loud failure, not a silent downgrade.
+#[test]
+fn xhigh_is_accepted_as_the_synonym_of_mistrals_high() {
+    let r = render_mistral(RenderFlags {
+        enable_thinking: true,
+        reasoning_effort: Some("xhigh"),
+        ..Default::default()
+    })
+    .expect("xhigh must reach Mistral's top thinking tier, not 400");
+    assert!(r.contains(SETTINGS_HIGH), "render:\n{r}");
 }

@@ -108,6 +108,11 @@ pub(crate) async fn build_and_serve(
         .route("/hardware", get(api::hardware))
         .route("/health", get(api::health))
         .route("/health/live", get(api::health_live))
+        .route("/admin/shutdown", post(api::admin_shutdown))
+        .route(
+            "/admin/levers",
+            get(api::admin_levers_get).post(api::admin_levers_set),
+        )
         .route("/metrics", get(api::metrics_handler))
         // Body size limit. Default 32 MB covers typical multi-image and
         // long-prompt requests; raise via `ATLAS_MAX_BODY_BYTES` (in

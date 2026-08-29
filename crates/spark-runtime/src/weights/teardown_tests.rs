@@ -83,6 +83,90 @@ fn fp8_kv_scale_count_zero_without_scales() {
     assert_eq!(store.fp8_kv_scale_count(), 0);
 }
 
+fn tensor(gpu: &dyn GpuBackend, dtype: WeightDtype, shape: &[usize]) -> WeightTensor {
+    let n: usize = shape.iter().product();
+    WeightTensor {
+        ptr: gpu.alloc(n * dtype.byte_size().max(1)).expect("alloc"),
+        shape: shape.to_vec(),
+        dtype,
+    }
+}
+
+/// The pointer test IS the mechanism. `dense_auto` hands back the STORE
+/// POINTER for a BF16 tensor and a FRESH allocation for an FP8 one; only the
+/// second is the caller's to free, and freeing the first would hand the store
+/// a dangling pointer.
+#[test]
+fn retire_dequant_source_takes_the_fresh_buffer_and_spares_the_alias() {
+    let gpu = MockGpuBackend::new();
+    let mut map = HashMap::new();
+    // 32 elements each: FP8 on disk (dequants to a fresh 64-byte BF16), BF16
+    // on disk (aliases straight through).
+    map.insert(
+        "a.weight".to_string(),
+        tensor(&gpu, WeightDtype::FP8E4M3, &[4, 8]),
+    );
+    map.insert(
+        "b.weight".to_string(),
+        tensor(&gpu, WeightDtype::BF16, &[4, 8]),
+    );
+    let alias = map["b.weight"].ptr;
+    let mut store = WeightStore::from_map(map);
+
+    let dequant = gpu.alloc(64).expect("alloc");
+    assert!(store.retire_dequant_source("a", dequant), "fresh → queued");
+    assert!(
+        !store.retire_dequant_source("b", alias),
+        "store alias → not ours"
+    );
+    assert!(
+        !store.retire_dequant_source("nope", dequant),
+        "unknown prefix → nothing to compare against"
+    );
+    assert!(!store.retire_dequant_source("a", DevicePtr::NULL));
+
+    assert_eq!(gpu.alloc_count(), 3);
+    let (bytes, count) = store.free_retired(&gpu).expect("freed");
+    assert_eq!((bytes, count), (64, 1));
+    assert_eq!(gpu.alloc_count(), 2, "only the dequant went");
+    assert!(store.get("b.weight").is_ok(), "the alias is still live");
+}
+
+/// A 4-bit-packed source is `[n, k/2]` on disk, so its element count is HALF
+/// the BF16 output's. Getting this wrong would poison (or, on a real backend,
+/// memset) past the end of the buffer.
+#[test]
+fn retire_dequant_source_sizes_a_packed_source_from_the_unpacked_width() {
+    let gpu = MockGpuBackend::new();
+    let mut map = HashMap::new();
+    // [4, 4] U8 = 16 bytes on disk = 32 logical values = 64 BF16 bytes.
+    map.insert(
+        "c.weight_packed".to_string(),
+        tensor(&gpu, WeightDtype::UInt8, &[4, 4]),
+    );
+    let mut store = WeightStore::from_map(map);
+    assert!(store.retire_dequant_source("c", gpu.alloc(64).expect("alloc")));
+    assert_eq!(store.free_retired(&gpu).expect("freed"), (64, 1));
+}
+
+/// `free_retired` is the ordinary path, but a load that errors out before it
+/// must not strand the buffers — teardown is the backstop, and these are not
+/// store tensors so `weights.drain()` cannot have covered them.
+#[test]
+fn release_frees_a_dequant_free_retired_never_took() {
+    let gpu = MockGpuBackend::new();
+    let mut map = HashMap::new();
+    map.insert(
+        "a.weight".to_string(),
+        tensor(&gpu, WeightDtype::FP8E4M3, &[4, 8]),
+    );
+    let mut store = WeightStore::from_map(map);
+    assert!(store.retire_dequant_source("a", gpu.alloc(64).expect("alloc")));
+    assert_eq!(gpu.alloc_count(), 2);
+    store.release(&gpu).expect("released");
+    assert_eq!(gpu.alloc_count(), 0);
+}
+
 /// Reverse order, and one failure does not abandon the rest — the whole
 /// reason `Teardown` exists rather than `Drop`.
 #[test]

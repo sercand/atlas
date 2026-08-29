@@ -214,6 +214,115 @@ pub async fn health_live() -> Response {
     }
 }
 
+/// POST /admin/shutdown — request the clean shutdown (stop accepting, drain
+/// in-flight, exit), exactly what SIGTERM triggers. Under a supervisor with
+/// Restart=always this is the remote restart primitive: it lets local tooling
+/// without signal rights (a sandboxed agent, a deploy script) bounce the
+/// serve to pick up a new binary or serve.sh env.
+///
+/// Loopback-only, checked against the CONNECTION's peer address — never a
+/// header — so a `--bind 0.0.0.0` deployment does not hand the LAN a kill
+/// switch. A local caller is equivalent to a same-user `kill`, which is the
+/// mechanism this replaces. The shutdown itself is deferred ~100 ms so the
+/// 202 response flushes before the accept loop stops.
+pub async fn admin_shutdown(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "shutdown is accepted from loopback only"
+            })),
+        )
+            .into_response();
+    }
+    tracing::warn!("Shutdown requested via POST /admin/shutdown from {peer}");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::tui::shutdown::request("admin endpoint");
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "shutting_down"})),
+    )
+        .into_response()
+}
+
+/// GET /admin/levers — list the runtime experiment levers (see
+/// `spark_model::runtime_levers`): name, shadowed env var, override state,
+/// and effective value. Loopback-only, like /admin/shutdown.
+pub async fn admin_levers_get(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "levers are loopback-only"})),
+        )
+            .into_response();
+    }
+    Json(spark_model::runtime_levers::describe_all()).into_response()
+}
+
+/// POST /admin/levers {"name": "...", "value": true|false|null} — set or
+/// clear one runtime lever. `null` clears the override back to the shadowed
+/// env var. Levers gate dispatch between already-loaded kernels only, so a
+/// flip needs no restart; in-flight chunks may straddle the change.
+pub async fn admin_levers_set(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "levers are loopback-only"})),
+        )
+            .into_response();
+    }
+    let Json(body) = match req {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let Some(name) = body.get("name").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing \"name\""})),
+        )
+            .into_response();
+    };
+    let value = match body.get("value") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("\"value\" must be true/false/null, got {other}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    if !spark_model::runtime_levers::set_by_name(name, value) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no lever named {name:?}"),
+                "levers": spark_model::runtime_levers::describe_all(),
+            })),
+        )
+            .into_response();
+    }
+    Json(spark_model::runtime_levers::describe_all()).into_response()
+}
+
 /// GET /hardware — the serving box's hardware fingerprint, for benchmark
 /// provenance. Probed on request (the sm-clock reading must be live), via
 /// `spawn_blocking` because the vendor tools are synchronous subprocesses.

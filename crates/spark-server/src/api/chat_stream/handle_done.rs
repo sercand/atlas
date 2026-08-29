@@ -31,6 +31,18 @@ pub(super) fn handle_done(
 ) -> DeltaVec {
     let mut deltas: DeltaVec = Vec::new();
 
+    // ATLAS_DEBUG_IO=1: the streaming counterpart of the blocking path's
+    // pre-parse dump. Without this, an agentic client (which streams) got the
+    // rendered prompt and NOTHING about what came back — and the 2026-08-29
+    // `</parameter→` corruption was only visible because the next turn echoed
+    // it into the prompt. Token ids come too: a single substituted token
+    // (`>` -> U+2192) is a token-id question, and the decoded text cannot say
+    // whether one id changed or the detokenizer did it.
+    if crate::debug_io::enabled() {
+        crate::debug_io::dump_output("stream, content", &state.debug_raw);
+        crate::debug_io::dump_token_ids(&state.all_toks);
+    }
+
     // ── Stop-string hold-back flush ─────────────────────────────────
     // vLLM's `IncrementalDetokenizer` releases any bytes still in the
     // hold-back window when the stream finalises (see

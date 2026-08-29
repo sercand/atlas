@@ -49,12 +49,15 @@ pub(crate) const BLOCK: usize = 4096;
 pub struct NgramRowCache {
     /// Flat pinned, GPU-addressable `[slots, row_stride]` region.
     arena: ExpertArena,
-    /// Backing file: row `i` at byte offset `base_offset + i * row_stride`.
+    /// Backing files: row `i` at byte offset `base_offset + i * row_stride`
+    /// inside `files[0]`, or — for a SEGMENTED table — inside the file its
+    /// shard names (see [`Segments::file_of`]).
+    ///
     /// `base_offset` lets the cache read STRAIGHT OUT OF A SAFETENSORS SHARD
     /// — a table is already a contiguous row-major blob there, so no repack
     /// or re-save is needed. Because that offset is only 8-byte aligned, a
     /// row may straddle a 4 KiB O_DIRECT block; `fetch_into` handles the seam.
-    file: File,
+    files: Vec<File>,
     base_offset: u64,
     /// SEGMENTED tables: one base offset per equal-sized shard.
     ///
@@ -89,6 +92,16 @@ pub struct NgramRowCache {
 struct Segments {
     /// Byte offset of each shard's first row, indexed by shard.
     bases: Vec<u64>,
+    /// Which backing file each shard lives in, as an index into
+    /// [`NgramRowCache::files`]. All-zero for the single-file case.
+    ///
+    /// RadixArk's release is preprocessed into ONE 102.4 GB BF16 file, so the
+    /// cache was written to open exactly one. primitive-ai's mixed build
+    /// ships the same 128 shards already BF16 but spread over 43
+    /// `ple-bf16-*.safetensors` — and it is 102 GB of disk and a repack pass
+    /// to flatten that, for a table the cache only ever reads 320 bytes of at
+    /// a time. One fd per shard file costs nothing and removes the repack.
+    file_of: Vec<u16>,
     /// Rows per shard. Every shard but conceivably the last holds exactly
     /// this many; `open_segmented` requires them all equal so the mapping is
     /// a divide rather than a search.
@@ -182,7 +195,7 @@ impl NgramRowCache {
         };
         Ok(Self {
             arena,
-            file,
+            files: vec![file],
             base_offset,
             segments: None,
             scales,
@@ -215,6 +228,35 @@ impl NgramRowCache {
         row_stride: usize,
         slots: usize,
     ) -> Result<Self> {
+        let file_of = vec![0u16; bases.len()];
+        Self::open_segmented_multi(
+            std::slice::from_ref(&path),
+            file_of,
+            bases,
+            rows_per_shard,
+            scale_path,
+            row_stride,
+            slots,
+        )
+    }
+
+    /// As [`Self::open_segmented`], but the shards may live in DIFFERENT
+    /// files: `file_of[shard]` indexes `paths`.
+    ///
+    /// A checkpoint that ships its n-gram table as N safetensors shards
+    /// spread over M files (primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8:
+    /// 128 shards over 43 `ple-bf16-*.safetensors`) is served in place, with
+    /// no repack of a 102 GB table into one file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_segmented_multi(
+        paths: &[&Path],
+        file_of: Vec<u16>,
+        bases: Vec<u64>,
+        rows_per_shard: u64,
+        scale_path: Option<&Path>,
+        row_stride: usize,
+        slots: usize,
+    ) -> Result<Self> {
         if bases.is_empty() || rows_per_shard == 0 {
             bail!(
                 "NgramRowCache: segmented table needs shards and rows \
@@ -222,10 +264,30 @@ impl NgramRowCache {
                 bases.len()
             );
         }
+        if paths.is_empty() {
+            bail!("NgramRowCache: segmented table needs at least one backing file");
+        }
+        if file_of.len() != bases.len() {
+            bail!(
+                "NgramRowCache: {} shard bases but {} file assignments",
+                bases.len(),
+                file_of.len()
+            );
+        }
+        if let Some(bad) = file_of.iter().find(|f| **f as usize >= paths.len()) {
+            bail!(
+                "NgramRowCache: shard names file {bad} but only {} were given",
+                paths.len()
+            );
+        }
         let rows_total = bases.len() as u64 * rows_per_shard;
-        let mut c = Self::open_at(path, 0, scale_path, rows_total, row_stride, slots)?;
+        let mut c = Self::open_at(paths[0], 0, scale_path, rows_total, row_stride, slots)?;
+        for p in &paths[1..] {
+            c.files.push(open_direct(p)?);
+        }
         c.segments = Some(Segments {
             bases,
+            file_of,
             rows_per: rows_per_shard,
         });
         Ok(c)
@@ -323,7 +385,7 @@ impl NgramRowCache {
         if !jobs.is_empty() {
             let r = crate::ngram_cache_fault::fault_all(
                 &jobs,
-                &self.file,
+                &self.files,
                 self.scales.as_ref().map(|sc| &sc.file),
                 self.row_stride,
                 &mut self.bounce,
@@ -354,7 +416,7 @@ impl NgramRowCache {
     /// bookkeeping-free half of the old `fetch_into`, consumed by
     /// [`crate::ngram_cache_fault::fault_all`].
     fn fault_job(&self, id: u64, slot: u32) -> Result<crate::ngram_cache_fault::FaultJob> {
-        let byte = self.row_byte(id);
+        let (file_idx, byte) = self.row_byte(id);
         let block_off = byte - (byte % BLOCK as u64);
         let within = (byte - block_off) as usize;
         let nblocks = crate::ngram_cache_fault::nblocks_for(within, self.row_stride);
@@ -379,6 +441,7 @@ impl NgramRowCache {
         Ok(crate::ngram_cache_fault::FaultJob {
             row_id: id,
             slot,
+            file_idx,
             block_off,
             within,
             nblocks,
@@ -420,14 +483,17 @@ impl NgramRowCache {
         )
     }
 
-    /// Byte offset of row `id` in the backing file.
-    fn row_byte(&self, id: u64) -> u64 {
+    /// Which backing file row `id` lives in, and its byte offset there.
+    fn row_byte(&self, id: u64) -> (u16, u64) {
         match &self.segments {
-            None => self.base_offset + id * self.row_stride as u64,
+            None => (0, self.base_offset + id * self.row_stride as u64),
             Some(seg) => {
                 let shard = (id / seg.rows_per) as usize;
                 let local = id % seg.rows_per;
-                seg.bases[shard] + local * self.row_stride as u64
+                (
+                    seg.file_of[shard],
+                    seg.bases[shard] + local * self.row_stride as u64,
+                )
             }
         }
     }

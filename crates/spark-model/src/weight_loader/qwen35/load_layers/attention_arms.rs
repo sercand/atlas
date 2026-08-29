@@ -62,7 +62,7 @@ pub(crate) fn build_full_attention_nvfp4(
                     quantized_auto(store, &prefix, gpu, variant)?
                 } else {
                     let dense_bf16 = dense_auto(store, &format!("{prefix}.weight"), gpu)?;
-                    quantize_to_nvfp4(
+                    let q = quantize_to_nvfp4(
                         &dense_bf16,
                         full_n,
                         full_k,
@@ -70,7 +70,17 @@ pub(crate) fn build_full_attention_nvfp4(
                         absmax_k,
                         quantize_k,
                         stream,
-                    )?
+                    )?;
+                    // On this arm the NVFP4 copy is the ONLY thing installed —
+                    // `q_proj`/`k_proj`/`v_proj` go in as NULL `dummy` below and
+                    // `o_proj` as the quantized weight — so once the quantize has
+                    // copied, the BF16 is unreachable. When the source was FP8 or
+                    // 4-bit-packed that BF16 is a fresh allocation the store has
+                    // never seen, and nothing else would ever free it: 99.7 MB per
+                    // QSA layer × 12 = 1.20 GB on the mixed NVFP4/FP8 Flash-Next
+                    // build. A BF16 source aliases the store and is left alone.
+                    store.retire_dequant_source(&prefix, dense_bf16.weight);
+                    q
                 };
                 if tp_size == 1 {
                     return Ok(src);

@@ -109,21 +109,55 @@ pub(crate) fn render_chat(
         .preserve_thinking
         .map(minijinja::Value::from)
         .unwrap_or(minijinja::Value::UNDEFINED);
-    let ctx = minijinja::context! {
-        messages => messages_val,
-        tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
-        add_generation_prompt => !continue_final,
-        enable_thinking => enable_thinking,
-        reasoning_effort => reasoning_effort,
-        preserve_thinking => preserve_thinking,
-        disable_tool_steering => flags.disable_tool_steering,
-        add_vision_id => false,
+    // Templates disagree on the reasoning-effort vocabulary, and the
+    // disagreement is not knowable from the model id:
+    //
+    //   Qwen3.8-27B      remaps 'high' -> 'xhigh' itself, then validates
+    //                    against ('xhigh','medium','low')
+    //   Qwen3.8-Flash-Next  SAME validation, NO remap — `high` raises
+    //   Mistral          validates against ('none','high') — `xhigh` raises
+    //
+    // So `reasoning_effort: "high"`, an ordinary OpenAI value, 400'd on
+    // Flash-Next while working on the 27B (2026-08-29). A static table
+    // cannot satisfy both directions, and a template cannot be asked what
+    // it accepts. Render, and if the template raises specifically about the
+    // effort value, retry ONCE with the neighbouring spelling. Costs
+    // nothing on the success path and is self-correcting for a template
+    // Atlas has never seen.
+    let render_with = |effort: minijinja::Value| {
+        tmpl.render(minijinja::context! {
+            messages => messages_val.clone(),
+            tools => tools_val.clone().unwrap_or(minijinja::Value::UNDEFINED),
+            add_generation_prompt => !continue_final,
+            enable_thinking => enable_thinking,
+            reasoning_effort => effort,
+            preserve_thinking => preserve_thinking.clone(),
+            disable_tool_steering => flags.disable_tool_steering,
+            add_vision_id => false,
+        })
     };
-
-    let mut rendered = tmpl.render(ctx).map_err(|e| {
-        tracing::error!("Jinja template error: {e:#}");
-        anyhow::anyhow!("Failed to render Jinja chat template: {e}")
-    })?;
+    let mut rendered = match render_with(reasoning_effort.clone()) {
+        Ok(r) => r,
+        Err(e) if is_effort_rejection(&e) => {
+            let asked = reasoning_effort.as_str().unwrap_or_default().to_string();
+            let Some(alt) = effort_synonym(&asked) else {
+                tracing::error!("Jinja template error: {e:#}");
+                return Err(anyhow::anyhow!("Failed to render Jinja chat template: {e}"));
+            };
+            tracing::warn!(
+                "chat template rejected reasoning_effort {asked:?}; retrying as {alt:?} \
+                 (this template does not carry the {asked:?} remap)"
+            );
+            render_with(minijinja::Value::from(alt)).map_err(|e2| {
+                tracing::error!("Jinja template error after effort retry: {e2:#}");
+                anyhow::anyhow!("Failed to render Jinja chat template: {e2}")
+            })?
+        }
+        Err(e) => {
+            tracing::error!("Jinja template error: {e:#}");
+            return Err(anyhow::anyhow!("Failed to render Jinja chat template: {e}"));
+        }
+    };
 
     if continue_final {
         // Strip the trailing end-of-turn so the assistant content is the
@@ -135,5 +169,33 @@ pub(crate) fn render_chat(
         tracing::info!("continue_final_message: stripped trailing EOT for prefill A/B");
     }
 
+    crate::debug_io::dump_prompt(&rendered);
     Ok(rendered)
+}
+
+/// True when a Jinja render failed because the template validates
+/// `reasoning_effort` against a fixed tuple and ours was not in it. Matched
+/// on the message because that is all `raise_exception` gives back; every
+/// template in the wild phrases it as "reasoning effort".
+fn is_effort_rejection(e: &minijinja::Error) -> bool {
+    let mut msg = e.to_string().to_ascii_lowercase();
+    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(e);
+    while let Some(s) = src {
+        msg.push(' ');
+        msg.push_str(&s.to_string().to_ascii_lowercase());
+        src = std::error::Error::source(s);
+    }
+    msg.contains("reasoning effort") || msg.contains("reasoning_effort")
+}
+
+/// The other spelling of a tier, for the one-shot retry. Only the pairs that
+/// templates actually disagree about — `high` and `xhigh` are the same rung
+/// under two names, and nothing else is remapped, so a genuinely unsupported
+/// value still fails loudly instead of being silently downgraded.
+fn effort_synonym(asked: &str) -> Option<&'static str> {
+    match asked {
+        "high" => Some("xhigh"),
+        "xhigh" => Some("high"),
+        _ => None,
+    }
 }

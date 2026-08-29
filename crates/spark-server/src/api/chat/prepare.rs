@@ -60,11 +60,34 @@ pub(crate) fn prepare_chat_prompt(
     // don't make assumptions"), which the GDN model needs to correctly
     // DECLINE on irrelevance prompts. With it (and compact tool-JSON)
     // hallucination returns to ~96 (vs 30/64 without).
+    //
+    // …EXCEPT on a model whose own chat template already renders the tool
+    // list and the format spec (`[behavior].native_tool_prompt`). There this
+    // injection is a SECOND copy of both, worded differently, and `render_
+    // template` hands Jinja the same tools so its `{% if tools %}` branch
+    // renders them again. Measured on Qwen3.8-Flash-Next, 7 tools: 5,774
+    // prompt tokens against 3,733 from the template alone, and the model
+    // emitted a corrupted `</parameter→` close tag that left the first call
+    // unterminated so two `edit_file` calls merged into one object — duplicate
+    // keys, last wins, and the write aimed at text.txt landed on meta.json.
+    //
+    // Only the tool-CHOICE instruction survives the suppression: the template
+    // has no notion of `tool_choice`, so required/specific would otherwise
+    // lose their steering. `auto` appends nothing, so the common path stays
+    // byte-identical to the template's own render.
     if tools_active && let Some(ref parser) = state.tool_call_parser {
         let default_choice = crate::tool_parser::ToolChoice::Mode("auto".to_string());
         let tool_choice = req.tool_choice.as_ref().unwrap_or(&default_choice);
-        let tool_prompt = parser.system_prompt(&req.tools, tool_choice, &state.chat.prompt);
-        inject_tool_system_prompt(&mut req.messages, tool_prompt);
+        if state.behavior.native_tool_prompt {
+            let mut choice_only = String::new();
+            crate::tool_parser::append_tool_choice_instruction(&mut choice_only, tool_choice);
+            if !choice_only.is_empty() {
+                inject_tool_system_prompt(&mut req.messages, choice_only.trim_start().to_string());
+            }
+        } else {
+            let tool_prompt = parser.system_prompt(&req.tools, tool_choice, &state.chat.prompt);
+            inject_tool_system_prompt(&mut req.messages, tool_prompt);
+        }
     }
 
     tracing::info!(

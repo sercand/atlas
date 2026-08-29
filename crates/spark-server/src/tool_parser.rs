@@ -496,6 +496,10 @@ pub use deepseek_v4_dsml::*;
 pub use gemma4::*;
 use helpers_a::*;
 use helpers_b::*;
+// Re-exported for `api::chat::prepare`, which needs the tool-CHOICE steering
+// alone when `[behavior].native_tool_prompt` suppresses the rest of the
+// injected tool prompt.
+pub(crate) use helpers_b::append_tool_choice_instruction;
 pub use hermes::*;
 pub use minimax_xml::*;
 pub use mistral::*;

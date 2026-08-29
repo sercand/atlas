@@ -27,8 +27,17 @@ def read_header(path):
         return json.loads(fh.read(n)), 8 + n
 
 # ── locate all mtp.* tensors ──
+#
+# Two releases spell the BF16 backbone files differently — RadixArk
+# `model-bf16-*.safetensors`, primitive-ai's mixed build
+# `carry-model-bf16-*.safetensors` — and the mtp.* tensors are BF16 and
+# byte-identical in both. Scan every shard EXCEPT the n-gram table (102 GB of
+# `ple-bf16-*` whose headers we have no reason to read) and pick by name.
+SHARD_GLOB = os.environ.get('QWEN4EXP_SHARD_GLOB', '*model*bf16-*.safetensors')
 loc = {}
-for f in sorted(glob.glob(SNAP_SRC + 'model-bf16-*.safetensors')):
+for f in sorted(glob.glob(SNAP_SRC + SHARD_GLOB)):
+    if os.path.basename(f).startswith('ple-'):
+        continue
     hdr, ds = read_header(f)
     for k, v in hdr.items():
         if k.startswith('mtp.'):

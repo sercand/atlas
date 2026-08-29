@@ -214,6 +214,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 &mut state.detok_read_offset,
             );
             state.content_decoded.push_str(&delta_stable);
+            if crate::debug_io::enabled() {
+                state.debug_raw.push_str(&delta_stable);
+            }
             let stable_end = state.content_decoded.len();
             if stable_end > state.emitted {
                 let raw = state.content_decoded[state.emitted..stable_end].to_string();
@@ -419,6 +422,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         &mut state.detok_read_offset,
     );
     state.content_decoded.push_str(&delta_stable);
+            if crate::debug_io::enabled() {
+                state.debug_raw.push_str(&delta_stable);
+            }
     let stable_end = state.content_decoded.len();
     let _ = tok; // tok already in state.all_toks via line 86
     let mut delta = if stable_end > state.emitted {

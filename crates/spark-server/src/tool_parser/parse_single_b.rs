@@ -3,6 +3,72 @@
 
 use super::*;
 
+/// Offset and byte length of the earliest parameter CLOSE tag in `s`,
+/// accepting every spelling models actually emit:
+///
+/// ```text
+/// </parameter>            the documented form
+/// </parameter >           a space before the bracket
+/// </parameter=path>       the name mirrored from the opening tag
+/// </parameter=path >      both
+/// ```
+///
+/// Only the first is what the prompt asks for. The others were observed live
+/// against qwen3.8-flash-next (2026-08-29/30) and are invisible to a plain
+/// `find("</parameter>")`, so the value ran on past its own terminator and
+/// swallowed the next parameter — leaving that one EMPTY.
+///
+/// Deliberately strict about what may sit between `</parameter` and `>`:
+/// spaces/tabs, and an optional `=NAME`. Anything else (a `<`, a newline, a
+/// stray symbol) is NOT a close and must fall through to the recovery
+/// branches — that is what keeps the `</parameter<parameter=` garbled
+/// close-reopen (P0-2) and a plain truncation working as before.
+fn find_param_close(s: &str) -> Option<(usize, usize)> {
+    const TAG: &str = "</parameter";
+    let b = s.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find(TAG) {
+        let at = from + rel;
+        let mut j = at + TAG.len();
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b'=' {
+            j += 1;
+            while j < b.len() && b[j] != b'>' && b[j] != b'<' && b[j] != b'\n' {
+                j += 1;
+            }
+        }
+        if j < b.len() && b[j] == b'>' {
+            return Some((at, j + 1 - at));
+        }
+        from = at + TAG.len();
+    }
+    None
+}
+
+/// Strip a malformed close tag left at the tail of a value that ended at a
+/// RECOVERY boundary (next `<parameter=` / `</function>`).
+///
+/// The exact-orphan case (`</parameter` with the `>` dropped, P0-2
+/// 2026-07-09) is the common one. The 2026-08-29 live capture added a
+/// variant: `</parameter→`, where the final `>` token was replaced by
+/// U+2192 — a close the model intended and mis-spelled by one token. Allow a
+/// SHORT trailing run after `</parameter` so those are removed as the close
+/// they are, while a value that merely happens to end in the literal text
+/// keeps everything up to it.
+fn strip_orphan_close(v: &str) -> &str {
+    let Some(head) = v.find("</parameter") else {
+        return v;
+    };
+    let tail = &v[head + "</parameter".len()..];
+    // No `<` or newline, and short — a real close mis-spelled, not content.
+    if tail.chars().count() <= 4 && !tail.contains('<') && !tail.contains('\n') {
+        return v[..head].trim_end();
+    }
+    v
+}
+
 pub(super) fn parse_qwen3_coder_call(text: &str, _idx: u32) -> Option<ToolCall> {
     // Handle both <function=name> (correct) and <function name> (common model error).
     // Handle NVFP4 quantization variants: <function=name>, <function name>,
@@ -64,26 +130,42 @@ pub(super) fn parse_qwen3_coder_call(text: &str, _idx: u32) -> Option<ToolCall> 
         rest = &rest[key_end + 1..];
 
         // Stop at the LEAST of: `</parameter>` (proper close),
-        // `<parameter=` (next param — recovery for a missing close),
-        // or `</function>` (function ended without closing this param).
+        // `</parameter=NAME>` (named close — see below), `<parameter=`
+        // (next param — recovery for a missing close), or `</function>`
+        // (function ended without closing this param).
         // Without the recovery cases, a missing `</parameter>` swallows
         // every subsequent param into one giant value (vllm #38158
         // regression "streaming_missing_closing_tag").
-        let proper = rest.find("</parameter>");
+        //
+        // NAMED CLOSE (2026-08-29): the OPENING tag carries the parameter
+        // name, so models mirror it on the way out and emit
+        // `</parameter=content>`. That string contains neither `</parameter>`
+        // (the `=` breaks it) nor `<parameter=` (the `/` breaks it), so
+        // before this it was invisible to all three finders — the value ran
+        // on past its own close and swallowed the next parameter's tag and
+        // text, leaving the following parameter EMPTY. Observed live against
+        // qwen3.8-flash-next: an `edit_file` call came back with `path: ""`
+        // and `content` beginning `"</parameter=path>\n/tmp/probe_one.txt"`.
+        // A required argument silently going empty is the worst shape this
+        // can take, because the tool runs.
+        let close = find_param_close(rest);
         let next_param = rest.find("<parameter=");
         let func_close = rest.find("</function>");
         let mut val_end = rest.len();
-        let mut consumed_close = false;
-        if let Some(p) = proper {
+        // Byte length of the terminator to skip past; `None` = the value
+        // ended at a recovery boundary that must stay in `rest`.
+        let mut close_len: Option<usize> = None;
+        if let Some((p, len)) = close {
             val_end = p;
-            consumed_close = true;
+            close_len = Some(len);
         }
         for cand in [next_param, func_close].into_iter().flatten() {
             if cand < val_end {
                 val_end = cand;
-                consumed_close = false;
+                close_len = None;
             }
         }
+        let consumed_close = close_len.is_some();
         let raw_value = rest[..val_end].trim();
         // P0-2 (2026-07-09): when the value ended at a RECOVERY boundary
         // (next `<parameter=` / `</function>`), a garbled close-reopen
@@ -91,17 +173,14 @@ pub(super) fn parse_qwen3_coder_call(text: &str, _idx: u32) -> Option<ToolCall> 
         // orphan `</parameter` as the value's tail. Strip it; it is the
         // model's intended close, not content.
         let raw_value = if !consumed_close {
-            raw_value
-                .strip_suffix("</parameter")
-                .map(str::trim_end)
-                .unwrap_or(raw_value)
+            strip_orphan_close(raw_value)
         } else {
             raw_value
         };
         let advanced_to_func_close =
             !consumed_close && val_end < rest.len() && rest[val_end..].starts_with("</function>");
-        rest = if consumed_close {
-            &rest[val_end + "</parameter>".len()..]
+        rest = if let Some(len) = close_len {
+            &rest[val_end + len..]
         } else if val_end < rest.len() {
             // Recovery path: leave the next `<parameter=` / `</function>`
             // in place so the surrounding loop sees it.

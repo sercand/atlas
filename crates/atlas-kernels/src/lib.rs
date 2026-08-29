@@ -305,6 +305,23 @@ pub struct ModelBehavior {
     /// Default `false`; the TAS operator is tokenizer-specific so
     /// enable + verify per model. arXiv:2605.04107.
     pub tscg: bool,
+    /// This model's chat template renders the tool list and the tool-call
+    /// format spec itself, so Atlas must NOT also inject its own.
+    ///
+    /// When false (the default) Atlas injects `parser.system_prompt()` into
+    /// messages[0] AND — unless TSCG is on — hands the same tools to Jinja,
+    /// which renders them again. On a template with a `{% if tools %}` branch
+    /// that means two tool lists and two DIFFERENT format specs in one
+    /// prompt: measured on Qwen3.8-Flash-Next, +2,100 tokens on a 7-tool
+    /// request, and the model emitted a corrupted `</parameter→` close tag
+    /// that merged two tool calls into one.
+    ///
+    /// Default false because most templates render no tool block at all, and
+    /// for those the injection IS the tool prompt — removing it globally
+    /// regressed hermes from ~96 to 30/64 (the ST-995 note in
+    /// `api/chat/prepare.rs`). Set true only for a template verified to carry
+    /// its own tools branch.
+    pub native_tool_prompt: bool,
     /// Disable XGrammar tool-call constrained decoding for this model.
     /// Default `false`. Escape hatch for the "structure snowballing"
     /// alignment tax (arXiv:2604.06066) — a few models tool-call more
@@ -406,6 +423,7 @@ impl Default for ModelBehavior {
             max_inter_tool_prose: DEFAULT_MAX_INTER_TOOL_PROSE,
             max_post_think_content_tokens: 100_000,
             tscg: false,
+            native_tool_prompt: false,
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: "",

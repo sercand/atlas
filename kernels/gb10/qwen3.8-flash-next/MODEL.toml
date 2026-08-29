@@ -231,6 +231,23 @@ its per-token conv launches (same bits, more launches)."""
 # (verified from live emissions, agentic-webserver run 2026-08-27). Without a
 # parser the calls land in content and finish_reason still says tool_calls.
 tool_call_parser = "qwen3_coder"
+# This checkpoint's chat_template.jinja renders the tool list itself
+# (`{%- if tools ... %}` -> "# Tools", one `tool | tojson` per tool, then the
+# official 4-bullet <IMPORTANT> reminder). Atlas's parser system_prompt()
+# would inject a SECOND tool list and a DIFFERENT format spec
+# (<IMMEDIATE_TOOL_USE> + a 10-bullet <IMPORTANT>, with an inline-value
+# example where the template puts values on their own line).
+#
+# Measured 2026-08-29 on a 7-tool /v1/messages request: 5,774 prompt tokens
+# with the injection against 3,733 from vLLM/the official API on the same
+# payload -- each tool costing ~2x its own JSON. And the duplication is not
+# only tokens: the model emitted a corrupted `</parameter\u2192` close tag,
+# which left the first call's envelope unterminated so two consecutive
+# edit_file calls merged into ONE arguments object (duplicate keys, last
+# wins) -- a write aimed at text.txt was recorded against meta.json and
+# text.txt was never written. The extractor handles well-formed input
+# correctly; the malformed emission is upstream of it.
+native_tool_prompt = true
 # Qwen3.8-Flash-Next is a THINKING model whose chat template gates
 # EVERYTHING on `enable_thinking is undefined or true`: the default render
 # carries a reasoning-effort system preamble ("Reasoning effort is set to
@@ -264,4 +281,4 @@ min_reasoning_floor_tokens = 0
 # and forcing continued reasoning — the swallow path is what turned early
 # closes into <|im_start|>user template simulation.
 honor_eos_inside_thinking = true
-max_thinking_budget = 2048
+max_thinking_budget = 16384

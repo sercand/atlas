@@ -74,6 +74,16 @@ pub(crate) struct ParsedBehavior {
     pub max_inter_tool_prose: u32,
     pub max_post_think_content_tokens: u32,
     pub tscg: bool,
+    /// The model's own chat template already renders the tool list and the
+    /// tool-call format spec (its `{% if tools %}` branch). Atlas's parser
+    /// `system_prompt()` injection is then a SECOND, differently-worded copy
+    /// of both — see `api/chat/prepare.rs`. Set true to suppress the
+    /// injection and let the template be the single source.
+    ///
+    /// Default false: most templates render no tool block at all, and for
+    /// those the injection IS the tool prompt (removing it globally regressed
+    /// hermes badly — the ST-995 note in `prepare.rs`).
+    pub native_tool_prompt: bool,
     pub disable_tool_grammar: bool,
     pub rollback_resteer: bool,
     pub rom_head: String,
@@ -113,6 +123,7 @@ impl Default for ParsedBehavior {
             max_inter_tool_prose: DEFAULT_MAX_INTER_TOOL_PROSE,
             max_post_think_content_tokens: 100_000,
             tscg: false,
+            native_tool_prompt: false,
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: String::new(),
@@ -259,6 +270,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("tscg"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let native_tool_prompt = b
+        .and_then(|v| v.get("native_tool_prompt"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let disable_tool_grammar = b
         .and_then(|v| v.get("disable_tool_grammar"))
         .and_then(|v| v.as_bool())
@@ -307,6 +322,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         max_inter_tool_prose,
         max_post_think_content_tokens,
         tscg,
+        native_tool_prompt,
         disable_tool_grammar,
         rollback_resteer,
         rom_head,

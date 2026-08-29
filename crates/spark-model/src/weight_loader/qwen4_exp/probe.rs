@@ -68,7 +68,18 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         let first_local = (0..config.num_experts)
             .find(|e| config.is_local_expert(*e))
             .unwrap_or(0);
-        if store.contains(&format!("{lp}.mlp.experts.{first_local}.gate_proj.weight")) {
+        // Two on-disk spellings of the same tensor. ModelOpt NVFP4
+        // (RadixArk/Qwen3.8-Flash-Next-NVFP4) names the packed E2M1 payload
+        // `.weight`; compressed-tensors `nvfp4-pack-quantized`
+        // (primitive-ai/…-mixed-NVFP4-FP8) names it `.weight_packed`. Probing
+        // only the first spelling counted ZERO experts on the second
+        // checkpoint and `ensure_loadable` refused a perfectly good model
+        // before uploading a byte.
+        if store.contains(&format!("{lp}.mlp.experts.{first_local}.gate_proj.weight"))
+            || store.contains(&format!(
+                "{lp}.mlp.experts.{first_local}.gate_proj.weight_packed"
+            ))
+        {
             r.expert_tensors += 1;
         }
         if store.contains(&format!("{lp}.input_layernorm.weight"))

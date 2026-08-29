@@ -190,6 +190,28 @@ pub struct WeightStore {
     /// [`Self::free_retired`] (after every loader has run, so "retired then
     /// read at construction" is impossible).
     retired: Vec<String>,
+    /// Loader-owned buffers that are NOT store tensors, queued by
+    /// [`Self::retire_dequant_source`] and freed alongside `retired`.
+    ///
+    /// `dense_auto` has two return contracts: a BF16 store tensor comes back
+    /// as an ALIAS (`w.ptr`), an FP8 or 4-bit-packed one as a FRESH BF16
+    /// allocation. Aliases are reclaimable through [`Self::retire`]; the fresh
+    /// buffers were never in `weights`, so that path is structurally blind to
+    /// them and they stayed resident for the life of the process — 5.35 GB on
+    /// primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8, whose QSA and GDN
+    /// projections all ship FP8 E4M3.
+    ///
+    /// `Mutex` because the layer arms hold `&WeightStore`, not `&mut`.
+    detached: std::sync::Mutex<Vec<DetachedBuffer>>,
+}
+
+/// A loader-owned dequant intermediate awaiting the deferred free.
+struct DetachedBuffer {
+    ptr: DevicePtr,
+    /// Size of the BF16 output, for the poison memset and the log line.
+    bytes: usize,
+    /// Store key it was dequantized from — for diagnostics only.
+    from: String,
 }
 
 /// Where a skipped tensor lives, so a consumer can read it in place.
@@ -212,6 +234,7 @@ impl WeightStore {
             deferred: HashMap::new(),
             slabs: Vec::new(),
             retired: Vec::new(),
+            detached: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -247,6 +270,66 @@ impl WeightStore {
             }
             None => false,
         }
+    }
+
+    /// Queue the BF16 intermediate a `dense_auto` / `dequant_*` call produced
+    /// from the store tensor at `prefix`, to be freed by the next
+    /// [`Self::free_retired`].
+    ///
+    /// `prefix` is the projection prefix the loader passed to the load helper
+    /// (e.g. `model.layers.3.linear_attn.in_proj_qkv`) and `ptr` is what came
+    /// back. The pointer test IS the mechanism: `dense_auto` returns the store
+    /// pointer for a BF16 tensor and a fresh allocation for an FP8 or
+    /// 4-bit-packed one, so a differing pointer is proof a dequant happened
+    /// and that this buffer belongs to the caller. An alias is left alone —
+    /// that memory is the store's, and [`Self::retire`] is how it goes back.
+    ///
+    /// Call only where every consumer has already copied out of the buffer
+    /// (`quantize_to_nvfp4`, a concat, a shard). Deferring the actual free to
+    /// `free_retired` is what makes "freed then read at construction"
+    /// impossible, exactly as for `retire`.
+    ///
+    /// Returns true if a buffer was queued.
+    pub fn retire_dequant_source(&self, prefix: &str, ptr: DevicePtr) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        let packed = format!("{prefix}.weight_packed");
+        let plain = format!("{prefix}.weight");
+        let (key, t) = match self.weights.get(&packed) {
+            Some(t) => (packed, t),
+            None => match self.weights.get(&plain) {
+                Some(t) => (plain, t),
+                None => return false,
+            },
+        };
+        // Alias into the store: not ours to free.
+        if t.ptr == ptr {
+            return false;
+        }
+        // A dequant output is always a standalone `gpu.alloc`, never a slab
+        // interior — but a stray caller passing an interior pointer would
+        // corrupt the slab, so refuse rather than trust.
+        if self.is_slab_interior(ptr) {
+            tracing::warn!("retire_dequant_source({prefix}): slab-backed pointer — kept");
+            return false;
+        }
+        // Bytes of the BF16 output. A 4-bit-packed source is [n, k/2] and so
+        // has half the output's element count; every other source dtype is
+        // element-for-element.
+        let bytes = match t.dtype {
+            WeightDtype::UInt8 => t.num_elements() * 4,
+            _ => t.num_elements() * 2,
+        };
+        self.detached
+            .lock()
+            .expect("weight store detached queue poisoned")
+            .push(DetachedBuffer {
+                ptr,
+                bytes,
+                from: key,
+            });
+        true
     }
 
     /// Free every tensor queued by [`Self::retire`]. Call exactly once, after
@@ -289,7 +372,44 @@ impl WeightStore {
                 },
             );
         }
-        Ok((bytes, count))
+        // Loader-owned dequant intermediates queued by
+        // `retire_dequant_source`. Poison mode KEEPS them queued, mirroring
+        // how it keeps the store entries: a still-aliasing consumer reads
+        // 0xA5, and `release` is still the thing that frees them at teardown.
+        let (mut dbytes, mut dcount) = (0usize, 0usize);
+        {
+            let mut q = self
+                .detached
+                .lock()
+                .expect("weight store detached queue poisoned");
+            for d in q.iter() {
+                if poison {
+                    gpu.memset(d.ptr, 0xA5, d.bytes).with_context(|| {
+                        format!("poisoning dequant intermediate from {}", d.from)
+                    })?;
+                } else {
+                    gpu.free(d.ptr)
+                        .with_context(|| format!("freeing dequant intermediate from {}", d.from))?;
+                }
+                dbytes += d.bytes;
+                dcount += 1;
+            }
+            if !poison {
+                q.clear();
+            }
+        }
+        if dcount > 0 {
+            tracing::info!(
+                "Retired {dcount} dequant intermediates: {:.2} GB {}",
+                dbytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                if poison {
+                    "POISONED (0xA5, kept resident — validation mode)"
+                } else {
+                    "freed"
+                },
+            );
+        }
+        Ok((bytes + dbytes, count + dcount))
     }
 
     /// Record a tensor that was skipped at load, with its on-disk location.
@@ -321,6 +441,7 @@ impl WeightStore {
             deferred: HashMap::new(),
             slabs: Vec::new(),
             retired: Vec::new(),
+            detached: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -566,6 +687,23 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
                 && first_error.is_none()
             {
                 first_error = Some(e.context("freeing weight slab"));
+            }
+        }
+        // Dequant intermediates `free_retired` did not take: either it never
+        // ran, or poison mode deliberately left them resident. They are not
+        // store tensors, so the `weights.drain()` above cannot have freed them
+        // and this is not a double free.
+        let detached = std::mem::take(
+            self.detached
+                .get_mut()
+                .expect("weight store detached queue poisoned"),
+        );
+        for d in detached {
+            if let Err(e) = gpu.free(d.ptr)
+                && first_error.is_none()
+            {
+                first_error =
+                    Some(e.context(format!("freeing dequant intermediate from {}", d.from)));
             }
         }
         match first_error {

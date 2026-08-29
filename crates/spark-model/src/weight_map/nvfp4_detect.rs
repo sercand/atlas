@@ -261,6 +261,25 @@ pub(crate) fn quantized_any(
             .map(|w| w.dtype == WeightDtype::FP8E4M3)
             .unwrap_or(false);
 
+    // Per-key fallback #3 (the mirror of #2): a ModelOpt-layout NVFP4 key
+    // inside a checkpoint that is compressed-tensors overall. This is how the
+    // qwen4_exp MTP head arrives on primitive-ai's mixed build — the
+    // checkpoint ships `mtp.*` experts FUSED BF16, so they are pre-sliced and
+    // pre-quantized offline into `extra_weights.safetensors` (ModelOpt
+    // layout: packed `weight` + per-16 `weight_scale` + scalar
+    // `weight_scale_2`), and that sidecar's layout has nothing to do with how
+    // the 48 main layers happen to be spelled. Without this, `quantized_v2`
+    // looks for a `weight_packed` the sidecar does not have.
+    //
+    // Excluded by construction from stealing a genuine compressed-tensors
+    // key: those carry `weight_packed`, which this requires ABSENT.
+    let has_modelopt_nvfp4 = !has_packed
+        && store.contains(&format!("{prefix}.weight_scale_2"))
+        && store
+            .get(&format!("{prefix}.weight"))
+            .map(|w| w.dtype == WeightDtype::UInt8)
+            .unwrap_or(false);
+
     let effective_variant = if has_only_dense && !matches!(variant, Nvfp4Variant::Bf16Raw) {
         tracing::debug!("{prefix}: no quantization metadata; falling back to runtime BF16→NVFP4");
         Nvfp4Variant::Bf16Raw
@@ -269,6 +288,9 @@ pub(crate) fn quantized_any(
     {
         tracing::debug!("{prefix}: FP8 key in an NVFP4 checkpoint; dequant FP8→BF16→NVFP4");
         Nvfp4Variant::Fp8Dequanted
+    } else if has_modelopt_nvfp4 && variant == Nvfp4Variant::CompressedTensors {
+        tracing::debug!("{prefix}: ModelOpt-layout NVFP4 key in a compressed-tensors checkpoint");
+        Nvfp4Variant::Standard
     } else {
         variant
     };

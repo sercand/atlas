@@ -438,16 +438,31 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     /// held resident while the KV cache goes without.
     ///
     /// Gates: the requant arm must actually have run (env =0), the checkpoint
-    /// must ship these BF16 (variant Standard — on Fp8Dequanted the arm frees
-    /// its own dense expansions and the FP8 originals feed other paths), and
-    /// the BF16-override lever must be off (it installs the out_proj alias as
+    /// must be one whose GDN `.weight` is dead after it, and the
+    /// BF16-override lever must be off (it installs the out_proj alias as
     /// `out_proj_dense`). Validated with ATLAS_POISON_RETIRED_WEIGHTS=1.
+    ///
+    /// TWO variants qualify, for the same reason by different routes:
+    ///   * `Standard` — RadixArk ships these BF16; `load_ssm_qwen35` hands
+    ///     the arm the STORE pointer, which the concat and the quantize only
+    ///     copy from.
+    ///   * `CompressedTensors` — primitive-ai's mixed build ships them FP8
+    ///     E4M3 with a per-channel scale, so `dense_auto` DEQUANTISES into a
+    ///     fresh BF16 buffer and the FP8 original is read exactly once. Same
+    ///     deadness, ~2 GB of it at 36 layers x 3 projections.
+    ///
+    /// `Fp8Dequanted` is still excluded: there the arm frees its own dense
+    /// expansions and the FP8 originals feed other paths.
     fn retirable_weights(&self, store: &WeightStore, config: &ModelConfig) -> Vec<String> {
         let requant_gdn = std::env::var("ATLAS_QWEN4EXP_BF16_GDN").as_deref() == Ok("0");
         let bf16_override =
             std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref() == Some("1");
         let variant = crate::weight_map::detect_nvfp4_variant(store, config);
-        if !requant_gdn || bf16_override || variant != Nvfp4Variant::Standard {
+        let retirable_variant = matches!(
+            variant,
+            Nvfp4Variant::Standard | Nvfp4Variant::CompressedTensors
+        );
+        if !requant_gdn || bf16_override || !retirable_variant {
             return Vec::new();
         }
         let mut names = Vec::new();

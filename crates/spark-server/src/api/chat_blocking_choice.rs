@@ -41,6 +41,18 @@ pub(super) fn build_choice_message(
     let mut msg_refusal: Option<String> = None;
     let mut finish_reason_i = response.finish_reason.clone();
 
+    // ATLAS_DEBUG_IO=1: the raw generation, before tool parsing, think
+    // splitting or content stripping touches it. Unconditional on
+    // `tools_active` — "the model emitted no tool call at all" is exactly
+    // the case you need the raw text for, and that case has tools_active
+    // true but nothing parsed, or the tools-off control run beside it.
+    if crate::debug_io::enabled() {
+        crate::debug_io::dump_output(&format!("choice {choice_idx}, content"), &output_text_i);
+        if let Some(r) = reasoning_content.as_deref() {
+            crate::debug_io::dump_output(&format!("choice {choice_idx}, reasoning"), r);
+        }
+    }
+
     if tools_active {
         if std::env::var("ATLAS_LOG_TOOL_RAW").as_deref() == Ok("1") {
             tracing::info!(

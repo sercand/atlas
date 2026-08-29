@@ -35,6 +35,9 @@ const MAX_WORKERS: usize = 16;
 pub(super) struct FaultJob {
     pub(super) row_id: u64,
     pub(super) slot: u32,
+    /// Which of the cache's backing files `block_off` addresses. Always 0
+    /// for a single-file table.
+    pub(super) file_idx: u16,
     /// 4 KiB-aligned file offset of the row's containing block(s).
     pub(super) block_off: u64,
     /// Row start within the block window.
@@ -55,11 +58,19 @@ unsafe impl Sync for FaultJob {}
 
 fn run_one(
     job: &FaultJob,
-    file: &File,
+    files: &[File],
     scale_file: Option<&File>,
     row_stride: usize,
     bounce: &mut AlignedBlock,
 ) -> Result<()> {
+    let file = files.get(job.file_idx as usize).ok_or_else(|| {
+        anyhow::anyhow!(
+            "NgramRowCache: row {} names file {} of {}",
+            job.row_id,
+            job.file_idx,
+            files.len()
+        )
+    })?;
     atlas_tier::pio::read_exact_at(file, bounce.blocks(job.nblocks), job.block_off)
         .with_context(|| format!("NgramRowCache: read row {}", job.row_id))?;
     // SAFETY: disjoint per-job region inside the live pinned arena.
@@ -88,14 +99,14 @@ fn serial_forced() -> bool {
 /// Fault every job in, serial below [`PARALLEL_MIN`], scoped threads above.
 pub(super) fn fault_all(
     jobs: &[FaultJob],
-    file: &File,
+    files: &[File],
     scale_file: Option<&File>,
     row_stride: usize,
     bounce: &mut AlignedBlock,
 ) -> Result<()> {
     if jobs.len() < PARALLEL_MIN || serial_forced() {
         for job in jobs {
-            run_one(job, file, scale_file, row_stride, bounce)?;
+            run_one(job, files, scale_file, row_stride, bounce)?;
         }
         return Ok(());
     }
@@ -109,7 +120,7 @@ pub(super) fn fault_all(
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(job) = jobs.get(i) else { break };
-                    if let Err(e) = run_one(job, file, scale_file, row_stride, &mut bounce) {
+                    if let Err(e) = run_one(job, files, scale_file, row_stride, &mut bounce) {
                         *first_err.lock().unwrap() = Some(e);
                         break;
                     }

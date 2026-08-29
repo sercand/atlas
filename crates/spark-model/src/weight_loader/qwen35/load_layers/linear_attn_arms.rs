@@ -557,5 +557,32 @@ pub(crate) fn build_linear_attention_nvfp4(
     {
         tracing::debug!("SSM[{lp}] ATLAS_GDN_SLIM: BF16 QKVZ concat retired");
     }
+    // FP8- and packed-NVFP4-on-disk checkpoints: `load_ssm_qwen35` DEQUANTIZED
+    // these three projections into fresh BF16 buffers (a BF16 checkpoint hands
+    // back the store pointer instead, and `retire_dequant_source` leaves that
+    // case alone). Every consumer above has copied out of them by now —
+    // `gpu_concat_rows` into the concat, `quantize_to_nvfp4` into the NVFP4
+    // pair, `bf16_to_fp8` into the native-FP8 prefill copies — so on this arm
+    // they are dead the moment the layer is built. Nothing else can reach
+    // them: they were never in the store, which is exactly why
+    // `retirable_weights()` is structurally blind to them and they used to
+    // stay resident for the life of the process.
+    //
+    // Measured on primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8: in_proj_qkv
+    // 52.4 MB + in_proj_z 31.5 + out_proj 31.5 = 115.4 MB per GDN layer × 36
+    // = 4.15 GB, which read as "attn/GDN arms 202.2 MB/layer" against 89.1 on
+    // the BF16-shipping RadixArk build of the same model.
+    //
+    // conv1d / a_log / dt_bias / norm are NOT retired: at tp=1 the shard
+    // helpers return the source pointer and the layer keeps it.
+    let bf16_out_proj = std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref() == Some("1");
+    let ssm_p = format!("{lp}.linear_attn");
+    store.retire_dequant_source(&format!("{ssm_p}.in_proj_qkv"), ssm35.in_proj_qkv.weight);
+    store.retire_dequant_source(&format!("{ssm_p}.in_proj_z"), ssm35.in_proj_z.weight);
+    if !bf16_out_proj {
+        // Under ATLAS_GDN_BF16_WEIGHTS the same buffer is installed as
+        // `layer.out_proj_dense` above and is the live prefill weight.
+        store.retire_dequant_source(&format!("{ssm_p}.out_proj"), ssm35.out_proj.weight);
+    }
     Ok(Box::new(layer))
 }

@@ -5,6 +5,7 @@
 use super::*;
 
 mod deepseek_v4;
+mod effort_vocabulary;
 use serde_json::json;
 
 mod laguna;

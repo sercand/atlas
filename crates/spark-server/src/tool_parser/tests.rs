@@ -13,6 +13,7 @@ mod group_f;
 mod group_g_parallel;
 mod group_h_salvage;
 mod group_i_poolside_safety;
+mod group_j_named_close;
 mod streaming_frag;
 mod streaming_frag_env;
 mod streaming_leak;

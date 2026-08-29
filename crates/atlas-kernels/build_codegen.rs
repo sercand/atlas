@@ -189,6 +189,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               max_inter_tool_prose: {},\n\
              \x20               max_post_think_content_tokens: {},\n\
              \x20               tscg: {},\n\
+             \x20               native_tool_prompt: {},\n\
              \x20               disable_tool_grammar: {},\n\
              \x20               rollback_resteer: {},\n\
              \x20               rom_head: \"{}\",\n\
@@ -232,6 +233,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_max_inter_tool_prose,
             target.behavior_max_post_think_content_tokens,
             target.behavior_tscg,
+            target.behavior_native_tool_prompt,
             target.behavior_disable_tool_grammar,
             target.behavior_rollback_resteer,
             target.behavior_rom_head,
