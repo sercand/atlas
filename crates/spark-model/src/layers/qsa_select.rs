@@ -12,6 +12,35 @@ use super::{QsaIndexer, QsaSeqState};
 use crate::layers::ops;
 
 impl QsaIndexer {
+    /// Stage-2 kill switch: `ATLAS_QSA_NO_PREFILL_SELECT=1` keeps stage-1
+    /// behavior (dense prefill past the bound; decode still selects).
+    pub(crate) fn s2_disabled() -> bool {
+        static S2_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *S2_OFF
+            .get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
+    }
+
+    /// S2 diagnostic mode (`ATLAS_QSA_S2_DIAG=1`): compares the dense context
+    /// against the selected overwrite, so the dense pass must actually run.
+    pub(crate) fn s2_diag() -> bool {
+        static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *D.get_or_init(|| std::env::var("ATLAS_QSA_S2_DIAG").as_deref() == Ok("1"))
+    }
+
+    /// True when stage-2 selection will overwrite EVERY attention-context row
+    /// of a chunk whose rows all sit at or past the inert bound — the license
+    /// for `prefill/paged.rs` to skip the dense attention pass those rows
+    /// would otherwise burn (O(chunk × depth) per layer, measured +26 ms per
+    /// layer per 1k tokens of depth on 8k chunks — the dominant long-context
+    /// prefill term). The `qsa_keep_dense_prefill` runtime lever (shadowing
+    /// `ATLAS_QSA_KEEP_DENSE_PREFILL=1`) restores the old compute-then-discard
+    /// behavior for A/B.
+    pub(crate) fn s2_replaces_dense() -> bool {
+        !crate::runtime_levers::QSA_KEEP_DENSE_PREFILL.get()
+            && !Self::s2_disabled()
+            && !Self::s2_diag()
+    }
+
     /// Stage 2: per-query prefill selection for ANY prefill chunk. Chunk
     /// rows whose GLOBAL position (`seq_start + row`) is at or past the
     /// inert bound get their ATTENTION CONTEXT rows (pre-gate, pre-o_proj)
@@ -47,16 +76,10 @@ impl QsaIndexer {
         }
         // Kill switch: ATLAS_QSA_NO_PREFILL_SELECT=1 keeps stage-1 behavior
         // (dense prefill past the bound; decode still selects).
-        static S2_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *S2_OFF
-            .get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
-        {
+        if Self::s2_disabled() {
             return Ok(());
         }
-        let diag = {
-            static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *D.get_or_init(|| std::env::var("ATLAS_QSA_S2_DIAG").as_deref() == Ok("1"))
-        };
+        let diag = Self::s2_diag();
         // Diagnostic: park the DENSE context of the LAST row before the
         // overwrite; log cosine(dense, selected) after. Selected attends
         // 2048 of the visible tokens, so a healthy overwrite is close to
@@ -186,21 +209,86 @@ impl QsaIndexer {
                 stream,
             )?;
             let n_blocks_max = (first_pos + rows) / ratio; // last row's complete
-            ops::qsa_score_rows(
-                gpu,
-                self.k_score_rows_k,
-                qpost,
-                st.block_keys,
-                scores,
-                rows as u32,
-                n_blocks_max as u32,
-                first_pos as u32,
-                stride as u32,
-                self.ratio,
-                self.n_heads,
-                self.hd,
-                stream,
-            )?;
+            if crate::runtime_levers::QSA_SCORE_UNTILED.get() {
+                ops::qsa_score_rows(
+                    gpu,
+                    self.k_score_rows_k,
+                    qpost,
+                    st.block_keys,
+                    scores,
+                    rows as u32,
+                    n_blocks_max as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    self.n_heads,
+                    self.hd,
+                    stream,
+                )?;
+            } else {
+                // Same scores, bit for bit; one CTA covers 16 blocks of the row
+                // so the query tile is read once per tile instead of once per
+                // block (that redundancy outweighs key traffic ~8:1).
+                ops::qsa_score_rows_tiled(
+                    gpu,
+                    self.k_score_rows_tiled_k,
+                    qpost,
+                    st.block_keys,
+                    scores,
+                    rows as u32,
+                    n_blocks_max as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    self.n_heads,
+                    self.hd,
+                    stream,
+                )?;
+            }
+
+            if !crate::runtime_levers::QSA_HOST_TOPK.get() {
+                // On-device top-k straight into `lists`. Emits the same block
+                // ids in the same order as the host path below (see
+                // `qsa_topk_rows`), so this is a pure who-computes-it swap —
+                // but it deletes the sync D2H of the whole score matrix
+                // (rows x stride f32, 67 MB per layer at 16k depth) and the
+                // stream drain that comes with it, which is what made
+                // selection ~80% of attention-layer prefill time.
+                ops::qsa_topk_rows(
+                    gpu,
+                    self.k_topk_rows_k,
+                    scores,
+                    lists,
+                    rows as u32,
+                    first_pos as u32,
+                    stride as u32,
+                    self.ratio,
+                    topk as u32,
+                    stream,
+                )?;
+                ops::qsa_prefill_attn(
+                    gpu,
+                    self.k_prefill_attn_k,
+                    q_roped.offset(first_row * q_row * 2),
+                    k_pool,
+                    v_pool,
+                    block_table_dev,
+                    lists,
+                    attn_ctx.offset(first_row * q_row * 2),
+                    rows as u32,
+                    first_pos as u32,
+                    topk as u32,
+                    self.ratio,
+                    block_size,
+                    nq,
+                    self.nkv_attn,
+                    self.hd_attn,
+                    inv_sqrt_d,
+                    stream,
+                )?;
+                slab += rows;
+                continue;
+            }
 
             // Host top-k per row (sync D2H drains the stream first). Torch
             // tie-break: larger score first, lower index on ties — via the

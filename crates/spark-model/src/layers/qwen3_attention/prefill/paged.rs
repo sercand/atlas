@@ -629,33 +629,78 @@ impl Qwen3AttentionLayer {
                 self.prefill_attention_paged_attn_batched(kv_cache, ctx, &args)?;
             }
         } else {
-            // Single-stream path requires meta_for_single (validated above).
-            let meta = meta_for_single
-                .expect("single-stream mode: meta_for_single guaranteed by validation above");
-            let mut args = super::paged_attn::PagedAttnArgs {
-                q_contiguous,
-                k_contiguous,
-                v_contiguous,
-                attn_out,
-                n,
-                seq_len_start,
-                num_tokens,
-                nq,
-                nkv,
-                hd,
-                bs,
-                bf16,
-                inv_sqrt_d,
-                kv_len,
-                meta: &meta,
-                block_table,
-                disk_block_ids,
-                disk_last_offloaded_per_layer,
-                stream,
+            // ── 8-pre. QSA stage-2 fully-selective fast path ──
+            // A chunk whose EVERY row sits at or past the indexer's inert
+            // bound gets its whole attention context overwritten by
+            // `prefill_select` (section 8b) — the dense pass here would be
+            // computed and then 100% discarded. That waste is O(chunk×depth)
+            // PER LAYER and was the dominant long-context prefill term
+            // (measured +26 ms/layer per 1k tokens of depth on 8k chunks;
+            // ~40 s/chunk at 115k). Skip it when — and only when — the
+            // selection that replaces it will actually run and cover every
+            // row: stage-2 on, no diag compare, single-stream, plain BF16
+            // KV (no WHT bases), and no disk-offloaded blocks (the dense
+            // HSS path is the only reader that restores those).
+            // Chunk 0 and any chunk straddling the bound keep the dense
+            // pass for their sub-bound rows.
+            let qsa_covers_chunk = self.qsa.as_ref().is_some_and(|q| {
+                seq_len_start >= q.inert_bound()
+                    && crate::layers::qsa::QsaIndexer::s2_replaces_dense()
+                    && !k_is_turbo
+                    && !v_is_turbo
+                    && disk_block_ids.is_empty()
+            });
+            let t_dense = if ctx.profile {
+                ctx.gpu.synchronize(stream)?;
+                Some(std::time::Instant::now())
+            } else {
+                None
             };
-            match self.prefill_attention_paged_attn(kv_cache, ctx, &mut args)? {
-                super::paged_attn::PagedAttnOutcome::EarlyReturn(out) => return Ok(out),
-                super::paged_attn::PagedAttnOutcome::Continue => {}
+            if qsa_covers_chunk {
+                if ctx.stats.once("log:qsa_dense_prefill_skip") {
+                    tracing::info!(
+                        "QSA stage-2: skipping dense prefill attention for fully-selective \
+                         chunks (seq_start {seq_len_start} >= bound; \
+                         ATLAS_QSA_KEEP_DENSE_PREFILL=1 restores it)"
+                    );
+                }
+            } else {
+                // Single-stream path requires meta_for_single (validated above).
+                let meta = meta_for_single
+                    .expect("single-stream mode: meta_for_single guaranteed by validation above");
+                let mut args = super::paged_attn::PagedAttnArgs {
+                    q_contiguous,
+                    k_contiguous,
+                    v_contiguous,
+                    attn_out,
+                    n,
+                    seq_len_start,
+                    num_tokens,
+                    nq,
+                    nkv,
+                    hd,
+                    bs,
+                    bf16,
+                    inv_sqrt_d,
+                    kv_len,
+                    meta: &meta,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    stream,
+                };
+                match self.prefill_attention_paged_attn(kv_cache, ctx, &mut args)? {
+                    super::paged_attn::PagedAttnOutcome::EarlyReturn(out) => return Ok(out),
+                    super::paged_attn::PagedAttnOutcome::Continue => {}
+                }
+            }
+            if let Some(t) = t_dense {
+                ctx.gpu.synchronize(stream)?;
+                tracing::info!(
+                    "  ATTN prefill [dense_attn] N={num_tokens} depth={seq_len_start} \
+                     skipped={qsa_covers_chunk}: {}µs",
+                    t.elapsed().as_micros()
+                );
             }
         }
 
@@ -701,6 +746,12 @@ impl Qwen3AttentionLayer {
                 "QSA prefill selection is single-stream (batched paged \
                  prefill is refused upstream for this model)"
             );
+            let t_sel = if ctx.profile {
+                ctx.gpu.synchronize(stream)?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let qsa_st =
                 crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
             qsa.prefill_select(
@@ -720,6 +771,13 @@ impl Qwen3AttentionLayer {
                 ctx.gpu,
                 stream,
             )?;
+            if let Some(t) = t_sel {
+                ctx.gpu.synchronize(stream)?;
+                tracing::info!(
+                    "  ATTN prefill [qsa_select] N={num_tokens} depth={seq_len_start}: {}µs",
+                    t.elapsed().as_micros()
+                );
+            }
         }
 
         // ── 9. Sigmoid gate × attn_out (gated only) — single batched kernel ──

@@ -73,6 +73,126 @@ mod topk_equivalence_tests {
     }
 }
 
+/// The device `qsa_topk_rows` must produce the SAME list in the SAME order as
+/// `host_topk_blocks` — the set feeds attention and the order feeds an online
+/// softmax, so a divergence in either is a numerics change wearing a speedup's
+/// clothes. The kernel cannot run in the default sweep (no GPU), so what is
+/// pinned here is its ALGORITHM: the claim that a descending sort of the
+/// 64-bit key `(float_bits(score) << 32) | !index` reproduces the host
+/// comparator, and that the 8-bit-digit radix select with the
+/// bucket-consumed-whole early exit lands on a threshold that admits exactly
+/// `k` keys. A bug in either would otherwise only ever show up as drifted
+/// logprobs on a live box.
+#[cfg(test)]
+mod device_topk_model_tests {
+    use super::host_topk_blocks;
+
+    fn key(s: f32, i: u32) -> u64 {
+        ((s.to_bits() as u64) << 32) | (!i) as u64
+    }
+
+    /// Line-for-line model of `qsa_topk_rows` in `qsa_indexer.cu`.
+    fn device_model(scores: &[f32], k: usize) -> Vec<u32> {
+        let n = scores.len();
+        let mut prefix = 0u64;
+        let mut mask = 0u64;
+        let mut remaining = k as u32;
+        let mut shift: i32 = 56;
+        while shift >= 0 {
+            let mut hist = [0u32; 256];
+            for (b, &s) in scores.iter().enumerate() {
+                let kk = key(s, b as u32);
+                if kk & mask == prefix {
+                    hist[((kk >> shift) & 0xFF) as usize] += 1;
+                }
+            }
+            let mut rem = remaining;
+            let mut d = 255usize;
+            while d > 0 {
+                if hist[d] >= rem {
+                    break;
+                }
+                rem -= hist[d];
+                d -= 1;
+            }
+            prefix |= (d as u64) << shift;
+            mask |= 0xFFu64 << shift;
+            remaining = rem;
+            if hist[d] == rem {
+                break;
+            }
+            shift -= 8;
+        }
+        let mut got: Vec<u64> = (0..n)
+            .map(|b| key(scores[b], b as u32))
+            .filter(|&kk| kk >= prefix)
+            .collect();
+        assert_eq!(got.len(), k, "threshold admitted {} keys, want {k}", got.len());
+        got.sort_unstable();
+        got.reverse();
+        got.iter().map(|kk| !(*kk as u32)).collect()
+    }
+
+    #[test]
+    fn device_model_matches_host_topk() {
+        // Same deterministic LCG as the sibling test. The 1/8 quantization is
+        // the point: it forces long runs of identical scores across the k
+        // boundary, which is the only thing that drives the select past the
+        // score bits and into the index tie-break digits.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = |steps: f32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32 * steps).floor() / steps
+        };
+        for &(n, k) in &[
+            (512usize, 512usize),
+            (513, 512),
+            (4096, 512),
+            (40960, 512),
+            (1024, 256),
+        ] {
+            // `steps = 4.0` collapses 40k scores onto a handful of distinct
+            // values, so the k-th and (k+1)-th almost always tie on score.
+            for &steps in &[4.0f32, 4096.0] {
+                let scores: Vec<f32> = (0..n).map(|_| next(steps)).collect();
+                assert_eq!(
+                    device_model(&scores, k),
+                    host_topk_blocks(&scores, k),
+                    "n={n} k={k} steps={steps}"
+                );
+            }
+        }
+    }
+
+    /// Every score is identical, so the selection is decided purely by the
+    /// index tie-break — the case the early exit must not short-circuit wrong.
+    #[test]
+    fn all_scores_equal_selects_lowest_indices_in_order() {
+        let scores = vec![1.5f32; 4096];
+        let got = device_model(&scores, 512);
+        assert_eq!(got, (0u32..512).collect::<Vec<_>>());
+        assert_eq!(got, host_topk_blocks(&scores, 512));
+    }
+
+    /// Zero is a legitimate score (all heads' dots clipped by relu) and its
+    /// float bits are 0, the bottom of the key space — the select must still
+    /// place it correctly rather than treating it as absent.
+    #[test]
+    fn zero_scores_rank_below_positives_and_still_tie_break_by_index() {
+        let mut scores = vec![0.0f32; 2048];
+        for (i, s) in scores.iter_mut().enumerate().take(100) {
+            *s = (100 - i) as f32;
+        }
+        let got = device_model(&scores, 512);
+        assert_eq!(got, host_topk_blocks(&scores, 512));
+        assert_eq!(&got[..3], &[0, 1, 2]);
+        // Positions 100.. are all zero, so they fill the tail by index order.
+        assert_eq!(got[100], 100);
+    }
+}
+
 /// One decode step's selection: contiguous NHD `k/v` scratch + identity table.
 pub struct QsaSelection {
     pub k_scratch: DevicePtr,
@@ -123,6 +243,8 @@ pub struct QsaIndexer {
     k_gather_k: KernelHandle,
     k_qprep_rows_k: KernelHandle,
     k_score_rows_k: KernelHandle,
+    k_score_rows_tiled_k: KernelHandle,
+    k_topk_rows_k: KernelHandle,
     k_prefill_attn_k: KernelHandle,
 
     qk_scratch: DevicePtr, // [INGEST_SLAB, (n_heads+1)*hd] BF16
@@ -222,6 +344,8 @@ impl QsaIndexer {
             k_gather_k: gpu.kernel("qsa_indexer", "qsa_gather")?,
             k_qprep_rows_k: gpu.kernel("qsa_indexer", "qsa_qprep_rows")?,
             k_score_rows_k: gpu.kernel("qsa_indexer", "qsa_score_rows")?,
+            k_score_rows_tiled_k: gpu.kernel("qsa_indexer", "qsa_score_rows_tiled")?,
+            k_topk_rows_k: gpu.kernel("qsa_indexer", "qsa_topk_rows")?,
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
             qk_scratch: gpu.alloc(INGEST_SLAB * qk_width * 2)?,
             q_post: gpu.alloc(n_heads * hd * 4)?,
