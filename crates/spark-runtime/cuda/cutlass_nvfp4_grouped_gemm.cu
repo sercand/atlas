@@ -283,6 +283,87 @@ __global__ void pack_weight_sfb_group(
   cutlass_scales[layout_sfb(col, group * 16, 0)] = *reinterpret_cast<unsigned char*>(&sf);
 }
 
+// ─── batched (all-experts-in-one-launch) SFB swizzle ───
+// Same per-element mapping as `pack_weight_sfb_group`, over every expert of one
+// projection at once. Exists so the swizzle can run PER PREFILL CALL instead of
+// once at load: the resident per-layer SFB tables cost 157 MB/layer x 48 layers
+// = 7.6 GB of the KV pool on the 512-expert 125B, and re-deriving them into a
+// shared one-layer scratch is a pure memory/compute trade. Per-expert launches
+// would not pay for themselves (1536 launches/layer, ~30 ms of pure eager
+// launch overhead measured at load) — hence the expert index on grid.y.
+//
+// `in_ptrs`/`out_ptrs` are DEVICE arrays of device pointers, one per expert; a
+// null entry in either is a skipped (remote/placeholder) expert.
+// Staged through shared memory in (col, group) tiles so BOTH sides coalesce.
+// The source is contiguous along one axis and the SFB atom along the other, so
+// a single thread->element map necessarily scatters one of them into 1-byte
+// transactions; the tile lets the read loop walk the source's contiguous axis
+// and the write loop walk the atom's. Which (col, group) pair lands at which
+// output address is untouched, so the bytes produced are identical to the
+// per-expert entry's.
+#define QSA_SFB_TILE_N 32
+#define QSA_SFB_TILE_G 32
+
+template <class LayoutSFB_t>
+__global__ void pack_weight_sfb_batched(
+    const unsigned char* const* __restrict__ in_ptrs,
+    unsigned char* const* __restrict__ out_ptrs,
+    int n,
+    int k,
+    int src_n_major,
+    int tiles_g,
+    LayoutSFB_t layout_sfb) {
+  const int e = blockIdx.y;
+  const unsigned char* atlas_scales = in_ptrs[e];
+  unsigned char* cutlass_scales = out_ptrs[e];
+  if (atlas_scales == nullptr || cutlass_scales == nullptr) {
+    return;
+  }
+  const int groups = k / 16;
+  const int col0 = (blockIdx.x / tiles_g) * QSA_SFB_TILE_N;
+  const int g0 = (blockIdx.x % tiles_g) * QSA_SFB_TILE_G;
+
+  __shared__ unsigned char tile[QSA_SFB_TILE_N * QSA_SFB_TILE_G];
+  const int tile_elems = QSA_SFB_TILE_N * QSA_SFB_TILE_G;
+
+  // Read along whichever axis the SOURCE stores contiguously.
+  for (int i = threadIdx.x; i < tile_elems; i += blockDim.x) {
+    int lc, lg;
+    if (src_n_major) {
+      lc = i / QSA_SFB_TILE_G;  // consecutive threads walk `group`
+      lg = i % QSA_SFB_TILE_G;
+    } else {
+      lg = i / QSA_SFB_TILE_N;  // consecutive threads walk `col`
+      lc = i % QSA_SFB_TILE_N;
+    }
+    const int col = col0 + lc;
+    const int group = g0 + lg;
+    unsigned char v = 0;
+    if (col < n && group < groups) {
+      v = src_n_major ? atlas_scales[(unsigned long long)col * groups + group]
+                      : atlas_scales[(unsigned long long)group * n + col];
+    }
+    tile[lc * QSA_SFB_TILE_G + lg] = v;
+  }
+  __syncthreads();
+
+  // Write along `col`: the SFB atom stores 32 consecutive n contiguously.
+  for (int i = threadIdx.x; i < tile_elems; i += blockDim.x) {
+    const int lc = i % QSA_SFB_TILE_N;
+    const int lg = i / QSA_SFB_TILE_N;
+    const int col = col0 + lc;
+    const int group = g0 + lg;
+    if (col >= n || group >= groups) {
+      continue;
+    }
+    __nv_fp8_e4m3 in;
+    *reinterpret_cast<unsigned char*>(&in) = tile[lc * QSA_SFB_TILE_G + lg];
+    float scale = static_cast<float>(in);
+    cutlass::float_ue4m3_t sf(scale);
+    cutlass_scales[layout_sfb(col, group * 16, 0)] = *reinterpret_cast<unsigned char*>(&sf);
+  }
+}
+
 #endif  // arch guard for device code
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -318,6 +399,54 @@ extern "C" int atlas_cutlass_pack_weight_sfb(
 #else
   (void)scale_in;
   (void)scale_out;
+  (void)n;
+  (void)k;
+  (void)src_n_major;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Batched SFB swizzle — every expert of one projection in ONE launch. Same
+// output bytes as calling `atlas_cutlass_pack_weight_sfb` per expert; this
+// exists purely so the swizzle is cheap enough to redo per prefill call (see
+// the kernel comment). `in_ptrs`/`out_ptrs` are DEVICE arrays of `num_experts`
+// device pointers; a null entry on either side skips that expert.
+// ════════════════════════════════════════════════════════════════════════════
+extern "C" int atlas_cutlass_pack_weight_sfb_batched(
+    const void* in_ptrs,   // device [num_experts] of const unsigned char*
+    const void* out_ptrs,  // device [num_experts] of unsigned char*
+    int num_experts,
+    int n,
+    int k,
+    int src_n_major,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0) {
+    return -1;
+  }
+  auto layout_sfb =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(1, n, k, 1));
+  const int groups = k / 16;
+  const int tiles_n = (n + QSA_SFB_TILE_N - 1) / QSA_SFB_TILE_N;
+  const int tiles_g = (groups + QSA_SFB_TILE_G - 1) / QSA_SFB_TILE_G;
+  dim3 block(256);
+  dim3 grid((unsigned)(tiles_n * tiles_g), (unsigned)num_experts);
+  pack_weight_sfb_batched<<<grid, block, 0, stream>>>(
+      static_cast<const unsigned char* const*>(in_ptrs),
+      static_cast<unsigned char* const*>(out_ptrs),
+      n,
+      k,
+      src_n_major,
+      tiles_g,
+      layout_sfb);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? 0 : -static_cast<int>(err);
+#else
+  (void)in_ptrs;
+  (void)out_ptrs;
+  (void)num_experts;
   (void)n;
   (void)k;
   (void)src_n_major;

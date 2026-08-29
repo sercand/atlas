@@ -259,14 +259,10 @@ pub struct MoeLayer {
     /// `moe_fused_gate_up_t_k64_m128 == KernelHandle(0)` and dispatch
     /// falls through to the M=64 path even when the env var is set.
     nvfp4_gate_up_m128: bool,
-    /// `ATLAS_HOLO_MOE_GATEUP_FP4=1` opts the prefill fused gate_up onto the
-    /// block-scaled FP4 kernel. Reads the SHARED FAST_MOE=full `gate_ptrs_t`/
-    /// `up_ptrs_t` `[K/2,N]` tables (no extra MoE memory); dispatch also requires
-    /// those tables present + the FP4 kernel handle != 0.
-    gateup_fp4: bool,
-    /// `ATLAS_HOLO_MOE_DOWN_FP4=1` — same, for the prefill down projection over
-    /// the shared `down_ptrs_t` table.
-    down_fp4: bool,
+    // The prefill FP4-MMA gate_up/down opt-ins (`ATLAS_HOLO_MOE_GATEUP_FP4`,
+    // `ATLAS_HOLO_MOE_DOWN_FP4`) moved to `crate::runtime_levers` so they can
+    // be flipped over the admin API for A/Bs; dispatch still requires the
+    // shared `*_ptrs_t` tables present + the FP4 kernel handle != 0.
     /// `ATLAS_HYBRID_MOE_LAYOUT=1` opts in to the hybrid-layout path:
     /// keep BOTH original `[N, K/2]` weights (for decode + MTP verify) AND
     /// transposed `[K/2, N]` weights (for prefill). Doubles MoE-weight

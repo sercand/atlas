@@ -10,14 +10,13 @@
 
 use super::*;
 
-/// Whether the single-launch CUTLASS grouped NVFP4 gate_up path is enabled
-/// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS=1`). Off by default; falls back to the
-/// hand-rolled fused FP4/FP8 grouped kernels when unset.
+/// Whether the single-launch CUTLASS grouped NVFP4 gate_up path is enabled —
+/// the `moe_grouped_cutlass` runtime lever, which shadows
+/// `ATLAS_HOLO_MOE_GROUPED_CUTLASS`. Off by default; falls back to the
+/// hand-rolled fused/grouped kernels when unset. Only effective when the
+/// load-time SFB tables exist (`cutlass_grouped_host`).
 fn grouped_cutlass_gate_up_enabled() -> bool {
-    std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
-        .ok()
-        .as_deref()
-        == Some("1")
+    crate::runtime_levers::MOE_GROUPED_CUTLASS.get()
 }
 
 impl MoeLayer {
@@ -163,6 +162,17 @@ impl MoeLayer {
                 // token-major expert_input + sorted_token_ids directly, no separate
                 // permute pass. Writes C_gate/C_up in the sorted layout so
                 // silu+down+unpermute are unchanged.
+                //
+                // Under ATLAS_CUTLASS_SFB_LAZY the SFB scale tables are not
+                // resident — they live in one scratch shared by every layer and
+                // must be re-derived here, on THIS stream, before either grouped
+                // GEMM reads them. Covers the down projection too: it runs later
+                // in this same layer with nothing in between that touches the
+                // scratch. No-op when the tables are resident.
+                self.cutlass_grouped_host
+                    .as_ref()
+                    .expect("checked above")
+                    .refresh_lazy_sfb(stream)?;
                 cutlass_eoff = Some(ops::moe_grouped_gate_up_cutlass(
                     ctx.gpu,
                     self.cutlass_grouped_host.as_ref().expect("checked above"),
@@ -205,7 +215,9 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
+                } else if crate::runtime_levers::MOE_GATEUP_FP4.get()
+                    && self.moe_fused_gate_up_t_k64_fp4.0 != 0
+                {
                     // ── FUSED FP4 gate_up (ATLAS_HOLO_MOE_GATEUP_FP4) ──
                     // Block-scaled FP4 over the SHARED FAST_MOE=full [K/2,N] tables
                     // (gate_ptrs_t/up_ptrs_t — the SAME bytes the FP8 fused path
@@ -373,7 +385,7 @@ impl MoeLayer {
                     .cutlass_grouped_host
                     .as_ref()
                     .and_then(|t| t.down.as_ref())
-                && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
+                && crate::runtime_levers::MOE_GROUPED_DOWN.get()
             {
                 // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
                 //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──
@@ -417,7 +429,9 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
+                } else if crate::runtime_levers::MOE_DOWN_FP4.get()
+                    && self.moe_down_t_k64_fp4.0 != 0
+                {
                     // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) over the SHARED down_ptrs_t
                     // [K/2,N] table (real per-expert scale2; coalesced K-major load +
                     // on-chip DN4_TRANSPOSE). Same sorted layout + null
@@ -440,8 +454,7 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else {
-                    let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
-                        == Some("1")
+                    let fp8_down = crate::runtime_levers::MOE_FP8_DOWN.get()
                         && self.moe_fp8_grouped_gemm_t.0 != 0
                         && self.bf16_to_fp8_k.0 != 0;
                     if fp8_down {

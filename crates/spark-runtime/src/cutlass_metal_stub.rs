@@ -93,6 +93,19 @@ pub fn pack_weight_sfb(
     unreachable!("cutlass::pack_weight_sfb is cuda-only (not built for metal)")
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn pack_weight_sfb_batched(
+    _in_ptrs: u64,
+    _out_ptrs: u64,
+    _num_experts: u32,
+    _n: u32,
+    _k: u32,
+    _src_n_major: bool,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::pack_weight_sfb_batched is cuda-only (not built for metal)")
+}
+
 pub fn transpose_nvfp4_packed_kton(
     _src_packed_t: u64,
     _dst_packed: u64,

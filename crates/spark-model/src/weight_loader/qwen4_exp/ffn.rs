@@ -61,6 +61,29 @@ pub(super) fn build_moe(
         stream,
     )?);
 
-    let moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+
+    // CUTLASS grouped NVFP4 prefill (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1):
+    // qwen4_exp never builds the Atlas-transposed expert tables (they would
+    // double ~68 GB of expert weight on this box), which leaves prefill on the
+    // non-transposed BF16-MMA grouped kernel — measured 6.7 TFLOPS, 46% of
+    // every chunk on the 125B. The CUTLASS grouped collective reads the
+    // checkpoint-native [N,K/2] tables directly, so its only cost is the
+    // per-expert swizzled SFB scale copies built here (size-capped inside
+    // build_cutlass_grouped_sfb — over the cap it degrades to a no-op, never
+    // an OOM). Dispatch is per-call via the moe_grouped_cutlass /
+    // moe_grouped_down runtime levers.
+    if std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS").ok().as_deref() == Some("1") {
+        // Degrade, never fail the boot: without the tables the dispatch just
+        // keeps the non-CUTLASS grouped kernels (a no-CUTLASS build bails
+        // here on the first pack call).
+        if let Err(e) = moe.build_cutlass_grouped_sfb(gpu, config, stream) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("qwen4_exp: CUTLASS grouped SFB unavailable at {lp}: {e}");
+            }
+        }
+    }
     Ok(FfnComponent::Moe(moe))
 }

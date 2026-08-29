@@ -52,6 +52,55 @@ pub fn pack_weight_sfb(
     }
 }
 
+/// [`pack_weight_sfb`] for every expert of one projection in a single launch.
+///
+/// `in_ptrs`/`out_ptrs` are DEVICE arrays of `num_experts` device pointers (a
+/// null entry on either side skips that expert); `n`/`k`/`src_n_major` are the
+/// same for all experts, which is what makes one launch legal. Output bytes are
+/// identical to the per-expert loop.
+///
+/// This exists so the SFB tables can be re-derived per prefill call instead of
+/// living resident: 512 experts x 3 projections x 48 layers is 7.6 GB of scale
+/// swizzle that otherwise comes straight out of the KV pool. The per-expert
+/// entry is kept for the resident (load-time) path and as the equivalence
+/// reference.
+pub fn pack_weight_sfb_batched(
+    in_ptrs: u64,
+    out_ptrs: u64,
+    num_experts: u32,
+    n: u32,
+    k: u32,
+    src_n_major: bool,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let status = unsafe {
+            atlas_cutlass_pack_weight_sfb_batched(
+                in_ptrs as *const c_void,
+                out_ptrs as *const c_void,
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                i32::from(src_n_major),
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "CUTLASS batched weight SFB pack failed: status {status} for \
+                 {num_experts}x{n}x{k}"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (in_ptrs, out_ptrs, num_experts, n, k, src_n_major, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 /// Pack BF16 row-major weight `[N,K]` into the native CUTLASS NVFP4 layout:
 /// packed `[N,K/2]` (N-major, K-contiguous — NOT the Atlas transposed `[K/2,N]`)
 /// and E4M3 scales `[K/16,N]`. `weight_scale_2` is assumed to be 1.0 by the

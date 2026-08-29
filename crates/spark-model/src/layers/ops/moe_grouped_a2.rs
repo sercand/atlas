@@ -50,6 +50,58 @@ pub struct MoeCutlassHostTables {
     /// `None` when the checkpoint has no down-projection scale table — the
     /// grouped down branch is unreachable in that case.
     pub down: Option<MoeCutlassDownHostTables>,
+    /// `Some` when the SFB tables are NOT resident: the `*_sfb` pointer vectors
+    /// address a SHARED one-layer scratch that every MoE layer reuses, so they
+    /// hold this layer's bytes only after [`Self::refresh_lazy_sfb`] has run on
+    /// the dispatch stream. See [`MoeCutlassLazySfb`].
+    pub lazy: Option<MoeCutlassLazySfb>,
+}
+
+/// Everything needed to re-derive one layer's SFB scale tables into the shared
+/// scratch, for the lazy (`ATLAS_CUTLASS_SFB_LAZY=1`) path.
+///
+/// Resident SFB costs `num_experts x 3 projections x sfb_len` PER LAYER —
+/// 157 MB/layer, 7.6 GB across 48 layers on the 512-expert 125B, taken straight
+/// out of the KV pool (measured: KV 12.3 GB -> 4.6 GB when the tables went
+/// resident). The swizzle itself is a cheap permutation of scale bytes that
+/// already live on the device for the decode kernels, so redoing it per prefill
+/// call into one shared buffer trades a little prefill time for all of that
+/// memory. Prefill runs layers strictly sequentially on one stream, which is
+/// what makes a single shared scratch safe.
+pub struct MoeCutlassLazySfb {
+    pub num_experts: u32,
+    /// Source scale layout: `true` = checkpoint-native `[N,K/16]`, `false` =
+    /// Atlas-transposed `[K/16,N]`. Same for all three projections.
+    pub src_n_major: bool,
+    /// One entry per projection, in the order gate, up, down: the DEVICE array
+    /// of per-expert source scale pointers, the DEVICE array of per-expert
+    /// destination pointers into the shared scratch, and the projection's
+    /// `(n, k)`.
+    pub projections: Vec<(DevicePtr, DevicePtr, u32, u32)>,
+}
+
+impl MoeCutlassHostTables {
+    /// Re-derive this layer's SFB tables into the shared scratch. No-op unless
+    /// the tables are lazy. Must be issued on the SAME stream as the grouped
+    /// GEMMs that read them — stream order is the only thing keeping the next
+    /// layer's swizzle from overwriting bytes this layer is still reading.
+    pub fn refresh_lazy_sfb(&self, stream: u64) -> Result<()> {
+        let Some(l) = self.lazy.as_ref() else {
+            return Ok(());
+        };
+        for &(src, dst, n, k) in &l.projections {
+            spark_runtime::cutlass::pack_weight_sfb_batched(
+                src.0,
+                dst.0,
+                l.num_experts,
+                n,
+                k,
+                l.src_n_major,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Down-projection third of [`MoeCutlassHostTables`].
@@ -113,6 +165,7 @@ impl MoeCutlassHostTables {
                 }),
                 None => None,
             },
+            lazy: None,
         })
     }
 }

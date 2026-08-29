@@ -4,6 +4,59 @@
 
 use super::*;
 
+/// `ATLAS_CUTLASS_SFB_LAZY=1` — keep ONE shared SFB scratch for the whole model
+/// and re-swizzle it per prefill call, instead of one resident table per layer.
+/// Load-time only (the tables' shape is decided at construction), so this is an
+/// env var rather than a runtime lever.
+fn lazy_sfb_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_CUTLASS_SFB_LAZY").ok().as_deref() == Some("1"))
+}
+
+/// Shape of the shared SFB scratch. Every MoE layer of a given model produces
+/// the same three projection shapes, so one scratch serves all of them — and a
+/// layer whose dims disagree must NOT silently share it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SfbScratchDims {
+    num: usize,
+    len_gate_up: usize,
+    /// 0 when the checkpoint has no down scale table.
+    len_down: usize,
+}
+
+impl SfbScratchDims {
+    fn bytes(&self) -> usize {
+        self.num * (2 * self.len_gate_up + self.len_down)
+    }
+}
+
+/// The process-global SFB scratch, allocated by the first layer that asks and
+/// shared by every layer after it.
+///
+/// STATIC, DELIBERATELY, and never freed: it is sized from the model's MoE
+/// shapes and must exist BEFORE the KV pool is sized, which is the whole point
+/// of the lazy path — a late allocation would come out of the inference
+/// headroom instead of being visible to KV sizing. A model swap re-enters with
+/// the same dims (or is refused below and falls back to resident tables).
+fn sfb_scratch(gpu: &dyn GpuBackend, dims: SfbScratchDims) -> Result<u64> {
+    static SCRATCH: std::sync::OnceLock<(u64, SfbScratchDims)> = std::sync::OnceLock::new();
+    if let Some((base, have)) = SCRATCH.get() {
+        if *have != dims {
+            anyhow::bail!("SFB scratch already sized for {have:?}, this layer needs {dims:?}");
+        }
+        return Ok(*base);
+    }
+    let base = gpu.alloc(dims.bytes())?;
+    // A racing layer that lost the set() would leak `base`; construction is
+    // single-threaded, but take the winner's pointer regardless.
+    let _ = SCRATCH.set((base.0, dims));
+    let (won, _) = SCRATCH.get().expect("just set");
+    if *won != base.0 {
+        gpu.free(base)?;
+    }
+    Ok(*won)
+}
+
 impl MoeLayer {
     /// Transpose MoE weights for coalesced prefill GEMM reads.
     ///
@@ -422,6 +475,39 @@ impl MoeLayer {
         let num = self.weights.experts.len();
         // Swizzled SFB atom size (bytes): round_up(N,128) * round_up(K/16,4).
         let sfb_len = |n: usize, k: usize| n.div_ceil(128) * 128 * (k / 16).div_ceil(4) * 4;
+        // Boot-safety cap: SFB cost scales with experts × layers and on a
+        // 512-expert × 48-layer model the projection is GBs — an OOM here
+        // crash-loops the serve under Restart=always. Track the process-wide
+        // running total and refuse (loudly, tables stay None, dispatch falls
+        // through to the non-CUTLASS kernels) once the cap is crossed.
+        // ATLAS_CUTLASS_SFB_MAX_GB overrides the 12 GB default.
+        // Not applicable in lazy mode: there the whole model shares ONE
+        // scratch, so the cumulative-cost runaway this cap guards cannot happen.
+        static SFB_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let this_layer =
+            (num * (2 * sfb_len(inter, h) + sfb_len(h, inter))) as u64;
+        let cap_gb: u64 = std::env::var("ATLAS_CUTLASS_SFB_MAX_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let would_be = if lazy_sfb_enabled() {
+            0
+        } else {
+            SFB_TOTAL.fetch_add(this_layer, std::sync::atomic::Ordering::Relaxed) + this_layer
+        };
+        if would_be > cap_gb * (1 << 30) {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "CUTLASS grouped SFB: cumulative cost would reach {:.1} GB (> cap {cap_gb} GB, \
+                     ATLAS_CUTLASS_SFB_MAX_GB) at {:.1} MB/layer — refusing to build further \
+                     layers; those layers keep the non-CUTLASS grouped kernels",
+                    would_be as f64 / 1e9,
+                    this_layer as f64 / 1e6,
+                );
+            }
+            return Ok(());
+        }
         // Prefer the Atlas-transposed [K/16,N] scales when they exist. Without
         // them (a checkpoint served straight from its native tables, e.g.
         // Laguna with the unified transpose disabled) fall back to the
@@ -442,30 +528,152 @@ impl MoeLayer {
             None => None,
         };
         let mut owned: Vec<DevicePtr> = Vec::new();
+
+        // ── Shared-scratch (lazy) mode ──────────────────────────────────────
+        // Resident SFB is 157 MB/layer here; across 48 layers that is 7.6 GB of
+        // the KV pool (measured on this box: KV 12.3 GB / 539k tokens with the
+        // tables off, 4.6 GB / 201k with them on). The swizzle only permutes
+        // scale bytes that are already resident for the decode kernels, so
+        // pointing every layer at ONE scratch and re-deriving it per prefill
+        // call buys all of that back. Legal because prefill walks layers
+        // strictly in order on a single stream.
+        if lazy_sfb_enabled() {
+            let dims = SfbScratchDims {
+                num,
+                len_gate_up: sfb_len(inter, h),
+                len_down: down_scale_dev.map_or(0, |_| sfb_len(h, inter)),
+            };
+            match sfb_scratch(gpu, dims) {
+                Ok(base) => {
+                    // Offsets are dims-derived, so every layer lays out the
+                    // scratch identically: [gate | up | down], expert e of a
+                    // projection at `e * len`.
+                    let mut cursor = base;
+                    let mut projections = Vec::with_capacity(3);
+                    let mut host_tables = Vec::with_capacity(3);
+                    for (scale_dev, len) in [
+                        (Some(gate_scale_dev), dims.len_gate_up),
+                        (Some(up_scale_dev), dims.len_gate_up),
+                        (down_scale_dev, dims.len_down),
+                    ] {
+                        let Some(scale_dev) = scale_dev else {
+                            host_tables.push(Vec::new());
+                            continue;
+                        };
+                        // A null source expert must stay null on BOTH sides:
+                        // the batched swizzle skips it, and the grouped GEMM
+                        // must not be handed a scratch address holding another
+                        // expert's stale bytes.
+                        let sp = crate::layers::ops::read_expert_ptrs_u64(gpu, scale_dev, num)?;
+                        let dst: Vec<u64> = sp
+                            .iter()
+                            .enumerate()
+                            .map(|(e, &s)| if s == 0 { 0 } else { cursor + (e * len) as u64 })
+                            .collect();
+                        let dst_dev = gpu.alloc(num * 8)?;
+                        owned.push(dst_dev);
+                        let raw: Vec<u8> = dst.iter().flat_map(|p| p.to_le_bytes()).collect();
+                        gpu.copy_h2d(&raw, dst_dev)?;
+                        projections.push((scale_dev, dst_dev, len));
+                        host_tables.push(dst);
+                        cursor += (num * len) as u64;
+                    }
+                    let down = down_scale_dev.map(|_| {
+                        (
+                            self.down_ptrs.packed_ptrs,
+                            host_tables[2].clone(),
+                            self.down_ptrs.scale2_vals,
+                        )
+                    });
+                    let mut tables = crate::layers::ops::MoeCutlassHostTables::snapshot(
+                        gpu,
+                        num,
+                        self.gate_ptrs.packed_ptrs,
+                        host_tables[0].clone(),
+                        self.gate_ptrs.scale2_vals,
+                        self.up_ptrs.packed_ptrs,
+                        host_tables[1].clone(),
+                        self.up_ptrs.scale2_vals,
+                        down,
+                    )?;
+                    tables.lazy = Some(crate::layers::ops::MoeCutlassLazySfb {
+                        num_experts: num as u32,
+                        src_n_major,
+                        projections: projections
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (src, dst, _))| {
+                                let (n, k) = if i == 2 { (h, inter) } else { (inter, h) };
+                                (src, dst, n as u32, k as u32)
+                            })
+                            .collect(),
+                    });
+                    self.cutlass_grouped_host = Some(tables);
+                    self._cutlass_sfb_owned = owned;
+                    static ONCE: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!(
+                            "CUTLASS grouped SFB: LAZY (ATLAS_CUTLASS_SFB_LAZY=1) — {num} experts \
+                             re-swizzled per prefill call into one {:.1} MB shared scratch \
+                             instead of {:.1} MB resident per layer",
+                            dims.bytes() as f64 / 1e6,
+                            dims.bytes() as f64 / 1e6,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            "CUTLASS grouped SFB: lazy scratch unavailable ({e}) — falling back \
+                             to resident per-layer tables"
+                        );
+                    }
+                }
+            }
+        }
+
         // Swizzle each expert's [K/16,N] scale into the CUTLASS SFB atom. `n`/`k`
         // are the projection's GEMM dims: gate/up = (inter, hidden); down = (hidden, inter).
         // Returns the HOST vector of per-expert SFB pointers: the grouped C entry
         // consumes pointer values host-side, so no device copy of this table is
         // ever made — the values go straight into the layer-owned snapshot below.
+        //
+        // SLAB-PACKED: one allocation per projection, experts at `len` offsets.
+        // The first ship of this table did ~1.5k separate ~100 KB allocs per
+        // layer; allocator granularity roughly DOUBLED the resident cost
+        // (measured 2026-08-29 on the 512-expert 125B: ~7.7 GB requested,
+        // +14.5 GB pre-KV observed — the KV pool paid the difference). SFB
+        // atoms are addressed per expert through the pointer table, so
+        // packing changes no consumer.
         let mut build_one = |scale_ptrs_dev: DevicePtr, n: usize, k: usize| -> Result<Vec<u64>> {
             let len = sfb_len(n, k);
             let sp = crate::layers::ops::read_expert_ptrs_u64(gpu, scale_ptrs_dev, num)?;
+            let live = sp.iter().filter(|&&p| p != 0).count();
             let mut sfb_ptrs = vec![0u64; num];
+            if live == 0 {
+                return Ok(sfb_ptrs);
+            }
+            let slab = gpu.alloc(len * live)?;
+            owned.push(slab);
+            let mut next = slab.0;
             for (e, &sptr) in sp.iter().enumerate() {
                 if sptr == 0 {
                     continue; // remote/placeholder expert
                 }
-                let sfb = gpu.alloc(len)?;
                 spark_runtime::cutlass::pack_weight_sfb(
                     sptr,
-                    sfb.0,
+                    next,
                     n as u32,
                     k as u32,
                     src_n_major,
                     stream,
                 )?;
-                sfb_ptrs[e] = sfb.0;
-                owned.push(sfb);
+                sfb_ptrs[e] = next;
+                next += len as u64;
             }
             gpu.synchronize(stream)?;
             Ok(sfb_ptrs)

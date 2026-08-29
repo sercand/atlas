@@ -392,13 +392,8 @@ impl MoeLayer {
             nvfp4_gate_up_m128: std::env::var("ATLAS_NVFP4_GATE_UP_M128")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            // FP4 prefill MoE over the shared FAST_MOE=full [K/2,N] tables.
-            gateup_fp4: std::env::var("ATLAS_HOLO_MOE_GATEUP_FP4")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-            down_fp4: std::env::var("ATLAS_HOLO_MOE_DOWN_FP4")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            // FP4 prefill MoE opt-ins live in `crate::runtime_levers`
+            // (admin-flippable; env vars still honored when levers are unset).
             shared_gate_t: None,
             shared_up_t: None,
             shared_down_t: None,

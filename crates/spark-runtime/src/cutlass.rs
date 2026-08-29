@@ -21,7 +21,10 @@ mod pack;
 
 pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
 pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
-pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
+pub use pack::{
+    pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched,
+    transpose_nvfp4_packed_kton,
+};
 
 #[cfg(all(test, atlas_cutlass))]
 mod tests;
@@ -114,6 +117,15 @@ unsafe extern "C" {
     pub(crate) fn atlas_cutlass_pack_weight_sfb(
         scale_in: *const c_void,
         scale_out: *mut c_void,
+        n: i32,
+        k: i32,
+        src_n_major: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn atlas_cutlass_pack_weight_sfb_batched(
+        in_ptrs: *const c_void,
+        out_ptrs: *const c_void,
+        num_experts: i32,
         n: i32,
         k: i32,
         src_n_major: i32,
